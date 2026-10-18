@@ -25,6 +25,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/MemArena.h"
+#include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
 #include "Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h"
 
 static int g_failures = 0;
@@ -168,6 +169,71 @@ static void test_skylander_crypto()
   std::printf("\n");
 }
 
+// The portal is what the game actually talks to. Correct figure bytes do not
+// prove the portal answers correctly: the game reads figures back through
+// GetStatus() and QueryBlock(), and it is those replies -- status bitmask,
+// per-block framing, encrypted payload -- that have to match hardware.
+static void test_portal()
+{
+  std::printf("Skylander portal\n");
+
+  IOS::HLE::USB::SkylanderPortal portal;
+  portal.Activate();
+
+  // Nothing on the portal yet.
+  auto status = portal.GetStatus();
+  check(status[0] == 0x53, "status reply is framed 'S'");
+  const u64 empty_status = fnv1a(status.data(), status.size());
+
+  // Put Spyro down, exactly as record-gameplay.sh does via --skylander=16:0.
+  const std::array<u8, 4> nuid{0x01, 0x23, 0x45, 0x67};
+  const std::string path = "/tmp/portal_spyro.sky";
+  std::remove(path.c_str());
+  auto fig = std::make_unique<IOS::HLE::USB::SkylanderFigure>(path);
+  check(fig->Create(16, 0x0000, nuid), "figure created for the portal");
+
+  const u8 slot = portal.LoadSkylander(std::move(fig));
+  check(slot < 16, "figure accepted into a portal slot");
+
+  status = portal.GetStatus();
+  const u64 loaded_status = fnv1a(status.data(), status.size());
+  check(loaded_status != empty_status, "status changes once a figure is present");
+
+  // Read every block back the way the game does. This is the payload the game
+  // decrypts, so hashing all 64 replies covers framing and data together.
+  u64 blocks_hash = 0xcbf29ce484222325ULL;
+  int framed = 0;
+  for (u8 b = 0; b < 64; ++b)
+  {
+    std::array<u8, 32> reply{};
+    portal.QueryBlock(slot, b, reply.data());
+    if (reply[0] == 'Q' && reply[2] == b)
+      ++framed;
+    for (u8 byte : reply)
+    {
+      blocks_hash ^= byte;
+      blocks_hash *= 0x100000001b3ULL;
+    }
+  }
+  check(framed == 64, "all 64 block replies are correctly framed");
+  std::printf("  %-20s slot=%-2u              64 blocks fnv1a=%016llx\n", "Spyro on portal", slot,
+              static_cast<unsigned long long>(blocks_hash));
+
+  // Write a block and read it back: the portal must persist figure edits,
+  // which is how the game saves levels and gold onto a figure.
+  std::array<u8, 16> payload{};
+  for (size_t i = 0; i < payload.size(); ++i)
+    payload[i] = static_cast<u8>(0xA0 + i);
+  std::array<u8, 32> wr{}, rd{};
+  portal.WriteBlock(slot, 0x08, payload.data(), wr.data());
+  portal.QueryBlock(slot, 0x08, rd.data());
+  check(std::memcmp(rd.data() + 3, payload.data(), payload.size()) == 0,
+        "written block reads back identically");
+
+  check(portal.RemoveSkylander(slot), "figure removed from the portal");
+  std::printf("\n");
+}
+
 int main()
 {
 #if defined(__EMSCRIPTEN__)
@@ -179,6 +245,7 @@ int main()
 
   test_mem_arena();
   test_skylander_crypto();
+  test_portal();
 
   std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
   return g_failures ? 1 : 0;
