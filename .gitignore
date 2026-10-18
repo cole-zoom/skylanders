@@ -60,3 +60,6 @@ node_modules/
 .vscode/*
 !.vscode/extensions.json
 *.swp
+
+# Spike build output
+spikes/**/spike.wasm
