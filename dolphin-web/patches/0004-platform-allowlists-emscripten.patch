@@ -1,0 +1,76 @@
+diff --git a/Source/Core/Core/HW/DVD/AMMediaboard.cpp b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
+index 272e5a1..f725600 100644
+--- a/Source/Core/Core/HW/DVD/AMMediaboard.cpp
++++ b/Source/Core/Core/HW/DVD/AMMediaboard.cpp
+@@ -33,8 +33,8 @@
+ #include "VideoCommon/OnScreenDisplay.h"
+ 
+ #if defined(__linux__) or defined(__APPLE__) or defined(__FreeBSD__) or defined(__NetBSD__) or     \
+-    defined(__OpenBSD__) or defined(__HAIKU__)
+-
++    defined(__OpenBSD__) or defined(__HAIKU__) or                       \
++    defined(__EMSCRIPTEN__)
+ #include <unistd.h>
+ 
+ #include "Common/UnixUtil.h"
+diff --git a/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h b/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h
+index 59fabfa..7807bec 100644
+--- a/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h
++++ b/Source/Core/Core/HW/EXI/EXI_DeviceEthernet.h
+@@ -412,7 +412,8 @@ private:
+     bool m_bba_link_up = false;
+     bool m_bba_failure_notified = false;
+ #if defined(WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) ||          \
+-    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__) ||                         \
++    defined(__EMSCRIPTEN__)
+     sf::UdpSocket m_sf_socket;
+     sf::IpAddress m_sf_recipient_ip = sf::IpAddress::Any;
+     char m_in_frame[9004]{};
+@@ -456,7 +457,8 @@ private:
+     std::map<u32, Common::MACAddress> m_arp_table;
+     sf::TcpListener m_upnp_httpd;
+ #if defined(WIN32) || defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) ||          \
+-    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__) ||                         \
++    defined(__EMSCRIPTEN__)
+     NetworkRef m_network_ref;
+     std::thread m_read_thread;
+     Common::Flag m_read_enabled;
+diff --git a/Source/Core/Core/IOS/Network/Socket.h b/Source/Core/Core/IOS/Network/Socket.h
+index 3617e24..6ad5001 100644
+--- a/Source/Core/Core/IOS/Network/Socket.h
++++ b/Source/Core/Core/IOS/Network/Socket.h
+@@ -14,8 +14,12 @@ typedef pollfd pollfd_t;
+ #define MALLOC(x) HeapAlloc(GetProcessHeap(), 0, (x))
+ #define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
+ 
++// Emscripten belongs with the POSIX platforms: it provides <poll.h> and the
++// BSD socket headers below. It is listed explicitly because the fallback
++// #else omits <poll.h> and never defines pollfd_t, which surfaces far away as
++// "use of undeclared identifier 'pollfd_t'" at the first use.
+ #elif defined(__linux__) or defined(__APPLE__) or defined(__FreeBSD__) or defined(__NetBSD__) or   \
+-    defined(__OpenBSD__) or defined(__HAIKU__)
++    defined(__OpenBSD__) or defined(__HAIKU__) or defined(__EMSCRIPTEN__)
+ #include <arpa/inet.h>
+ #include <fcntl.h>
+ #include <net/if.h>
+diff --git a/Source/Core/VideoCommon/DriverDetails.cpp b/Source/Core/VideoCommon/DriverDetails.cpp
+index 3027aab..6769bc0 100644
+--- a/Source/Core/VideoCommon/DriverDetails.cpp
++++ b/Source/Core/VideoCommon/DriverDetails.cpp
+@@ -43,6 +43,14 @@ constexpr u32 m_os = OS_ALL | OS_OPENBSD;
+ constexpr u32 m_os = OS_ALL | OS_NETBSD;
+ #elif __HAIKU__
+ constexpr u32 m_os = OS_ALL | OS_HAIKU;
++#elif __EMSCRIPTEN__
++// The browser is not one of the listed operating systems, and the driver bugs
++// below are matched by OS. Entries tagged OS_ALL still apply; OS-specific ones
++// correctly do not. Without this branch m_os is simply never defined, and the
++// compiler resolves the name to BugInfo::m_os instead -- which fails with
++// "invalid use of non-static data member" rather than anything naming the
++// missing platform.
++constexpr u32 m_os = OS_ALL;
+ #endif
+ 
+ static API m_api = API_OPENGL;

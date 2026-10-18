@@ -13,7 +13,7 @@ BUILD_DIR=dolphin-web/build-wasm
 TARGET="${1:-common}"
 
 # Apply the wasm port patches. Reverse-check first so re-runs are idempotent.
-for p in dolphin-web/patches/000[23]-*.patch; do
+for p in dolphin-web/patches/000[234]-*.patch; do
   [ -e "$p" ] || continue
   case "$(basename "$p")" in
     *sfml*)  repo=dolphin/Externals/SFML/SFML; rel="../../../../$p" ;;
@@ -34,7 +34,14 @@ done
 #
 # WITH_OPTIM=OFF disables zlib-ng's architecture-specific paths, which
 # otherwise pull in x86 CPUID intrinsics that do not exist on wasm.
+# -pthread enables wasm's atomics and bulk-memory target features. Without it
+# anything using atomic builtins fails to compile ("needs target feature
+# atomics") -- cubeb hits this first. It also commits the build to the
+# threading model Spike C validated: SharedArrayBuffer plus COOP/COEP, which
+# spikes/threading/serve.mjs already serves.
 emcmake cmake -S dolphin -B "$BUILD_DIR" -G Ninja \
+  -DCMAKE_C_FLAGS="-pthread" \
+  -DCMAKE_CXX_FLAGS="-pthread" \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_GENERIC=ON \
   -DWITH_OPTIM=OFF \
