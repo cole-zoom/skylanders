@@ -1,0 +1,18 @@
+diff --git a/Source/Core/Common/Timer.cpp b/Source/Core/Common/Timer.cpp
+index fcbbd7b..7f8b911 100644
+--- a/Source/Core/Common/Timer.cpp
++++ b/Source/Core/Common/Timer.cpp
+@@ -214,6 +214,13 @@ auto SteadyAwakeClock::now() -> time_point
+       CLOCK_MONOTONIC;
+ #elif defined(__APPLE__)
+       CLOCK_UPTIME_RAW;
++#elif defined(__EMSCRIPTEN__)
++      // Emscripten has no CLOCK_UPTIME. CLOCK_MONOTONIC is what it provides,
++      // and it shares Linux's semantics of not counting suspended time --
++      // which in a browser means a backgrounded tab. That is the correct
++      // behaviour here: wall time spent with the tab hidden should not be
++      // charged to the emulated machine.
++      CLOCK_MONOTONIC;
+ #else
+       CLOCK_UPTIME;
+ #endif
