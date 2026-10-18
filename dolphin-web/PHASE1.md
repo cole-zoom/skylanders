@@ -65,12 +65,47 @@ encrypted payload the game decrypts — is byte-identical across targets. The
 write/read check matters because that is how the game saves levels and gold
 onto a figure.
 
-**What is still not covered:** `SkylanderUSB`, the device wrapper the emulated
-IOS talks to. `SkylanderPortal` is the data path; the wrapper marshals it into
-USB control and interrupt transfers, and that needs IOS HLE to exercise. Its
-dependencies are deferred at link time with `-undefined dynamic_lookup` on the
-native side, so if that path is ever reached it fails loudly rather than
-answering.
+### Where the smoke test stops, and why
+
+`SkylanderUSB` — the device wrapper the emulated IOS talks to — **cannot be
+reached from a smoke test at all.** This was tried and abandoned deliberately.
+
+Merely constructing a `SkylanderUSB` emits its vtable. The vtable references
+every virtual, including `SubmitTransfer`, whose body calls
+`cmd->GetEmulationKernel().GetSystem()`, then `system.GetMemory()`, then
+`memory.GetPointerForRange()`. So the link pulls in `Core::System`,
+`Memory::MemoryManager`, the IOS kernel, `Mixer`, and the sound stream — the
+whole emulator singleton.
+
+That is why the earlier link succeeded with `Skylander.cpp.o` present: nothing
+instantiated the device, so the vtable was dead-stripped. Instantiating it is a
+cliff, not a slope:
+
+```
+wasm-ld: undefined symbol: IOS::HLE::USB::Device::~Device()
+wasm-ld: undefined symbol: IOS::HLE::USB::TransferCommand::GetEmulationKernel() const
+wasm-ld: undefined symbol: Core::System::GetMemory() const
+wasm-ld: undefined symbol: Memory::MemoryManager::GetPointerForRange(u32, size_t) const
+wasm-ld: undefined symbol: Core::System::GetSkylanderPortal() const
+wasm-ld: undefined symbol: Mixer::PushSkylanderPortalSamples(u8 const*, size_t)
+...
+```
+
+So the honest split is:
+
+| Layer | Status |
+|---|---|
+| `SkylanderFigure` — figure data and MIFARE crypto | verified, byte-identical |
+| `SkylanderPortal` — status, block reads and writes | verified, byte-identical |
+| `SkylanderUSB` — USB descriptors and transfer dispatch | **requires the emulator core** |
+| The game talking to any of it | requires the core booted |
+
+Everything the game actually does goes through the layer that is not covered.
+Testing it is not a bigger smoke test; it is the next real Phase 1 milestone —
+standing up `Core::System` under wasm32, which is what "the boot sequence
+executes under the interpreter" in `docs/PLAN.md` §5 means. `libcore.a` defines
+5,023 text symbols, and this is the point where they start being needed rather
+than dead-stripped.
 
 ### Three times the test was wrong, not the code
 
