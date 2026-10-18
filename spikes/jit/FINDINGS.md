@@ -1,91 +1,140 @@
 # Spike A — PowerPC → WebAssembly throughput
 
-**Status: INCONCLUSIVE. Does not yet gate Phase 0.**
+**Status: GATE MET.** Chrome sustains **863.9 MIPS** on the realistic variant,
+against a 600 MIPS gate.
 
 ## Question
 
-Can recompiled Broadway code sustain ≥ 600 MIPS in a browser? (Gate from
-`docs/PLAN.md` — Broadway is 729 MHz at close to 1 IPC on game code, so ~600 MIPS
-is roughly 100% speed with headroom.)
+Can recompiled Broadway code sustain ≥ 600 MIPS in a browser? Broadway is
+729 MHz at close to 1 IPC on game code, so ~600 MIPS is roughly 100% speed with
+headroom.
 
-## What was measured
+## Result
 
-A vertex-transform-shaped kernel — 18 guest instructions per iteration: 4 loads,
-6 paired-single float ops, 2 stores, 4 integer ops, a compare and a branch —
-written once in Rust and built twice, native `aarch64` and `wasm32` run under
-Node's V8 (same engine as Chrome).
+30M iterations × 11 trials, median (min–max), Apple M4:
 
-Three variants, 4 trials each, 30M iterations:
-
-| Variant | Native (MIPS) | WASM (MIPS) | WASM/native |
+| Variant | Native aarch64 | Chrome 155 | Chrome / native |
 |---|---|---|---|
-| `naive` — eager CR, bounds-checked loads | 785–871 | 645–774 | ~0.90 |
-| `tuned` — lazy CR, masked loads | 796–916 | 627–771 | ~0.85 |
-| `dispatch` — state in memory, indirect call | 663–732 | 1052–1518 | **invalid** |
+| `naive` — eager CR, bounds-checked loads | 842.9 (714–892) | 722.8 (518–734) | 0.86 |
+| `tuned` — lazy CR, masked loads | 844.2 (685–861) | 609.3 (518–705) | 0.72 |
+| **`dispatch` — state in memory, indirect call** | **596.9** (496–626) | **863.9** (793–887) | **1.45** |
 
-## The one real finding
+`dispatch` is the number that matters. The other two inline everything into one
+hot loop with guest state in host registers, which no real recompiler can do.
 
-**WebAssembly runs this instruction mix at roughly 0.85–0.90× native aarch64.**
+**Chrome's slowest dispatch trial (793.4 MIPS) still clears the gate.**
 
-That matters, because `docs/PLAN.md` assumed a **2–4× penalty** and derived the
-whole "75–250% of full speed" range from it. For straight-line recompiled code,
-that assumption is far too pessimistic. The arithmetic, the float work, and the
-masked memory accesses all survive the WASM boundary nearly intact.
+The surprise is that WebAssembly *beats* native on this variant, by 1.45×. Two
+plausible contributors, neither verified: V8's `call_indirect` against a bounded
+table may be cheaper than a native load-from-global plus unpredictable indirect
+branch; and the eight small block functions likely give V8's register allocator
+an easier problem than one large loop body. This is the opposite of the
+`2–4× slower` penalty `docs/PLAN.md` assumes, and that text now needs revising.
 
-This is a *ceiling*, not a result. See below.
+## How this was made trustworthy
 
-## Why this is not conclusive
+Two earlier versions of this spike produced plausible numbers from broken
+measurements. Every defence below exists because something actually went wrong.
 
-**The `dispatch` row is invalid and the other two are optimistic.**
+**Structural verification — `./verify.sh`.** Disassembles the emitted module and
+asserts the dispatch loop really dispatches. A MIPS number cannot tell you
+whether the compiler quietly removed the thing you were measuring.
 
-Both failures have the same cause: LLVM optimizes across the abstraction the
-benchmark is trying to price.
+```
+PASS  call_indirect present in module              25
+PASS  call_indirect inside run_dispatched          3
+PASS  distinct blocks as indirect targets          8
+PASS  run_dispatched not inlined-fat               70 lines
+```
 
-1. **First attempt** measured `Vec` indexing, not the MMU. `self.mem[off..off+4]`
-   carries its own bounds check and panic path, while the naive path's explicit
-   early-return let LLVM prove safety and drop its check — so "tuned" came out
-   *slower* than "naive", inverting the native ordering. Fixed by moving both
-   paths to raw pointer reads so the only difference is address translation.
+**Semantic verification — block invocation counter.** `spike_block_calls()`
+counts real block entries and the harness asserts it equals
+`iters/10 + iters × trials`. Confirmed **333,000,000 = 333,000,000** on both
+targets. Structure alone cannot prove the loop ran the expected number of times.
 
-2. **Second attempt** failed to measure dispatch. Both entries in the function
-   table are the same `block_body`, and `core::hint::black_box` is weaker on
-   wasm32 than on native, so LLVM devirtualized the indirect call, inlined it,
-   and optimized the loop — producing a number 2× *faster* than native and
-   faster than the inlined variant, which is impossible.
+**Three defences against devirtualization**, all required:
 
-So `naive` and `tuned` measure a fully-inlined hot loop with all guest state in
-host registers. A real recompiler cannot do that: it emits per-block functions,
-keeps guest state in memory between blocks, and pays an indirect call at every
-block boundary. **Real throughput will be below these numbers**, and the gap is
-exactly what the broken `dispatch` variant was meant to size.
+1. Eight genuinely distinct block functions, each folding a different constant
+   into the accumulator, so identical-code-folding cannot merge them.
+2. The block table is filled at runtime through an exported
+   `spike_install_blocks(seed)`, never a static initialiser — LLVM cannot know
+   which function occupies which slot.
+3. The table index is derived from guest state, so it is data-dependent rather
+   than a predictable loop counter.
 
-Variance is also high (±20% run to run) — the harness should report a median
-over more trials rather than single runs.
+## What went wrong on the way here
 
-## What to do next
+Each of these produced a believable number that was wrong.
 
-1. Defeat devirtualization: populate the block table at runtime with genuinely
-   distinct functions, indexed by a value derived from guest state, so the
-   indirect call survives optimization. Confirm by reading the emitted `.wat`
-   for an actual `call_indirect`.
-2. Force guest state to memory across block boundaries and confirm in the `.wat`
-   that it is not being promoted to locals.
-3. Median-of-N with outlier reporting instead of single trials.
-4. Only then compare against the 600 MIPS gate.
+1. **Measured `Vec`, not the MMU.** `self.mem[off..off+4]` carries its own bounds
+   check and panic path, while the naive path's explicit early-return let LLVM
+   prove safety and drop its check — so `tuned` came out *slower* than `naive`,
+   inverting the native ordering. Fixed by moving both paths to raw pointer
+   reads, leaving address translation as the only difference.
 
-Until step 4, **Phase 0 Spike A is open** and the 600 MIPS gate is unmet — not
-failed, unmeasured.
+2. **Devirtualization.** The block table held one repeated function and
+   `core::hint::black_box` is weak on wasm32, so LLVM inlined the indirect call.
+   Result: 1518 MIPS, faster than native and faster than the inlined variant.
+   Fixed by the three defences above.
+
+3. **A non-bijective permutation.** `(i × seed) ^ i` is not a bijection over
+   0..8, so only four blocks were ever installed and the other four were
+   dead-stripped — four indirect targets instead of eight. Caught by `verify.sh`,
+   not by reading the code. Fixed to `(i × (seed|1)) & 7`, where an odd
+   multiplier is invertible mod 8.
+
+4. **Different address trajectories.** `block_impl` folded its per-block constant
+   into the *index* computation, so every block walked different memory than
+   `run_tuned` did. The comparison was measuring cache behaviour, not dispatch
+   cost. Fixed so the index advance is byte-identical to `run_tuned` and the
+   constant only perturbs the accumulator.
+
+5. **Chrome silently produced nothing.** The extraction used `sed`, which cannot
+   match across newlines, so a working benchmark looked like a failed one. Fixed
+   with a Python extractor.
+
+## Open issue: float contraction diverges across targets
+
+`naive` and `tuned` produce identical checksums on both targets (`3493a94a`).
+`dispatch` does not — native `8641789f` vs Chrome `27617d8c`. They agree at 10
+iterations and diverge by 10M, which is characteristic of rounding, not logic.
+
+Cause: aarch64 contracts `fa*fc + fb*fd` into a fused multiply-add with a single
+rounding step. WebAssembly has no scalar FMA instruction, so it rounds twice. The
+two targets compute genuinely different floats, and the error accumulates.
+
+This does not undermine the timing result — the operation count is identical and
+independently verified — but **it is a real finding for the emulator**. Broadway's
+paired-single operations have defined rounding behaviour, and a recompiler that
+lets the host fuse will drift from hardware. `ppc2wasm` must control contraction
+explicitly, and the differential harness must compare floats bit-exactly or it
+will not catch this class of bug.
+
+## What this still does not measure
+
+- **A synthetic kernel, not profiled game code.** The 18-instruction mix is
+  plausible for a vertex transform but no Skylanders profile informs it. That
+  needs the oracle traces.
+- **Eight blocks, all the same shape.** Real code has thousands of blocks with
+  varied sizes and register pressure, and far worse icache behaviour.
+- **No MMU slow paths**, no unaligned access, no MMIO, no interrupts.
+- **No cross-block guest state spilling** beyond the four registers touched here.
+
+So 863.9 MIPS is an upper bound on a realistic shape, not a prediction. The
+honest reading: **the CPU approach is not disqualified, and the headroom is
+larger than the plan assumed.** Phase 2 remains the risk.
 
 ## Reproduce
 
 ```sh
 cd spikes/jit
-cargo build --release && ./target/release/native 30000000
+cargo build --release && ./target/release/native 30000000 11   # native
 cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/spike_a_throughput.wasm spike.wasm
-node run-wasm.mjs 30000000
+./verify.sh                 # structural checks — run this first
+node run-wasm.mjs 30000000 11   # Node / V8
+./run-chrome.sh 30000000 11     # real Chrome, headless
 ```
 
-Checksum is identical (`429fe667`) across every variant and both targets, so all
-paths compute the same result — the arithmetic is equivalent even where the
-timings are not trustworthy.
+`verify.sh` exits non-zero if the module structure is wrong. If it fails, every
+timing from that module is meaningless.

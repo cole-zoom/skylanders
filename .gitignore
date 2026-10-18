@@ -63,3 +63,5 @@ node_modules/
 
 # Spike build output
 spikes/**/spike.wasm
+spikes/**/bench.html
+spikes/**/spike.wat

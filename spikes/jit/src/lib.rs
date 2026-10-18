@@ -131,12 +131,12 @@ impl Guest {
     // ── tuned memory path ──
     // Mask into a power-of-two arena, then the same raw load. No branch.
     #[inline(always)]
-    fn read_u32_masked(&self, ea: u32) -> u32 {
+    pub fn read_u32_masked(&self, ea: u32) -> u32 {
         let off = (ea & MEM1_MASK & !3) as usize;
         unsafe { u32::from_be(core::ptr::read_unaligned(self.mem.as_ptr().add(off) as *const u32)) }
     }
     #[inline(always)]
-    fn write_u32_masked(&mut self, ea: u32, v: u32) {
+    pub fn write_u32_masked(&mut self, ea: u32, v: u32) {
         let off = (ea & MEM1_MASK & !3) as usize;
         unsafe { core::ptr::write_unaligned(self.mem.as_mut_ptr().add(off) as *mut u32, v.to_be()) }
     }
@@ -223,17 +223,38 @@ impl Guest {
     }
 }
 
-/// Realistic variant: guest state lives in memory, and each block is a
-/// separate function reached through a function pointer — which lowers to
-/// `call_indirect` on wasm32, exactly as a real dispatcher would.
-///
-/// This is the number that actually predicts the emulator, because it pays the
-/// two costs `run_tuned` hides: no cross-block register allocation, and an
-/// indirect call per block.
-pub type BlockFn = fn(&mut Guest) -> bool;
+// ────────────────────────────────────────────────────────────────────────────
+// dispatch variant — the one that predicts the emulator
+// ────────────────────────────────────────────────────────────────────────────
+//
+// A previous version of this spike reported `dispatch` as FASTER than native
+// and faster than the inlined variants, which is impossible. Cause: the block
+// table held one repeated function and `core::hint::black_box` is weak on
+// wasm32, so LLVM devirtualized the indirect call and inlined it.
+//
+// Three defences, all required:
+//   1. Eight genuinely distinct block functions. Each folds a different
+//      constant into its arithmetic, so LLVM's identical-code-folding cannot
+//      merge them back into one.
+//   2. The table is populated at runtime by `spike_install_blocks(seed)` with
+//      a seed the compiler never sees, so which function lands in which slot
+//      is unknowable at compile time.
+//   3. The index is derived from guest state, making it data-dependent rather
+//      than a predictable loop counter.
+//
+// Verified by disassembly — see verify.sh. A plausible MIPS number is not
+// evidence.
 
-#[inline(never)]
-pub fn block_body(g: &mut Guest) -> bool {
+pub type BlockFn = fn(&mut Guest);
+
+/// Shared body. `k` differs per block so the eight wrappers are not identical
+/// after inlining, which is what stops LLVM folding them together.
+#[inline(always)]
+fn block_impl(g: &mut Guest, k: u32) {
+    unsafe {
+        let c = core::ptr::addr_of_mut!(BLOCK_CALLS);
+        *c = (*c).wrapping_add(1);
+    }
     let idx = g.gpr[3];
     let base = MEM1_BASE.wrapping_add(idx & 0x00FF_FFF0);
 
@@ -251,55 +272,110 @@ pub fn block_body(g: &mut Guest) -> bool {
     g.write_u32_masked(base, x.to_bits());
     g.write_u32_masked(base.wrapping_add(4), y.to_bits());
 
+    // IMPORTANT: `k` must not touch the index. An earlier version folded it
+    // into the multiplier here, which gave every block a different address
+    // trajectory from `run_tuned` -- so the comparison measured cache
+    // behaviour, not dispatch cost, and `dispatch` came out faster than the
+    // inlined variant. The index advance below is now byte-identical to
+    // `run_tuned`; `k` only perturbs the accumulator, which is enough to keep
+    // the eight blocks distinct under identical-code-folding.
     let nidx = idx.wrapping_add(16).wrapping_mul(1_103_515_245) >> 3;
-    let acc = g.gpr[4].wrapping_add(z.to_bits() ^ nidx);
+    let acc = g.gpr[4].wrapping_add(z.to_bits() ^ nidx ^ k);
+
     g.gpr[3] = nidx;
     g.gpr[4] = acc;
-
     g.lazy_cr.record(acc as i32, 0x4000_0000i32);
-    !g.lazy_cr.lt()
+    if !g.lazy_cr.lt() {
+        g.gpr[3] = nidx.wrapping_add(1);
+    }
+}
+
+macro_rules! block {
+    ($name:ident, $k:expr) => {
+        #[inline(never)]
+        pub fn $name(g: &mut Guest) {
+            block_impl(g, $k)
+        }
+    };
+}
+block!(block_0, 0x0000_0000);
+block!(block_1, 0x0000_0001);
+block!(block_2, 0x0000_0003);
+block!(block_3, 0x0000_0007);
+block!(block_4, 0x0000_000F);
+block!(block_5, 0x0000_001F);
+block!(block_6, 0x0000_003F);
+block!(block_7, 0x0000_007F);
+
+/// Populated at runtime, never by a static initialiser — the whole point is
+/// that LLVM cannot know the contents.
+static mut BLOCK_TABLE: [Option<BlockFn>; 8] = [None; 8];
+
+/// Counts actual block invocations. Exists to prove the dispatch loop really
+/// executes one indirect call per iteration -- a MIPS number alone cannot
+/// distinguish "fast" from "did less work than we think".
+static mut BLOCK_CALLS: u64 = 0;
+
+#[no_mangle]
+pub extern "C" fn spike_block_calls() -> u64 {
+    unsafe { *core::ptr::addr_of!(BLOCK_CALLS) }
+}
+#[no_mangle]
+pub extern "C" fn spike_reset_calls() {
+    unsafe { *core::ptr::addr_of_mut!(BLOCK_CALLS) = 0 };
+}
+
+/// Install the block table using a seed supplied by the harness at runtime.
+#[no_mangle]
+pub extern "C" fn spike_install_blocks(seed: u32) {
+    let all: [BlockFn; 8] = [
+        block_0, block_1, block_2, block_3, block_4, block_5, block_6, block_7,
+    ];
+    let t = core::ptr::addr_of_mut!(BLOCK_TABLE);
+    for i in 0..8usize {
+        // Odd multiplier is invertible mod 8, so this is a bijection over
+        // 0..8 and every block is installed exactly once. (An earlier version
+        // XOR'd i into this, which is NOT a bijection — only four blocks were
+        // ever installed and the other four were dead-stripped, leaving four
+        // indirect targets instead of eight.)
+        let j = (i as u32).wrapping_mul(seed | 1) as usize & 7;
+        unsafe { (*t)[i] = Some(all[j]) };
+    }
 }
 
 impl Guest {
-    /// Dispatch loop: fetch block pointer from a table, indirect-call it.
+    /// Dispatch loop: data-dependent index, table load, indirect call.
     pub fn run_dispatched(&mut self, iters: u64) -> u32 {
-        let table: [BlockFn; 2] = [block_body, block_body];
-        self.gpr[3] = 0;
+        self.gpr[3] = 1;
         self.gpr[4] = 0;
-        let mut sel = 0usize;
+        let t = core::ptr::addr_of!(BLOCK_TABLE);
         for _ in 0..iters {
-            let f = core::hint::black_box(table[sel & 1]);
-            if f(self) {
-                self.gpr[3] = self.gpr[3].wrapping_add(1);
-            }
-            sel = sel.wrapping_add(1);
+            let sel = ((self.gpr[3] >> 4) & 7) as usize;
+            let f = unsafe { (*t)[sel].unwrap_unchecked() };
+            f(self);
         }
         self.gpr[4]
     }
 }
 
-#[no_mangle]
-pub extern "C" fn spike_run_dispatched(g: *mut Guest, iters: u64) -> u32 {
-    unsafe { (*g).run_dispatched(iters) }
-}
-
-// ── wasm32 entry points, called from the Node harness ──
+// ── wasm32 / FFI entry points ──
 
 #[no_mangle]
 pub extern "C" fn spike_new() -> *mut Guest {
     Box::into_raw(Box::new(Guest::new()))
 }
-
 #[no_mangle]
 pub extern "C" fn spike_run_naive(g: *mut Guest, iters: u64) -> u32 {
     unsafe { (*g).run_naive(iters) }
 }
-
 #[no_mangle]
 pub extern "C" fn spike_run_tuned(g: *mut Guest, iters: u64) -> u32 {
     unsafe { (*g).run_tuned(iters) }
 }
-
+#[no_mangle]
+pub extern "C" fn spike_run_dispatched(g: *mut Guest, iters: u64) -> u32 {
+    unsafe { (*g).run_dispatched(iters) }
+}
 #[no_mangle]
 pub extern "C" fn spike_insns_per_iter() -> u64 {
     GUEST_INSNS_PER_ITER
