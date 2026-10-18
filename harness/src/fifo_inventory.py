@@ -204,7 +204,7 @@ def main(path):
               total_bytes=0, vfmt=VertexFormats(), cp=Counter(),
               vtx_formats=Counter(), desync=False, cur_blend=0,
               arrays=ArrayDescriptors(), ram=GuestRAM(),
-              export=[] if len(sys.argv) > 2 else None)
+              export=[] if _export_path() else None)
 
     print(f"{path}")
     print(f"  format version {h['version']}, {h['frame_count']} frames, "
@@ -255,8 +255,49 @@ def main(path):
     elif pct > 99.0:
         print("  Full frame decoded -- the feature list above is complete for")
         print("  this capture.")
+    ok, msg = assess_capture(st)
+    print(f"\n  {'OK  ' if ok else 'WARN'}  {msg}")
     if st["export"] is not None:
-        write_export(st, sys.argv[2])
+        write_export(st, _export_path())
+    if "--check" in sys.argv and not ok:
+        sys.exit(1)
+
+
+# A capture that lands on a loading screen or a fade still writes a plausible
+# ~2 MB file with no error, because most of that size is the 1 MB TexMem
+# snapshot. The inventory drawn from it then reports almost no GX usage --
+# quietly wrong rather than obviously broken, which is the expensive kind.
+# These floors are well below the two known-good captures (title: 57,628 B /
+# 238 draws; gameplay: 114,436 B / 207 draws) and well above a loading screen.
+MIN_COMMAND_BYTES = 20_000
+MIN_DRAWS = 50
+
+
+def _args():
+    """Positional args only, so flags are never mistaken for paths."""
+    return [a for a in sys.argv[1:] if not a.startswith("-")]
+
+
+def _export_path():
+    a = _args()
+    return a[1] if len(a) > 1 else None
+
+
+def assess_capture(st):
+    """Return (ok, message). Cheap guard against a silently empty capture."""
+    draws = sum(st["prims"].values())
+    byts = st["total_bytes"]
+    problems = []
+    if byts < MIN_COMMAND_BYTES:
+        problems.append(f"only {byts} bytes of commands (want >= {MIN_COMMAND_BYTES})")
+    if draws < MIN_DRAWS:
+        problems.append(f"only {draws} draws (want >= {MIN_DRAWS})")
+    if st["desync"]:
+        problems.append("decoder desynchronised")
+    if problems:
+        return False, ("capture looks EMPTY -- likely a loading screen, a fade, "
+                       "or a mistimed delay:\n    " + "\n    ".join(problems))
+    return True, f"capture looks substantive: {byts} bytes, {draws} draws"
 
 
 def write_export(st, path):

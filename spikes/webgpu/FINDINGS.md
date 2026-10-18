@@ -122,15 +122,53 @@ renderer to be correct.
 
 Items 6 and 7 are why the earlier "5.4% decoded, 79 draws" figures were wrong.
 
+## Gameplay captured — the "floor not ceiling" risk is largely retired
+
+The headline risk of the first pass was that the title screen is not
+representative, and that real gameplay would need a much wider slice of GX.
+It was worth checking, and the answer came back the other way.
+
+`scripts/record-gameplay.sh` drives the game into the first level headlessly —
+Spyro on the emulated portal, a Nunchuk attached, scripted button input through
+Dolphin's Pipes device — and captures there.
+(`harness/reference/ssa-gameplay.png` is what that moment looks like.)
+
+| | Title screen | **Gameplay** |
+|---|---|---|
+| Command volume | 57,628 B | **114,436 B** |
+| BP writes / distinct regs | 1732 / 97 | 2741 / **63** |
+| TEV stages | 1, 2, **9** | **1, 2** |
+| texgens | 1, 2 | **1** |
+| Blend src | inv_dst_alpha, one, src_alpha | same |
+| Blend dst | inv_src_alpha, one | + **dst_alpha** |
+| **Logic ops** | none | **none** |
+| dst-alpha pass | yes | yes |
+| Texture formats | 1, 3, 6, 14 | **identical** |
+| Primitives | 229 fan, 9 strip | 183 fan, 24 strip |
+| Vertex formats | 3 kinds, incl. tex1 | **2 kinds, no tex1** |
+| Decode coverage | 100% | 100% |
+
+Gameplay pushes **twice the command volume** but through a **narrower** feature
+set: fewer distinct registers, fewer texgens, simpler vertex formats, and no
+second texture coordinate. The title screen is the more demanding frame — it
+reaches **9 TEV stages**, gameplay only 2.
+
+Still no logic ops anywhere, which was the one feature that would have forced
+framebuffer readback in WebGPU.
+
+The only genuinely new requirement is **`dst_alpha` as a blend destination
+factor**, which WebGPU supports natively.
+
+**What this does and does not settle.** It is one moment in the first level,
+captured once. Boss fights, spell effects and later worlds are still unmeasured,
+and the inventory remains a floor rather than a proof. But the specific fear —
+that the feature envelope explodes once the game is actually playing — did not
+materialise, and the envelope now looks stable across two very different scenes.
 ## Limits that still stand
 
-- **Title screen, not gameplay.** Captured 75 s into boot with no input. Real
-  gameplay will use more TEV stages, more texgens, probably indirect textures,
-  possibly logic ops. **Every row of the inventory is a floor, not a ceiling.**
-  Capturing gameplay needs scripted input (a `.dtm` movie) and a Skylander on
-  the emulated portal.
 - **One adapter.** Apple/Metal via Chrome 155. Nothing here speaks to
   Windows/D3D12, Linux/Vulkan, Firefox, or Safari.
+- **One gameplay moment**, in the first level. Later content is unmeasured.
 - **Three undecoded `0x48` opcodes** remain in the stream. Small, but not zero.
 
 ## Next
