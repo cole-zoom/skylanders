@@ -1,0 +1,21 @@
+<type>(<scope>): <imperative summary, max 72 chars>
+
+## What this is
+
+
+## Design choices
+
+
+## Why
+
+
+## Caveats and risks
+
+
+## What might go wrong
+
+
+# ── types:  feat fix perf spike chore docs refactor test
+# ── scopes: ppc2wasm dolphin-web webgpu harness web portal storage repo
+# ── All five sections required. Nothing to say -> write "None."
+# ── Full convention: docs/COMMIT_CONVENTION.md

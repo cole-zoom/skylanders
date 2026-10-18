@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────
+# Disc images — NEVER commit. Copyrighted, and 3.8 GB besides.
+# GitHub hard-rejects blobs >100 MB; this is the guardrail.
+# ─────────────────────────────────────────────────────────────
+skylanders-rom/
+*.rvz
+*.iso
+*.wbfs
+*.gcm
+*.wia
+*.nkit.iso
+*.dol
+*.rel
+
+# Figure dumps — per-figure NFC tag data produced by the portal
+*.sky
+*.bin.sky
+
+# ─────────────────────────────────────────────────────────────
+# Vendored upstream sources. Pinned in UPSTREAM.lock, fetched by
+# scripts/bootstrap.sh. Not submodules: both are shallow clones
+# and we want bootstrap to stay a single documented command.
+# ─────────────────────────────────────────────────────────────
+/dolphin/
+/rea/
+
+# ─────────────────────────────────────────────────────────────
+# Oracle traces — CPU/FIFO/DSP captures, routinely multi-GB.
+# Regenerate with harness/, never store.
+# ─────────────────────────────────────────────────────────────
+harness/traces/*
+!harness/traces/.gitkeep
+*.fifolog
+*.trace
+*.ppctrace
+
+# ─────────────────────────────────────────────────────────────
+# Build output
+# ─────────────────────────────────────────────────────────────
+build/
+cmake-build-*/
+target/
+dist/
+out/
+node_modules/
+.emscripten_cache/
+*.wasm
+*.wat
+!spikes/**/*.wat
+.turbo/
+.next/
+.vercel/
+
+# ─────────────────────────────────────────────────────────────
+# Editor / OS
+# ─────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp

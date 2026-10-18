@@ -1,0 +1,5 @@
+# Pinned upstream revisions. Fetched by scripts/bootstrap.sh.
+# Bump deliberately, in its own commit, with the reason in the body.
+
+dolphin  https://github.com/dolphin-emu/dolphin.git  38d619b07691231f54e6f037fcf30a3b64fdd5a5  # version 2609a
+rea      https://github.com/morluto/rea.git          bb212ffecb47e129cc569b9867b2b6e7c9b65685
