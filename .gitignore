@@ -38,6 +38,7 @@ harness/traces/*
 # Build output
 # ─────────────────────────────────────────────────────────────
 build/
+build-*/
 cmake-build-*/
 target/
 dist/
