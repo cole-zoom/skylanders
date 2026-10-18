@@ -93,10 +93,25 @@ while kill -0 $DOLPHIN 2>/dev/null && [ ! -f "$OUT" ]; do sleep 10; done
 sleep 5
 kill $INPUT 2>/dev/null || true
 
-if [ -f "$OUT" ]; then
-  echo "==> captured $OUT ($(stat -f%z "$OUT") bytes)"
-  grep -iE '^\[(fifo|sky)\]' /tmp/record-gameplay.log || true
-else
+if [ ! -f "$OUT" ]; then
   echo "capture failed; see /tmp/record-gameplay.log" >&2
   exit 1
 fi
+
+echo "==> captured $OUT ($(stat -f%z "$OUT") bytes)"
+grep -iE '^\[(fifo|sky)\]' /tmp/record-gameplay.log || true
+
+# The delays above are wall-clock and machine-dependent. On different hardware
+# they drift, and a mistimed capture lands on a loading screen: a plausible
+# ~2 MB file, no error, and an inventory reporting almost no GX usage. Verify
+# the capture has real content rather than trusting the timings.
+echo "==> verifying capture has real content"
+if ! ( cd harness/src && python3 fifo_inventory.py "../../$OUT" --check >/tmp/capture-check.log 2>&1 ); then
+  tail -5 /tmp/capture-check.log >&2
+  echo >&2
+  echo "The capture is empty. The --fifo-delay of ${DELAY}s probably did not" >&2
+  echo "land on gameplay on this machine. Re-run with a different delay, or" >&2
+  echo "use --screenshot-count to sweep for when gameplay is on screen." >&2
+  exit 1
+fi
+tail -1 /tmp/capture-check.log
