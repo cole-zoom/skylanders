@@ -6,11 +6,22 @@
 
 ```
 ✓ Common builds for wasm32          1.96 MB, 68 objects
-· Core / PowerPC                    not attempted yet
-· Memory arena replaced             compiles, will fail at runtime (see below)
+✓ Core builds for wasm32           18.75 MB, 307 objects
+✓ Memory arena replaced             MemArenaEmscripten.cpp, refuses what it cannot do
+✓ Skylander portal survives         Skylander/SkylanderCrypto/SkylanderFigure all present
+✓ Recompilers excluded              9 interpreter objects, 0 JIT objects
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
+· Anything actually RUN             not started
+```
+
+Verified in the archive rather than assumed:
+
+```
+Skylander.cpp.o  SkylanderCrypto.cpp.o  SkylanderFigure.cpp.o   <- portal intact
+Interpreter objects: 9      JIT objects: 0                      <- _M_GENERIC working
+MemArenaEmscripten.cpp.o                                        <- not the Unix one
 ```
 
 Build it with `scripts/build-wasm.sh`.
@@ -50,7 +61,34 @@ Only two, both small, and only one touches Dolphin's own code:
 Everything else that failed was third-party build configuration, not emulator
 source. That is a better ratio than expected.
 
-## The real problem: the memory arena
+## Dolphin's platform detection is allowlist-shaped
+
+Five separate build failures had one cause: `#if` chains that enumerate known
+platforms with no `#else`. A new platform does not get a clear "unsupported"
+error — it gets a confusing one, far from the actual cause:
+
+| File | Symptom | Real cause |
+|---|---|---|
+| SFML `Config.hpp` | `#error This UNIX operating system is not supported` | the only honest one |
+| `Timer.cpp` | `use of undeclared identifier 'CLOCK_UPTIME'` | no `#else` branch |
+| `DriverDetails.cpp` | `invalid use of non-static data member 'm_os'` | `m_os` never defined, so the name resolved to a struct member |
+| `Socket.h` | `use of undeclared identifier 'pollfd_t'` | fallback `#else` omits `<poll.h>` |
+| `EXI_DeviceEthernet.h` | `use of undeclared identifier 'm_network_ref'` | members declared only inside the allowlist |
+
+The `DriverDetails` one is the worst of them: the error names a struct member
+that has nothing to do with the problem.
+
+Emscripten was added to each allowlist rather than given a fallback branch,
+because the thing these guards actually gate on — BSD sockets, `<poll.h>`,
+threads — Emscripten genuinely provides.
+
+**One self-inflicted bug worth recording.** The first attempt at the
+`EXI_DeviceEthernet.h` allowlists used a regex that matched only the first line
+of a multi-line `#if`, splicing text into the middle and orphaning the rest of
+the condition. It produced a file that looked patched and was syntactically
+broken. Reverted and redone by appending to the end of the full condition.
+
+## The memory arena
 
 `MemArenaUnix.cpp` was selected by CMake's generic-Unix branch and **compiled
 cleanly**. It will not work.
@@ -64,21 +102,36 @@ memory is a single flat buffer.
 **Compiling is not working, and this is the clearest example of it in the
 project so far.** Nothing in the build output hints at a problem.
 
-The plan's answer is `MAIN_FASTMEM_ARENA=false`, which `docs/PLAN.md` §1 records
-as an independent upstream toggle. Next step is to confirm the software MMU path
-actually runs without the arena, and to add a `MemArenaEmscripten.cpp` that
-fails loudly on construction rather than silently returning broken mappings —
-so that if the arena is ever reached, it says so instead of corrupting guest
-memory.
+**Fixed.** `MemArenaEmscripten.cpp` now implements only what can work and
+refuses the rest:
+
+- `GrabSHMSegment` / `CreateView` / `GetPageSize` — a flat allocation with views
+  as offsets into it. This is all `Memory::Init` needs.
+- `ReserveMemoryRegion` — returns `nullptr`. `Memmap.cpp` already treats that as
+  "fastmem unavailable" and falls back to the software MMU, which is exactly
+  right.
+- `MapInMemoryRegion` / `ChangeMappingProtection` / `UnmapFromMemoryRegion` —
+  **panic**. They cannot be implemented and must never be reached; returning a
+  plausible pointer would silently corrupt guest memory.
+
+The CMake branch is placed *before* the generic-Unix one, since Emscripten
+defines `__unix__` and would otherwise keep selecting `MemArenaUnix.cpp`.
+
+Note that `CreateView` returning offsets means two views of the same offset get
+the *same* address rather than two addresses aliasing one page. Memory mirrors
+therefore cannot work on this backend. Nothing needs them with fastmem off, but
+it is a real limitation, not an implementation detail.
+
+`MemoryUtil.cpp` still references `mmap`/`mprotect`. Its anonymous-private
+mappings work under Emscripten; the `PROT_EXEC` and `mprotect` paths are
+JIT-only and `_M_GENERIC` excludes them. Unverified at runtime.
 
 ## Next
 
-1. **`MemArenaEmscripten.cpp`** that refuses to pretend, plus confirming
-   `MAIN_FASTMEM_ARENA=false` is viable end to end.
-2. **Build `core`**, which is where the interesting failures will be: threading,
-   filesystem, the `IOS::HLE::USB` stack, and the emulated Skylander portal that
-   has to survive.
-3. **Stub host USB** so libusb is never reached while the emulated portal is.
+1. **Run something.** Nothing in either library has been executed. A linking
+   archive says nothing about whether it works, and this project has repeatedly
+   found that gap the expensive way.
+2. **Stub host USB** so libusb is never reached while the emulated portal is.
 4. **`HttpBlobReader`** — a `DiscIO::BlobReader` subclass issuing range requests
    against the RVZ chunk index.
 5. **Differential harness in CI**, comparing floats bit-exactly (see

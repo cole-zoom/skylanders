@@ -1,0 +1,215 @@
+diff --git a/Source/Core/Common/CMakeLists.txt b/Source/Core/Common/CMakeLists.txt
+index c94c3e2..3b24971 100644
+--- a/Source/Core/Common/CMakeLists.txt
++++ b/Source/Core/Common/CMakeLists.txt
+@@ -248,6 +248,14 @@ elseif(APPLE)
+     Logging/ConsoleListenerNix.cpp
+     MemArenaDarwin.cpp
+   )
++elseif(EMSCRIPTEN)
++  # Must come before the generic-Unix branch: Emscripten defines __unix__, so
++  # that branch would select MemArenaUnix.cpp, which compiles cleanly and then
++  # fails at runtime inside mmap.
++  target_sources(common PRIVATE
++    Logging/ConsoleListenerNix.cpp
++    MemArenaEmscripten.cpp
++  )
+ else()
+   target_sources(common PRIVATE
+     Logging/ConsoleListenerNix.cpp
+diff --git a/Source/Core/Common/MemArena.h b/Source/Core/Common/MemArena.h
+index 188164b..f890c5f 100644
+--- a/Source/Core/Common/MemArena.h
++++ b/Source/Core/Common/MemArena.h
+@@ -148,6 +148,11 @@ private:
+ 
+   vm_address_t m_region_address = 0;
+   vm_size_t m_region_size = 0;
++#elif defined(__EMSCRIPTEN__)
++  // WebAssembly has no virtual memory: a single flat allocation, and "views"
++  // are offsets into it. See MemArenaEmscripten.cpp.
++  u8* m_block = nullptr;
++  std::size_t m_block_size = 0;
+ #else
+   int m_shm_fd = 0;
+   void* m_reserved_region = nullptr;
+diff --git a/Source/Core/Common/MemArenaEmscripten.cpp b/Source/Core/Common/MemArenaEmscripten.cpp
+new file mode 100644
+index 0000000..a87c990
+--- /dev/null
++++ b/Source/Core/Common/MemArenaEmscripten.cpp
+@@ -0,0 +1,156 @@
++// Copyright 2008 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// MemArena for WebAssembly.
++//
++// Every other backend builds this class on virtual memory: a shared memory
++// object mapped at several virtual addresses at once, so one physical page can
++// be reached through many guest addresses. That is what makes Dolphin's fast
++// memory path possible — the recompiler dereferences a guest address directly
++// and the MMU does the rest.
++//
++// WebAssembly has none of it. Linear memory is one flat buffer. There is no
++// mmap, no MAP_SHARED, no MAP_FIXED, no aliasing, and no page protection.
++//
++// So this backend does the one thing it can do honestly:
++//
++//   * GrabSHMSegment / CreateView / GetPageSize  — implemented. A flat
++//     allocation with views returned as offsets into it. This is all that
++//     Memory::Init needs, and it is enough to run with the software MMU.
++//
++//   * ReserveMemoryRegion — returns nullptr. Memmap.cpp already treats that as
++//     "fastmem unavailable" and carries on, which is exactly right here.
++//
++//   * MapInMemoryRegion / ChangeMappingProtection / UnmapFromMemoryRegion —
++//     cannot be implemented and must never be reached. They panic rather than
++//     return a plausible-looking pointer.
++//
++// That last point is the reason this file exists at all. CMake's generic-Unix
++// branch happily selects MemArenaUnix.cpp for Emscripten and it COMPILES
++// CLEANLY, then fails at runtime inside mmap with nothing pointing at the
++// cause. A backend that refuses out loud is worth more than one that builds.
++
++#include "Common/MemArena.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#include "Common/Assert.h"
++#include "Common/CommonTypes.h"
++#include "Common/Logging/Log.h"
++#include "Common/MsgHandler.h"
++
++namespace Common
++{
++// WebAssembly's page size. Not the host's, and not configurable.
++static constexpr size_t WASM_PAGE_SIZE = 65536;
++
++MemArena::MemArena() = default;
++
++MemArena::~MemArena()
++{
++  ReleaseSHMSegment();
++}
++
++void MemArena::GrabSHMSegment(size_t size, std::string_view base_name)
++{
++  ReleaseSHMSegment();
++
++  // Round up so the allocation is page-aligned both in size and address;
++  // aligned_alloc requires the size to be a multiple of the alignment.
++  const size_t rounded = (size + WASM_PAGE_SIZE - 1) & ~(WASM_PAGE_SIZE - 1);
++  m_block = static_cast<u8*>(std::aligned_alloc(WASM_PAGE_SIZE, rounded));
++  if (!m_block)
++  {
++    PanicAlertFmt("MemArena: could not allocate {} bytes of guest memory.", rounded);
++    m_block_size = 0;
++    return;
++  }
++
++  // Guest memory is expected to start zeroed; aligned_alloc does not.
++  std::memset(m_block, 0, rounded);
++  m_block_size = rounded;
++
++  INFO_LOG_FMT(MEMMAP, "MemArena(emscripten): {} bytes at {}", rounded,
++               static_cast<void*>(m_block));
++}
++
++void MemArena::ReleaseSHMSegment()
++{
++  if (!m_block)
++    return;
++  std::free(m_block);
++  m_block = nullptr;
++  m_block_size = 0;
++}
++
++void* MemArena::CreateView(s64 offset, size_t size)
++{
++  if (!m_block)
++    return nullptr;
++  if (offset < 0 || static_cast<size_t>(offset) + size > m_block_size)
++  {
++    PanicAlertFmt("MemArena::CreateView(): offset {} size {} outside a {} byte segment.", offset,
++                  size, m_block_size);
++    return nullptr;
++  }
++
++  // Without virtual memory a "view" can only be the memory itself. Two views of
++  // the same offset therefore return the SAME address rather than two addresses
++  // aliasing one page. Dolphin uses distinct addresses only for fastmem, which
++  // is disabled here, so this is sufficient — but it is why mirrors cannot work
++  // on this backend.
++  return m_block + offset;
++}
++
++void MemArena::ReleaseView(void* view, size_t size)
++{
++  // Views are offsets into the single allocation; the allocation owns them.
++}
++
++u8* MemArena::ReserveMemoryRegion(size_t memory_size)
++{
++  // Fastmem needs a multi-gigabyte reservation of *address space* that is not
++  // backed until mapped. WebAssembly cannot reserve without committing, and
++  // cannot commit several gigabytes. Memmap.cpp handles nullptr by leaving
++  // m_is_fastmem_arena_initialized false and using the software MMU.
++  WARN_LOG_FMT(MEMMAP,
++               "MemArena(emscripten): refusing a {} byte fastmem reservation; "
++               "WebAssembly has no virtual address space to reserve. "
++               "Falling back to the software MMU.",
++               memory_size);
++  return nullptr;
++}
++
++void MemArena::ReleaseMemoryRegion()
++{
++  // Nothing was ever reserved.
++}
++
++void* MemArena::MapInMemoryRegion(s64 offset, size_t size, void* base, bool writeable)
++{
++  // Only reachable if something mapped into a region ReserveMemoryRegion never
++  // handed out. Returning a pointer here would silently corrupt guest memory.
++  PanicAlertFmt("MemArena::MapInMemoryRegion() is not implementable on WebAssembly. "
++                "Fastmem must stay disabled (MAIN_FASTMEM_ARENA=false).");
++  return nullptr;
++}
++
++bool MemArena::ChangeMappingProtection(void* view, size_t size, bool writeable)
++{
++  // WebAssembly linear memory has no per-page protection at all.
++  PanicAlertFmt("MemArena::ChangeMappingProtection() is not implementable on WebAssembly.");
++  return false;
++}
++
++void MemArena::UnmapFromMemoryRegion(void* view, size_t size)
++{
++  PanicAlertFmt("MemArena::UnmapFromMemoryRegion() is not implementable on WebAssembly.");
++}
++
++size_t MemArena::GetPageSize() const
++{
++  return WASM_PAGE_SIZE;
++}
++}  // namespace Common
+diff --git a/Source/Core/Common/Timer.cpp b/Source/Core/Common/Timer.cpp
+index fcbbd7b..7f8b911 100644
+--- a/Source/Core/Common/Timer.cpp
++++ b/Source/Core/Common/Timer.cpp
+@@ -214,6 +214,13 @@ auto SteadyAwakeClock::now() -> time_point
+       CLOCK_MONOTONIC;
+ #elif defined(__APPLE__)
+       CLOCK_UPTIME_RAW;
++#elif defined(__EMSCRIPTEN__)
++      // Emscripten has no CLOCK_UPTIME. CLOCK_MONOTONIC is what it provides,
++      // and it shares Linux's semantics of not counting suspended time --
++      // which in a browser means a backgrounded tab. That is the correct
++      // behaviour here: wall time spent with the tab hidden should not be
++      // charged to the emulated machine.
++      CLOCK_MONOTONIC;
+ #else
+       CLOCK_UPTIME;
+ #endif
