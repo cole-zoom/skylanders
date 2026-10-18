@@ -1,0 +1,95 @@
+diff --git a/Source/Core/DolphinNoGUI/MainNoGUI.cpp b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
+index 3bf40ea..e14b081 100644
+--- a/Source/Core/DolphinNoGUI/MainNoGUI.cpp
++++ b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
+@@ -4,7 +4,9 @@
+ #include "DolphinNoGUI/Platform.h"
+ 
+ #include <OptionParser.h>
++#include <chrono>
+ #include <csignal>
++#include <thread>
+ #include <cstdio>
+ #include <string>
+ #include <vector>
+@@ -20,6 +22,8 @@
+ #include "Core/BootManager.h"
+ #include "Core/Core.h"
+ #include "Core/DolphinAnalytics.h"
++#include "Core/FifoPlayer/FifoDataFile.h"
++#include "Core/FifoPlayer/FifoRecorder.h"
+ #include "Core/Host.h"
+ #include "Core/System.h"
+ 
+@@ -184,6 +188,12 @@ static std::unique_ptr<Platform> GetPlatform(const optparse::Values& options)
+ #define main app_main
+ #endif
+ 
++// ── FIFO capture (instrumentation only; observes, never alters emulation) ──
++static int s_fifo_frames = 0;
++static std::string s_fifo_output;
++static bool s_fifo_started = false;
++static int s_fifo_delay = 0;
++
+ int main(const int argc, char* argv[])
+ {
+   const auto parser =
+@@ -210,6 +220,22 @@ int main(const int argc, char* argv[])
+ #endif
+       });
+ 
++  parser->add_option("--fifo-record")
++      .type("int")
++      .action("store")
++      .set_default(0)
++      .help("Record this many GX FIFO frames, then write the log and exit");
++  parser->add_option("--fifo-delay")
++      .type("int")
++      .action("store")
++      .set_default(0)
++      .help("Wait this many seconds after boot before recording (lets the game "
++            "reach a drawing state; recording at boot captures nothing)");
++  parser->add_option("--fifo-output")
++      .action("store")
++      .set_default("fifo.dff")
++      .help("Path for the recorded FIFO log (default: fifo.dff)");
++
+   optparse::Values& options = CommandLineParse::ParseArguments(parser.get(), argc, argv);
+   std::vector<std::string> args = parser->args();
+ 
+@@ -283,9 +309,35 @@ int main(const int argc, char* argv[])
+     return 1;
+   }
+ 
++  s_fifo_frames = static_cast<int>(options.get("fifo_record"));
++  s_fifo_output = static_cast<const char*>(options.get("fifo_output"));
++  s_fifo_delay = static_cast<int>(options.get("fifo_delay"));
++
+   auto core_state_changed_hook = Core::AddOnStateChangedCallback([](const Core::State state) {
+     if (state == Core::State::Uninitialized)
+       s_platform->Stop();
++
++    if (state == Core::State::Running && s_fifo_frames > 0 && !s_fifo_started)
++    {
++      s_fifo_started = true;
++      // Recording must begin once the game is actually drawing. Starting at
++      // State::Running captures the frames before anything is submitted.
++      std::thread([] {
++        if (s_fifo_delay > 0)
++        {
++          fprintf(stderr, "[fifo] waiting %ds for the game to start drawing\n", s_fifo_delay);
++          std::this_thread::sleep_for(std::chrono::seconds(s_fifo_delay));
++        }
++        fprintf(stderr, "[fifo] recording %d frames -> %s\n", s_fifo_frames,
++                s_fifo_output.c_str());
++        Core::System::GetInstance().GetFifoRecorder().StartRecording(s_fifo_frames, [] {
++        FifoDataFile* file = Core::System::GetInstance().GetFifoRecorder().GetRecordedFile();
++        const bool ok = file && file->Save(s_fifo_output);
++        fprintf(stderr, "[fifo] %s %s\n", ok ? "wrote" : "FAILED to write", s_fifo_output.c_str());
++        s_platform->RequestShutdown();
++        });
++      }).detach();
++    }
+   });
+ 
+ #ifdef _WIN32
