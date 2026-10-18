@@ -10,11 +10,60 @@
 ✓ Memory arena replaced             MemArenaEmscripten.cpp, refuses what it cannot do
 ✓ Skylander portal survives         Skylander/SkylanderCrypto/SkylanderFigure all present
 ✓ Recompilers excluded              9 interpreter objects, 0 JIT objects
+✓ First execution under wasm32      harness/wasm-smoke, both targets PASSED
+✓ MIFARE crypto verified            3 figures byte-identical vs native
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
-· Anything actually RUN             not started
 ```
+
+## First execution — and the first real differential result
+
+`harness/wasm-smoke/run.sh` builds the same source for wasm32 and native and
+diffs the output.
+
+```
+                                                 native    wasm32
+MemArena: views, zeroing, round-trip             ok        ok
+MemArena: non-overlapping regions                ok        ok
+ReserveMemoryRegion                              succeeds  refuses
+Spyro          id=16  var=0x0000   fnv1a=  e32e5ffc0f14cafe = e32e5ffc0f14cafe
+Gill Grunt     id=14  var=0x0000   fnv1a=  323814c7d30deee9 = 323814c7d30deee9
+Whirlwind (S2) id=0   var=0x1801   fnv1a=  cc48aed2b4be0e86 = cc48aed2b4be0e86
+```
+
+**The MIFARE crypto produces byte-identical figure data under wasm32.** That
+was the most load-bearing untested claim in the project — an endianness or
+integer-width difference would have produced figures the game silently rejects.
+Three figures, fixed NUID so `Create()` is deterministic, hashing the decrypted
+image that the game actually reads back through the portal.
+
+`MemArenaEmscripten` works at runtime, and refuses the fastmem reservation as
+designed while the native backend grants it. That asymmetry is the point, not a
+discrepancy.
+
+### Three times the test was wrong, not the code
+
+Worth recording, because the pattern is the same one that has cost the most
+time in this project — asserting an implementation detail as if it were a
+contract:
+
+1. Asserted a second view sits at `base + offset`. True only on Emscripten;
+   native backends map at an unrelated virtual address.
+2. Asserted overlapping views alias. True on neither, and `vm_remap` on Darwin
+   does not behave that way.
+3. Only then checked what `Memory::Init` actually does: one view per physical
+   region, at distinct non-overlapping offsets. That is the contract, and both
+   targets satisfy it.
+
+### Linking notes
+
+The wasm link needs only `SkylanderFigure.cpp.o` and `SkylanderCrypto.cpp.o`.
+The native link additionally needs `list_skylanders` and
+`NormalizeSkylanderType`, because `ld64` keeps the unreached reference from
+`GetData()` that `wasm-ld` eliminates at `-O2`. `native_stubs.cpp` supplies
+them, and `NormalizeSkylanderType` **aborts** rather than guessing, so the stub
+cannot quietly answer wrong if the figure-data path is ever exercised.
 
 Verified in the archive rather than assumed:
 
