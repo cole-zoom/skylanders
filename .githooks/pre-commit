@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Blocks the two things that must never enter this repo's history:
+#   1. Blobs large enough to break a push (GitHub hard-rejects >100 MB)
+#   2. Disc images and figure dumps, wherever they are placed
+#
+# .gitignore already covers the expected paths. This catches the case
+# .gitignore cannot: a dump placed somewhere unexpected under a name that
+# does not match an ignored pattern.
+#
+# Deliberate override:  ALLOW_BIG_COMMIT=1 git commit ...
+#
+# Portability: macOS ships bash 3.2, so no mapfile, no ${var,,}, and no
+# bare ${#arr[@]} under `set -u`. Keep this script 3.2-clean.
+
+MAX_BYTES=$((25 * 1024 * 1024))   # 25 MB. Well under GitHub's 100 MB wall,
+                                  # so we fail at commit, not at push.
+
+oversized=""
+forbidden=""
+
+# Added/copied/modified only; deletes have no blob to inspect.
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+
+  # ── 1. size, read from the staged blob (not the worktree file) ──
+  size=$(git cat-file -s ":$f" 2>/dev/null)
+  if [ -n "$size" ] && [ "$size" -gt "$MAX_BYTES" ]; then
+    mb=$(( size / 1048576 ))
+    oversized="${oversized}      ${mb} MB  ${f}
+"
+  fi
+
+  # ── 2. forbidden by type, regardless of location ──
+  lower=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    *.rvz|*.iso|*.wbfs|*.gcm|*.wia|*.nkit.iso|*.ciso)
+      forbidden="${forbidden}      ${f}  — disc image
+" ;;
+    *.sky)
+      forbidden="${forbidden}      ${f}  — Skylander figure dump
+" ;;
+    *.fifolog|*.trace|*.ppctrace)
+      forbidden="${forbidden}      ${f}  — oracle trace, regenerate instead
+" ;;
+  esac
+done <<EOF
+$(git diff --cached --name-only --diff-filter=ACM)
+EOF
+
+fail=0
+
+if [ -n "$oversized" ]; then
+  {
+    echo
+    echo "BLOCKED: staged file exceeds 25 MB"
+    printf '%s' "$oversized"
+    echo
+    echo "      Large binaries do not belong in this repo. Disc images go in"
+    echo "      skylanders-rom/ (gitignored); oracle traces are regenerated"
+    echo "      by harness/, never stored."
+  } >&2
+  fail=1
+fi
+
+if [ -n "$forbidden" ]; then
+  {
+    echo
+    echo "BLOCKED: file type that must not be committed"
+    printf '%s' "$forbidden"
+    echo
+    echo "      Blocked by type, not location — moving it elsewhere will not"
+    echo "      help. See .gitignore."
+  } >&2
+  fail=1
+fi
+
+if [ "$fail" -eq 1 ]; then
+  if [ "${ALLOW_BIG_COMMIT:-}" = "1" ]; then
+    echo >&2
+    echo "ALLOW_BIG_COMMIT=1 set — proceeding anyway." >&2
+    exit 0
+  fi
+  {
+    echo
+    echo "      Override (use deliberately):  ALLOW_BIG_COMMIT=1 git commit ..."
+    echo
+  } >&2
+  exit 1
+fi
+
+exit 0

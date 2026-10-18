@@ -40,7 +40,8 @@ C++ and ports for free.
 ./scripts/bootstrap.sh
 ```
 
-Fetches pinned upstream sources (`UPSTREAM.lock`) and points `commit.template` at `.gitmessage`.
+Fetches pinned upstream sources (`UPSTREAM.lock`), points `commit.template` at `.gitmessage`,
+and installs the `pre-commit` hook that blocks disc images and oversized blobs.
 
 You supply your own disc dump at `skylanders-rom/`. It is gitignored and never committed —
 GitHub rejects blobs over 100 MB, and distributing game images is not something this repo does.

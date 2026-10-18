@@ -7,6 +7,9 @@ cd "$(dirname "$0")/.."
 git config commit.template .gitmessage
 echo "commit template -> .gitmessage"
 
+git config core.hooksPath .githooks
+echo "hooks           -> .githooks (pre-commit size + disc-image guard)"
+
 while read -r name url sha _; do
   [[ -z "${name:-}" || "$name" == \#* ]] && continue
   if [[ -d "$name/.git" ]]; then
