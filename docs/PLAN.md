@@ -10,7 +10,8 @@ available through an emulated Portal of Power. **No streaming, no server-side em
 | **Target** | Chrome / Edge desktop first |
 | **Estimate** | 12–18 months |
 | **Baseline** | `dolphin-emu/dolphin` @ 2609a |
-| **Go/no-go** | End of Phase 0 |
+| **Go/no-go** | Phase 0 complete — **proceed** |
+| **Measured** | Spike A 863.9 MIPS · Spike C 16.670 ms p99 · Spike B partial |
 
 ---
 
@@ -83,17 +84,46 @@ interpreter discovers at runtime — dynamically loaded RELs, overlays, anything
 missed. Both emit into one function table, so the dispatcher never needs to know which tier produced
 a block.
 
-### Why this should land at playable speed
+### Speed — measured, not assumed
 
-On an M4, native Dolphin runs *Spyro's Adventure* at several hundred percent of full speed.
-WebAssembly typically costs between 1.2× and 2× against native C for compute-bound work, and our
-translation gives up a few more things on top: no direct host register mapping, bounds-checked
-memory on every guest load and store, and indirect calls at block boundaries. Call it **2–4× slower
-than the AArch64 recompiler**.
+This section originally assumed WebAssembly would cost **2–4× against the AArch64 recompiler** and
+derived a 75–250% speed range from it. **Spike A measured it instead, and that assumption was
+wrong in our favour.**
 
-Against a 300–500% starting margin, that lands between 75% and 250% of full speed. The bottom of
-that range misses and the top clears comfortably — which is precisely why Phase 0 exists and why it
-carries a hard numeric gate. We measure before we commit.
+600-ish lines of recompiler-shaped Rust, built natively and as `wasm32`, 30M iterations × 11 trials
+on an M4 (`spikes/jit/`):
+
+| Variant | Native aarch64 | Chrome 155 | ratio |
+|---|---|---|---|
+| inlined, bounds-checked | 842.9 MIPS | 722.8 | 0.86 |
+| inlined, masked + lazy CR | 844.2 MIPS | 609.3 | 0.72 |
+| **state in memory, `call_indirect`** | **596.9 MIPS** | **863.9** | **1.45** |
+
+The third row is the one that predicts the emulator — guest state in memory, blocks reached through
+a runtime-populated indirect table. **WebAssembly beat native by 1.45× on it**, and its slowest
+trial (793 MIPS) still clears the 600 MIPS gate.
+
+Why WASM wins there is not established. Two plausible contributors, neither verified: V8's
+`call_indirect` against a bounded table may be cheaper than a native load-from-global plus
+unpredictable indirect branch, and eight small block functions may give V8's register allocator an
+easier problem than one large loop.
+
+**This is a ceiling, not a prediction.** The kernel is synthetic, with eight blocks of one shape and
+unrealistically good icache behaviour. Real code has thousands of varied blocks. If diversity and
+icache pressure cost 2×, this lands near 430 MIPS and the gate becomes marginal again.
+
+### Floating point must not contract
+
+Spike A surfaced a requirement the plan did not have. The `naive` and `tuned` variants produce
+identical checksums on both targets; the dispatch variant does not — native `8641789f` vs Chrome
+`27617d8c`. They agree at 10 iterations and diverge by 10M, which is rounding, not logic.
+
+aarch64 contracts `a*c + b*d` into a fused multiply-add with one rounding step. WebAssembly has no
+scalar FMA instruction and rounds twice.
+
+Broadway's paired-single operations have defined rounding behaviour, so **`ppc2wasm` must control
+contraction explicitly**, and **the differential harness must compare floats bit-exactly**. A
+harness built with tolerant float comparison will not catch this class of bug at all.
 
 ---
 
@@ -107,7 +137,26 @@ browser means Emscripten pthreads over `SharedArrayBuffer`, which requires servi
 
 The constraint that shapes the topology: **`Atomics.wait` throws on the main thread.** Every thread
 that blocks on a synchronisation primitive must therefore be a worker, and the main thread is left
-with input sampling and the Portal UI.
+with input sampling and the Portal UI. Spike C verified this directly rather than assuming it.
+
+**Spike C measured the whole topology** (`spikes/threading/`): three CPU workers blocking on
+`Atomics.wait` and burning 3 ms each, a GPU worker owning the canvas via `transferControlToOffscreen`,
+an AudioWorklet pulling from a lock-free shared-memory ring, and a main thread that never blocks.
+600 frames at 60 Hz in Chrome 155:
+
+| | |
+|---|---|
+| interval mean | 16.667 ms (target 16.667) |
+| p50 / p95 / p99 | 16.665 / 16.670 / **16.670** ms |
+| dropped frames | **0** |
+| audio underruns | **0** |
+| GPU frame signals observed | **600 / 600** |
+
+Three microseconds of jitter at p99. The browser's primitives are good enough.
+
+That is **not** the same as the emulator pacing well: these threads never wait on each other, while
+real emulation has the CPU thread feeding the GX FIFO and the DSP consuming on a deadline, where a
+stall anywhere propagates.
 
 ```mermaid
 flowchart TB
@@ -142,6 +191,39 @@ hundred megabytes fetched lazily and kept across sessions.
 Worth testing early and cheaply: that file is suspiciously large for RVZ. Re-converting it with
 `DolphinTool` at zstd level 22 with junk-data scrubbing could plausibly cut it by more than half
 before any of this matters.
+
+### 3a. What the game actually asks of the GPU
+
+Scope measured from two captures, both decoded 100% (`harness/src/fifo_inventory.py`). The second
+required driving the game into the first level headlessly — Spyro on the emulated portal, a Nunchuk
+attached, scripted input through Dolphin's Pipes device (`scripts/record-gameplay.sh`).
+
+| | Title screen | Gameplay |
+|---|---|---|
+| Command volume | 57,628 B | **114,436 B** |
+| BP writes / distinct regs | 1732 / 97 | 2741 / **63** |
+| TEV stages | 1, 2, **9** | **1, 2** |
+| texgens | 1, 2 | **1** |
+| Blend dst factors | inv_src_alpha, one | + **dst_alpha** |
+| **Logic ops** | none | **none** |
+| Texture formats | 1, 3, 6, 14 | identical |
+| Primitives | 229 fan, 9 strip | 183 fan, 24 strip |
+
+Three things follow:
+
+1. **Logic ops are unused.** They would require reading the destination colour in the fragment
+   shader, which WebGPU cannot do — no framebuffer fetch, no programmable blending. Supporting them
+   means a readback per draw or full subpass emulation. Not needed.
+2. **Gameplay is narrower than the title screen**, not wider. Twice the command volume through
+   fewer registers, fewer texgens and simpler vertex formats. The title screen is the more demanding
+   frame. This retires the main scoping risk, though it is still one moment in the first level.
+3. **WebGPU has no triangle-fan topology** and fans are the hot path. Expansion to triangle lists
+   belongs in the vertex loader, not per draw.
+
+Confirmed present on a real Chrome 155 adapter (`spikes/webgpu/`), which reports **apple / metal-3**:
+`texture-compression-bc` (CMPR uploads as BC1 with no CPU decode), `dual-source-blending` (the
+dst-alpha pass in one pass), `float32-filterable`. The adapter being Metal is direct support for
+Bet 03.
 
 ---
 
@@ -202,23 +284,22 @@ blocks in OPFS. Saves go to the same place.
 
 Phase 0 is a decision, not a deliverable. Everything after it is conditional on passing.
 
-### Phase 0 — Three spikes that decide whether to build this · ~4 weeks
+### Phase 0 — COMPLETE · decision: proceed
 
-Each spike answers one question with a number. Any spike that misses its gate stops the project
-before the expensive part — that is the entire point of running them first.
+| Spike | Gate | Outcome |
+|---|---|---|
+| **A — throughput** | ≥ 600 MIPS | **MET — 863.9 MIPS** in Chrome (slowest trial 793) |
+| **B — graphics** | render one frame correctly | **capability confirmed; render gate not met** |
+| **C — threading** | hold 16.67 ms pacing | **MET — 16.670 ms p99, 0 drops, 0 underruns** |
 
-- **Spike A — throughput.** Hand-translate a hot Skylanders function to WebAssembly and measure
-  sustained guest instructions per second in Chrome against the native AArch64 recompiler.
-- **Spike B — graphics.** Capture one real GX FIFO frame from the game, replay it through a minimal
-  WebGPU renderer, confirm the TEV stages translate to WGSL and that blending gaps have workable
-  fallbacks.
-- **Spike C — threading.** Emscripten pthreads with three busy workers, an AudioWorklet and an
-  OffscreenCanvas, holding 16.6 ms frame pacing.
+Spike B is the one carried forward. Every WebGPU capability the game needs is confirmed present in
+real Chrome, and 100% of a captured frame decodes, but no renderer exists yet — XF matrices, texture
+decode and TEV→WGSL are Phase 3 work rather than spike work. Nothing it found disqualifies the
+approach.
 
-> **Gate** — Spike A sustains **≥ 600 MIPS** guest throughput, roughly 100% of a 729 MHz Broadway
-> with headroom. Spike B renders one frame correctly. Spike C holds pacing with no main-thread
-> `Atomics.wait` violation. Miss any of the three and we stop, write up why, and revisit streaming.
-
+**What Phase 0 changed in this plan:** the 2–4× WASM penalty assumption is gone (§2), float
+contraction became a hard requirement (§2), and the GX scope is now measured rather than guessed
+(§3a).
 ### Phase 1 — Dolphin core under Emscripten, headless · ~2 months
 
 Get `Core` and `PowerPC` compiling to `wasm32` with the Null video backend, no audio, no UI. Replace
@@ -285,10 +366,12 @@ What actually kills this, ranked by how much it would cost us.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Recompiled code misses the speed target | **Fatal** | Measured in Spike A before any commitment. If we land at 60–80% of target, the escape hatch is reducing accuracy in the DSP and texture paths rather than abandoning the approach. |
-| Condition-register and paired-single emulation cost more than modelled | **Fatal** | Lazy flag evaluation — record the operands, compute the flags only when something reads them. Standard in recompilers; must be in `ppc2wasm` from the first commit, not retrofitted. |
+| Recompiled code misses the speed target | **Retired to High** | Spike A measured 863.9 MIPS against a 600 gate, with WASM *beating* native 1.45× on the realistic variant. Remaining risk is that the kernel is synthetic: real block diversity and icache pressure could cost 2×, landing near 430 and making the gate marginal again. |
+| Condition-register and paired-single emulation cost more than modelled | **High** | Lazy flag evaluation, in `ppc2wasm` from the first commit. Spike A's lazy-CR variant showed no penalty against the eager one. |
+| **Float contraction diverges from Broadway** | **Fatal** | **New, found in Spike A.** aarch64 fuses `a*c+b*d` into an FMA; WASM has no scalar FMA and rounds twice. Broadway's paired singles have defined rounding. `ppc2wasm` must control contraction, and the harness must compare floats **bit-exactly** — a tolerant comparison misses this entire class. |
 | Self-modifying code or overlays defeat ahead-of-time analysis | High | The interpreter plus runtime tier exists precisely for this. Risk is to *speed*, not correctness — we find out in Phase 2 what share of execution stays interpreted. |
-| WebGPU has no framebuffer fetch, hurting EFB blend accuracy | High | Dolphin already runs on APIs without it. Spike B tests the specific blend modes *this* game uses rather than the full GX matrix. |
+| WebGPU has no framebuffer fetch, hurting EFB blend accuracy | **Retired to Low** | Spike B found **no logic ops** in either capture, which is what would have forced a readback. Blend factors used are all natively supported. |
+| GX scope is read as a ceiling rather than a floor | **High** | Both captures are from the first level. Boss fights, spell effects and later worlds are unmeasured. Capture more before any irreversible scoping decision. |
 | OPFS quota or eviction loses the cached disc | Medium | Request persistent storage; degrade to re-fetching range requests on eviction rather than failing. |
 | Safari and Firefox lag on WebGPU or threading features | Accepted | Chrome and Edge desktop first, explicitly. Others follow when they can. |
 | Browser memory ceiling | **Cleared** | 88 MB of guest RAM plus caches and compiled code fits inside the `wasm32` 4 GB limit comfortably. `memory64` is not needed, which keeps the door open for Safari. |
@@ -310,20 +393,34 @@ Every one of these is a thing we could build and a reason the project would not 
 
 ---
 
-## 8. This week
+## 8. Now — Phase 1
 
-Phase 0 work that can start immediately.
+Phase 0 is complete and the decision is to proceed. Phase 1 is getting Dolphin's core compiling to
+`wasm32` under Emscripten, headless, with the differential harness running from day one.
 
-1. **Install the toolchain.** Rust via rustup, Emscripten SDK, Ninja. Everything else is already
-   here — CMake 4.2, Node 22, and Dolphin 2609a for the oracle.
-2. **Build native Dolphin from the clone.** We need our own instrumented build to capture traces,
-   and it confirms the tree compiles before we start changing it.
-3. **Capture the first oracle traces.** Boot the game natively with CPU-block and FIFO logging.
-   These become the Phase 1 test corpus and the input to Spike B.
-4. **Run Spike A.** The throughput number gates everything. Nothing else in Phase 0 matters if this
-   one misses.
-5. **Re-compress the disc image.** `DolphinTool` at zstd 22 with scrubbing. Cheap, parallel to
-   everything else, and possibly halves the delivery problem.
+1. **Build `Common` under Emscripten first.** The smallest library with the most host-specific code
+   — threads, filesystem, CPU detection, memory arena. What breaks there defines the port surface
+   for everything above it.
+2. **Replace the memory arena.** `MAIN_FASTMEM_ARENA=false` is already supported upstream; confirm
+   the software MMU path builds and runs without a reserved virtual region.
+3. **Stub the host USB stack.** The emulated Skylander portal is platform-independent and must
+   survive; libusb must not be reached.
+4. **Bring up `HttpBlobReader`.** A `DiscIO::BlobReader` subclass issuing range requests against the
+   RVZ chunk index, cached in OPFS.
+5. **Differential harness in CI.** Native Dolphin as oracle, comparing floats **bit-exactly** —
+   see §2 on contraction.
+
+> **Gate** — the game's boot sequence executes under the interpreter and CPU state matches a
+> captured native trace instruction for instruction. Speed is irrelevant here; correctness is the
+> whole deliverable.
+
+### Already built in Phase 0, reused here
+
+- `scripts/build-oracle.sh` — stock native Dolphin, the test oracle
+- `scripts/record-gameplay.sh` — drives the game into a level headlessly (portal + Nunchuk +
+  scripted input) and verifies the capture is not a loading screen
+- `harness/src/` — FIFO decoder, 100% stream coverage, indexed vertex array resolution
+- `spikes/threading/serve.mjs` — the COOP/COEP configuration the app will need
 
 ---
 
