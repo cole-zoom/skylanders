@@ -53,7 +53,19 @@ try {
       returnByValue: true,
     });
     const text = r.result?.result?.value ?? '';
-    if (text && text !== 'running') { console.log(text); break; }
+    if (text && text !== 'running' && text !== '') {
+      console.log(text);
+      if (process.argv[3]) {              // capture the rendered canvas
+        const shot = await send(9000, 'Page.captureScreenshot', { format: 'png' });
+        const b64 = shot.result?.data;
+        if (b64) {
+          const { writeFileSync } = await import('node:fs');
+          writeFileSync(process.argv[3], Buffer.from(b64, 'base64'));
+          console.log('screenshot -> ' + process.argv[3]);
+        }
+      }
+      break;
+    }
     await sleep(500);
     if (i === 59) console.log('TIMEOUT — page never produced a result');
   }

@@ -1,0 +1,80 @@
+<!doctype html><meta charset=utf8><title>GX replay</title>
+<style>body{margin:0;background:#000}canvas{display:block}</style>
+<canvas id=c width=811 height=456></canvas><pre id=out style="color:#0f0;font:12px monospace"></pre>
+<script id=data type="application/json">/*GEOMETRY*/</script>
+<script type="module">
+const L=[]; const log=s=>{L.push(s);document.getElementById('out').textContent=L.join('\n');};
+try{
+  const draws = JSON.parse(document.getElementById('data').textContent);
+  const adapter = await navigator.gpu.requestAdapter();
+  const device  = await adapter.requestDevice();
+  const canvas  = document.getElementById('c');
+  const ctx     = canvas.getContext('webgpu');
+  const format  = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({device, format, alphaMode:'opaque'});
+
+  // GX draws triangle fans; WebGPU has no triangle-fan topology, so every fan
+  // is expanded to a triangle list here. 76 of 79 draws in this capture are
+  // fans, so this is not an edge case -- a real backend needs it on the hot path.
+  const b = draws.bounds;
+  const nx = v => ( (v - b.xmin) / (b.xmax - b.xmin) ) * 2 - 1;
+  const ny = v => -(( (v - b.ymin) / (b.ymax - b.ymin) ) * 2 - 1);
+
+  const verts = [];
+  let fans = 0, strips = 0, tris = 0;
+  for (let di = 0; di < draws.draws.length; di++) {
+    const d = draws.draws[di];
+    const n = d.pos.length / 3;
+    const P = i => [nx(d.pos[i*3]), ny(d.pos[i*3+1])];
+    // colour each draw distinctly so structure is visible without textures
+    const h = (di * 47) % 360, s = 0.65, l = 0.55;
+    const f = (k)=>{const a=s*Math.min(l,1-l);const kk=(k+h/30)%12;
+      return l-a*Math.max(-1,Math.min(Math.min(kk-3,9-kk),1));};
+    const col = [f(0), f(8), f(4)];
+    const push = (i)=>{const p=P(i); verts.push(p[0],p[1],...col);};
+    if (d.prim === 'tri-fan') {
+      fans++;
+      for (let i = 1; i + 1 < n; i++) { push(0); push(i); push(i+1); tris++; }
+    } else if (d.prim === 'tri-strip') {
+      strips++;
+      for (let i = 0; i + 2 < n; i++) {
+        if (i & 1) { push(i+1); push(i); push(i+2); }
+        else       { push(i); push(i+1); push(i+2); }
+        tris++;
+      }
+    }
+  }
+  log(`draws ${draws.draw_count}  fans ${fans}  strips ${strips}  -> ${tris} triangles`);
+
+  const data = new Float32Array(verts);
+  const vbo = device.createBuffer({size:data.byteLength, usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(vbo, 0, data);
+
+  const shader = device.createShaderModule({code:`
+struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec3f };
+@vertex fn vs(@location(0) p: vec2f, @location(1) c: vec3f) -> VSOut {
+  var o: VSOut; o.pos = vec4f(p, 0.0, 1.0); o.col = c; return o;
+}
+@fragment fn fs(i: VSOut) -> @location(0) vec4f { return vec4f(i.col, 1.0); }`});
+
+  const pipeline = device.createRenderPipeline({
+    layout:'auto',
+    vertex:{module:shader, entryPoint:'vs', buffers:[{
+      arrayStride:20,
+      attributes:[{shaderLocation:0,offset:0,format:'float32x2'},
+                  {shaderLocation:1,offset:8,format:'float32x3'}]}]},
+    fragment:{module:shader, entryPoint:'fs', targets:[{format}]},
+    primitive:{topology:'triangle-list'},
+  });
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({colorAttachments:[{
+    view: ctx.getCurrentTexture().createView(),
+    clearValue:{r:0.04,g:0.05,b:0.09,a:1}, loadOp:'clear', storeOp:'store'}]});
+  pass.setPipeline(pipeline); pass.setVertexBuffer(0, vbo);
+  pass.draw(data.length/5); pass.end();
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  log('RENDER OK');
+}catch(e){log('ERROR '+e);}
+</script>

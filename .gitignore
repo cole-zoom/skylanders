@@ -65,3 +65,7 @@ node_modules/
 spikes/**/spike.wasm
 spikes/**/bench.html
 spikes/**/spike.wat
+harness/reference/*.png
+spikes/webgpu/replay.html
+__pycache__/
+*.pyc

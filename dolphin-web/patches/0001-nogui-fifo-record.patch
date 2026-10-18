@@ -1,5 +1,5 @@
 diff --git a/Source/Core/DolphinNoGUI/MainNoGUI.cpp b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
-index 3bf40ea..e14b081 100644
+index 3bf40ea..5bd3696 100644
 --- a/Source/Core/DolphinNoGUI/MainNoGUI.cpp
 +++ b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
 @@ -4,7 +4,9 @@
@@ -21,7 +21,7 @@ index 3bf40ea..e14b081 100644
  #include "Core/Host.h"
  #include "Core/System.h"
  
-@@ -184,6 +188,12 @@ static std::unique_ptr<Platform> GetPlatform(const optparse::Values& options)
+@@ -184,6 +188,14 @@ static std::unique_ptr<Platform> GetPlatform(const optparse::Values& options)
  #define main app_main
  #endif
  
@@ -30,11 +30,13 @@ index 3bf40ea..e14b081 100644
 +static std::string s_fifo_output;
 +static bool s_fifo_started = false;
 +static int s_fifo_delay = 0;
++static int s_shot_after = 0;
++static std::string s_shot_path;
 +
  int main(const int argc, char* argv[])
  {
    const auto parser =
-@@ -210,6 +220,22 @@ int main(const int argc, char* argv[])
+@@ -210,6 +222,32 @@ int main(const int argc, char* argv[])
  #endif
        });
  
@@ -49,6 +51,16 @@ index 3bf40ea..e14b081 100644
 +      .set_default(0)
 +      .help("Wait this many seconds after boot before recording (lets the game "
 +            "reach a drawing state; recording at boot captures nothing)");
++  parser->add_option("--screenshot-after")
++      .type("int")
++      .action("store")
++      .set_default(0)
++      .help("Save a PNG this many seconds after boot, then exit. Works for a "
++            "game or for .dff playback; used to produce reference images.");
++  parser->add_option("--screenshot-path")
++      .action("store")
++      .set_default("")
++      .help("Where to write the screenshot");
 +  parser->add_option("--fifo-output")
 +      .action("store")
 +      .set_default("fifo.dff")
@@ -57,17 +69,36 @@ index 3bf40ea..e14b081 100644
    optparse::Values& options = CommandLineParse::ParseArguments(parser.get(), argc, argv);
    std::vector<std::string> args = parser->args();
  
-@@ -283,9 +309,35 @@ int main(const int argc, char* argv[])
+@@ -283,9 +321,54 @@ int main(const int argc, char* argv[])
      return 1;
    }
  
 +  s_fifo_frames = static_cast<int>(options.get("fifo_record"));
 +  s_fifo_output = static_cast<const char*>(options.get("fifo_output"));
 +  s_fifo_delay = static_cast<int>(options.get("fifo_delay"));
++  s_shot_after = static_cast<int>(options.get("screenshot_after"));
++  s_shot_path = static_cast<const char*>(options.get("screenshot_path"));
 +
    auto core_state_changed_hook = Core::AddOnStateChangedCallback([](const Core::State state) {
      if (state == Core::State::Uninitialized)
        s_platform->Stop();
++
++    if (state == Core::State::Running && s_shot_after > 0 && !s_fifo_started)
++    {
++      s_fifo_started = true;
++      std::thread([] {
++        std::this_thread::sleep_for(std::chrono::seconds(s_shot_after));
++        if (s_shot_path.empty())
++          Core::SaveScreenShot();
++        else
++          Core::SaveScreenShot(s_shot_path);
++        fprintf(stderr, "[shot] saved %s\n",
++                s_shot_path.empty() ? "(default path)" : s_shot_path.c_str());
++        // Give the async screenshot a moment to reach disk before shutdown.
++        std::this_thread::sleep_for(std::chrono::seconds(3));
++        s_platform->RequestShutdown();
++      }).detach();
++    }
 +
 +    if (state == Core::State::Running && s_fifo_frames > 0 && !s_fifo_started)
 +    {

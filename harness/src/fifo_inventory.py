@@ -15,6 +15,9 @@ import struct
 import sys
 from collections import Counter
 
+from gx_vertex import VertexFormats
+from gx_arrays import GuestRAM, ArrayDescriptors
+
 FILE_ID = 0x0D01F1F0
 
 # BP registers we care about, from VideoCommon/BPMemory.h
@@ -44,6 +47,7 @@ def read_header(b):
     (bp_off, bp_sz, cp_off, cp_sz, xf_off, xf_sz, xfr_off, xfr_sz,
      frames_off, frame_count, flags) = struct.unpack_from("<QIQIQIQIQII", b, off)
     return dict(version=ver, bp_off=bp_off, bp_sz=bp_sz,
+                cp_off=cp_off, cp_sz=cp_sz,
                 frames_off=frames_off, frame_count=frame_count, flags=flags)
 
 
@@ -56,18 +60,31 @@ def read_initial_state(b, h, st):
         if val:
             st["bp_initial"][reg] = val & 0xFFFFFF
             record_bp(reg, val & 0xFFFFFF, st)
+    cp = struct.unpack_from(f"<{h['cp_sz']}I", b, h["cp_off"])
+    st["vfmt"].load_initial(cp)
+    st["arrays"].load_initial(cp)
     return bp
 
 
 def read_frames(b, h):
-    """Frame records are 40 bytes: fifo offset/size/start/end, updates off/count."""
+    """Frame records are 64 bytes (FileFrameInfo), fields packed with no
+    padding: u64 dataOffset, u32 size/start/end, u64 updatesOffset,
+    u32 updateCount, then a 32-byte reserved tail. The reserved tail is what
+    makes the stride 64 while the fields occupy only the first 32."""
     frames = []
     for i in range(h["frame_count"]):
-        base = h["frames_off"] + i * 40
+        base = h["frames_off"] + i * 64
         (data_off, data_sz, start, end, mu_off, mu_n) = struct.unpack_from(
             "<QIIIQI", b, base)
+        updates = []
+        for k in range(mu_n):
+            # FileMemoryUpdate: 24 bytes, also packed
+            (fifo_pos, addr, d_off, d_sz, typ) = struct.unpack_from(
+                "<IIQIB", b, mu_off + k * 24)
+            updates.append(dict(address=addr, data=b[d_off:d_off + d_sz],
+                                type=typ))
         frames.append(dict(data=b[data_off:data_off + data_sz],
-                           n_updates=mu_n))
+                           n_updates=mu_n, updates=updates))
     return frames
 
 
@@ -79,6 +96,13 @@ def decode(stream, st):
         if op == 0x00:                               # NOP
             i += 1
         elif op == 0x08:                             # load CP reg
+            if i + 6 > n:
+                break
+            addr = stream[i + 1]
+            val = struct.unpack_from(">I", stream, i + 2)[0]
+            st["vfmt"].set_reg(addr, val)
+            st["arrays"].set_reg(addr, val)
+            st["cp"][addr] += 1
             i += 6
         elif op == 0x10:                             # load XF reg
             if i + 5 > n:
@@ -99,17 +123,32 @@ def decode(stream, st):
             record_bp(reg, val, st)
             i += 5
         elif op & 0xF8 in PRIMITIVES:                # draw
-            st["decoded_bytes"] += i
             if i + 3 > n:
                 break
+            vat = op & 0x07
             vcount = struct.unpack_from(">H", stream, i + 1)[0]
+            vsize = st["vfmt"].vertex_size(vat)
             st["prims"][PRIMITIVES[op & 0xF8]] += 1
             st["verts"] += vcount
-            # Vertex payload length depends on the active vertex descriptor,
-            # which we do not track; stop decoding this frame rather than
-            # silently resynchronise onto garbage.
-            st["stopped_at_draw"] = True
-            return
+            st["vtx_formats"][st["vfmt"].describe(vat)] += 1
+            if st["export"] is not None and vsize and vcount:
+                payload = stream[i + 3: i + 3 + vcount * vsize]
+                st["export"].append(dict(
+                    prim=PRIMITIVES[op & 0xF8], vat=vat, count=vcount,
+                    vsize=vsize, fmt=st["vfmt"].describe(vat),
+                    pos_fmt=(st["vfmt"].vat_a[vat] >> 1) & 7,
+                    pos_cnt=3 if (st["vfmt"].vat_a[vat] & 1) else 2,
+                    pos_frac=(st["vfmt"].vat_a[vat] >> 4) & 0x1F,
+                    pos_presence=st["vfmt"]._pos(),
+                    pos_offset=st["vfmt"].pos_offset(),
+                    blend=st["cur_blend"], data=payload.hex()))
+            if vsize == 0 and vcount:
+                # A draw against an unconfigured format means our CP state is
+                # wrong. Resynchronising would walk onto vertex data and invent
+                # features; stop and say so instead.
+                st["desync"] = True
+                return
+            i += 3 + vcount * vsize
         else:
             st["unknown_ops"][op] += 1
             i += 1
@@ -121,6 +160,7 @@ def record_bp(reg, val, st):
         st["texgens"].add(val & 0xF)
         st["cull"].add((val >> 14) & 0x3)
     elif reg == BP_BLENDMODE:
+        st["cur_blend"] = val
         st["blend_enable"].add(val & 1)
         st["logicop_enable"].add((val >> 1) & 1)
         st["dither"].add((val >> 2) & 1)
@@ -161,7 +201,10 @@ def main(path):
               alpha_test=0, efb_copies=0, tev_color_writes=0,
               tex_formats=set(), tex_filters=set(), line_point_width=0,
               stopped_at_draw=False, bp_initial={}, decoded_bytes=0,
-              total_bytes=0)
+              total_bytes=0, vfmt=VertexFormats(), cp=Counter(),
+              vtx_formats=Counter(), desync=False, cur_blend=0,
+              arrays=ArrayDescriptors(), ram=GuestRAM(),
+              export=[] if len(sys.argv) > 2 else None)
 
     print(f"{path}")
     print(f"  format version {h['version']}, {h['frame_count']} frames, "
@@ -171,8 +214,12 @@ def main(path):
     for i, f in enumerate(frames):
         print(f"  frame {i}: {len(f['data'])} bytes of commands, "
               f"{f['n_updates']} memory updates")
+        for u in f.get("updates", []):
+            st["ram"].apply(u["address"], u["data"])
         st["total_bytes"] += len(f["data"])
         decode(f["data"], st)
+        if not st["desync"]:
+            st["decoded_bytes"] += len(f["data"])
 
     print("\n── GX features used ──")
     print(f"  BP register writes      {sum(st['bp'].values())} "
@@ -197,14 +244,28 @@ def main(path):
     if st["unknown_ops"]:
         print(f"  UNDECODED opcodes       "
               f"{ {hex(k): v for k, v in st['unknown_ops'].most_common(5)} }")
-    if st["stopped_at_draw"]:
-        pct = 100.0 * st["decoded_bytes"] / max(st["total_bytes"], 1)
-        print(f"\n  Stream decode covered {st['decoded_bytes']}/{st['total_bytes']}"
-              f" bytes ({pct:.1f}%) before the first draw.")
-        print("  NOTE: decoding stops at the first draw in each frame. Vertex")
-        print("  payload length depends on the active vertex descriptor, which")
-        print("  this tool does not track. Register state above is therefore")
-        print("  setup-only and is a LOWER BOUND on features used.")
+    print(f"  vertex formats          {dict(st['vtx_formats']) or 'n/a'}")
+    print(f"  vertices drawn          {st['verts']}")
+    pct = 100.0 * st["decoded_bytes"] / max(st["total_bytes"], 1)
+    print(f"\n  stream decode coverage  {st['decoded_bytes']}/{st['total_bytes']}"
+          f" bytes ({pct:.1f}%)")
+    if st["desync"]:
+        print("  WARNING: decoder desynchronised (draw against an unconfigured")
+        print("  vertex format). Figures above are a LOWER BOUND.")
+    elif pct > 99.0:
+        print("  Full frame decoded -- the feature list above is complete for")
+        print("  this capture.")
+    if st["export"] is not None:
+        write_export(st, sys.argv[2])
+
+
+def write_export(st, path):
+    import json
+    draws = st["export"]
+    json.dump(dict(draw_count=len(draws),
+                   total_verts=sum(d["count"] for d in draws),
+                   draws=draws), open(path, "w"))
+    print(f"\n  exported {len(draws)} draws -> {path}")
 
 
 if __name__ == "__main__":
