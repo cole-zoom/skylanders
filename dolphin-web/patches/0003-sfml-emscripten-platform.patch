@@ -1,0 +1,19 @@
+diff --git a/include/SFML/Config.hpp b/include/SFML/Config.hpp
+index 36a8b1a..a7232ff 100644
+--- a/include/SFML/Config.hpp
++++ b/include/SFML/Config.hpp
+@@ -76,6 +76,14 @@
+ // Android
+ #define SFML_SYSTEM_ANDROID
+ 
++#elif defined(__EMSCRIPTEN__)
++
++// Emscripten: treated as Linux. Emscripten provides a Linux-like POSIX layer
++// including BSD sockets, which is all sfml-network uses. Without this branch
++// SFML's own platform check fails the build, because it tests __unix__ and
++// then recognises only Linux/Android/BSD.
++#define SFML_SYSTEM_LINUX
++
+ #elif defined(__linux__)
+ 
+ // Linux
