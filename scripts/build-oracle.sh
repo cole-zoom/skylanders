@@ -54,6 +54,26 @@ if [ -n "$missing" ]; then
 fi
 echo "    all required submodules populated"
 
+# ── Instrumentation patches ─────────────────────────────────────────────
+#
+# The oracle's EMULATION must stay stock -- an oracle built from our own
+# changes could confirm our own bugs as correct. These patches are strictly
+# observational: they add capture paths and never alter what is emulated.
+# Upstream wires FIFO recording only into the Qt GUI, so a headless build has
+# no way to capture a trace at all without this.
+echo "==> instrumentation patches"
+for p in dolphin-web/patches/*.patch; do
+  [ -e "$p" ] || continue
+  if git -C dolphin apply --reverse --check "../$p" >/dev/null 2>&1; then
+    echo "    $(basename "$p") already applied"
+  elif git -C dolphin apply "../$p" >/dev/null 2>&1; then
+    echo "    $(basename "$p") applied"
+  else
+    echo "ERROR: $(basename "$p") does not apply cleanly to the pinned tree" >&2
+    exit 1
+  fi
+done
+
 # ── Configure ────────────────────────────────────────────────────────────
 #
 # USE_MGBA=OFF and USE_RETRO_ACHIEVEMENTS=OFF match the skipped submodules.

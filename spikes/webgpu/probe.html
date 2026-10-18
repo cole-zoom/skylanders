@@ -1,0 +1,39 @@
+<!doctype html><meta charset=utf8><title>WebGPU probe</title><pre id=out>running</pre>
+<script type="module">
+const L = [];
+const log = s => L.push(s);
+const done = () => document.getElementById('out').textContent = L.join('\n');
+try {
+  if (!navigator.gpu) { log('FAIL navigator.gpu undefined — WebGPU unavailable'); done(); }
+  else {
+    const a = await navigator.gpu.requestAdapter();
+    if (!a) { log('FAIL requestAdapter() returned null'); done(); }
+    else {
+      const info = a.info ?? {};
+      log(`adapter: ${info.vendor ?? '?'} / ${info.architecture ?? '?'} / ${info.description ?? '?'}`);
+      const feats = [...a.features].sort();
+      log(`features (${feats.length}): ${feats.join(', ')}`);
+      // The specific things the Skylanders FIFO inventory says we need.
+      const need = {
+        'texture-compression-bc': 'CMPR/DXT1 textures (GX format 14) without CPU decode',
+        'dual-source-blending'  : 'GX dst-alpha pass in one pass',
+        'float32-filterable'    : 'filtered float targets for EFB formats',
+      };
+      log('');
+      log('needed by the SSA capture:');
+      for (const [f, why] of Object.entries(need))
+        log(`  ${a.features.has(f) ? 'YES' : 'NO '}  ${f.padEnd(24)} ${why}`);
+      const lim = a.limits;
+      log('');
+      log(`maxTextureDimension2D      ${lim.maxTextureDimension2D}`);
+      log(`maxColorAttachments        ${lim.maxColorAttachments}`);
+      log(`maxBindGroups              ${lim.maxBindGroups}`);
+      log(`maxStorageBuffersPerStage  ${lim.maxStorageBuffersPerShaderStage}`);
+      log(`maxComputeWorkgroupSizeX   ${lim.maxComputeWorkgroupSizeX}`);
+      const d = await a.requestDevice();
+      log(`\ndevice acquired: ${!!d}`);
+      done();
+    }
+  }
+} catch (e) { log('ERROR ' + e); done(); }
+</script>
