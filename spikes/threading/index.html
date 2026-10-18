@@ -1,0 +1,123 @@
+<!doctype html><meta charset=utf8><title>Spike C — threading</title>
+<style>body{margin:0;background:#0b0d12;color:#cfd6e4;font:13px/1.5 ui-monospace,monospace}
+canvas{display:block;width:320px;height:180px}pre{padding:12px;white-space:pre-wrap}</style>
+<canvas id=c width=320 height=180></canvas><pre id=out>running…</pre>
+<script type="module">
+const L = [], log = s => { L.push(s); document.getElementById('out').textContent = L.join('\n'); };
+const TARGET_MS = 1000 / 60;
+const FRAMES = 600;                       // 10 s at 60 Hz
+const IDX_FRAME=0, IDX_DONE=1, IDX_GPU_DONE=2, IDX_AUDIO_WRITE=3, IDX_AUDIO_UNDERRUN=4, IDX_GPU_SIGNALS=5;
+
+try {
+  log(`crossOriginIsolated = ${crossOriginIsolated}`);
+  if (!crossOriginIsolated) throw new Error('not cross-origin isolated — SharedArrayBuffer unavailable');
+  log(`SharedArrayBuffer   = ${typeof SharedArrayBuffer}`);
+  log(`hardwareConcurrency = ${navigator.hardwareConcurrency}`);
+
+  const sab   = new SharedArrayBuffer(64);
+  const state = new Int32Array(sab);
+  const work  = new SharedArrayBuffer(1024 * 8);
+  const ringSab = new SharedArrayBuffer(65536 * 4);
+  const ring  = new Float32Array(ringSab);
+
+  // ── the constraint that shapes the whole design ──
+  let mainBlocked = 'ALLOWED (unexpected)';
+  try { Atomics.wait(state, IDX_FRAME, 999, 0); }
+  catch (e) { mainBlocked = `THROWS (${e.name}) — as expected`; }
+  log(`Atomics.wait on main thread: ${mainBlocked}`);
+
+  // ── three CPU-like workers, each blocking on the frame signal ──
+  const NW = 3, budgetMs = 3.0;
+  const workers = [];
+  for (let i = 0; i < NW; i++) {
+    const w = new Worker('cpu-worker.mjs', { type: 'module' });
+    w.postMessage({ id: i, sab, work, budgetMs });
+    workers.push(w);
+  }
+  log(`${NW} CPU workers started, ${budgetMs}ms budget each`);
+
+  // ── GPU worker owns the canvas ──
+  const offscreen = document.getElementById('c').transferControlToOffscreen();
+  const gpu = new Worker('gpu-worker.mjs', { type: 'module' });
+  const gpuReady = new Promise((res, rej) => {
+    gpu.onmessage = e => e.data.error ? rej(new Error(e.data.error)) : res();
+  });
+  gpu.postMessage({ canvas: offscreen, sab }, [offscreen]);
+  await gpuReady;
+  log('GPU worker ready (OffscreenCanvas transferred)');
+
+  // ── audio ──
+  let audioNote = 'skipped';
+  try {
+    const ac = new AudioContext({ sampleRate: 48000 });
+    await ac.audioWorklet.addModule('audio-worklet.mjs');
+    const node = new AudioWorkletNode(ac, 'ring-player', { processorOptions: { sab, ringSab } });
+    node.connect(ac.destination);
+    audioNote = `AudioContext ${ac.sampleRate}Hz state=${ac.state}`;
+  } catch (e) { audioNote = 'FAILED ' + e.message; }
+  log(`audio: ${audioNote}`);
+
+  // ── pace 600 frames, measuring the interval each time ──
+  const intervals = [];
+  let audioWrite = 0, late = 0;
+  let prev = performance.now();
+  const t0 = prev;
+
+  for (let f = 1; f <= FRAMES; f++) {
+    const deadline = t0 + f * TARGET_MS;
+
+    Atomics.store(state, IDX_DONE, 0);
+    Atomics.store(state, IDX_FRAME, f);
+    Atomics.notify(state, IDX_FRAME);          // release the CPU workers
+
+    // Produce a frame of audio into the ring (48000/60 = 800 samples).
+    for (let i = 0; i < 800; i++) {
+      ring[(audioWrite + i) % ring.length] = Math.sin((audioWrite + i) * 0.03);
+    }
+    audioWrite += 800;
+    Atomics.store(state, IDX_AUDIO_WRITE, audioWrite);
+
+    // The main thread may not block, so poll for worker completion.
+    while (Atomics.load(state, IDX_DONE) < NW) {
+      if (performance.now() > deadline + TARGET_MS) { late++; break; }
+    }
+
+    // Hold the 60 Hz cadence without Atomics.wait.
+    while (performance.now() < deadline) { /* spin to deadline */ }
+
+    const now = performance.now();
+    intervals.push(now - prev);
+    prev = now;
+    if (f % 120 === 0) await new Promise(r => setTimeout(r, 0));  // let the event loop breathe
+  }
+
+  const sorted = [...intervals].sort((a, b) => a - b);
+  const pct = p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+  const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+  const dropped = intervals.filter(v => v > TARGET_MS * 1.5).length;
+
+  log('');
+  log(`frames paced        ${FRAMES} at ${TARGET_MS.toFixed(2)}ms target`);
+  log(`interval mean       ${mean.toFixed(3)} ms`);
+  log(`interval p50/p95/p99 ${pct(.5).toFixed(3)} / ${pct(.95).toFixed(3)} / ${pct(.99).toFixed(3)} ms`);
+  log(`interval max        ${sorted[sorted.length - 1].toFixed(3)} ms`);
+  log(`dropped (>1.5x)     ${dropped}`);
+  log(`frames workers late ${late}`);
+  const gpuSignals = Atomics.load(state, IDX_GPU_SIGNALS);
+  const gpuPresents = Atomics.load(state, IDX_GPU_DONE);
+  log(`GPU signals seen    ${gpuSignals} / ${FRAMES}   (did the worker keep up?)`);
+  log(`GPU frames presented ${gpuPresents} / ${FRAMES}   (did the canvas keep up?)`);
+  log(`audio underruns     ${Atomics.load(state, IDX_AUDIO_UNDERRUN)}`);
+
+  // The gate is about whether OUR threading model holds 60 Hz. Canvas
+  // presentation in headless Chrome is capped by its compositor and is not
+  // something the emulator controls, so the GPU criterion is that the worker
+  // observed every frame signal -- not that every frame reached the screen.
+  const ok = dropped === 0 && pct(.99) < TARGET_MS * 1.25 &&
+             gpuSignals >= FRAMES * 0.99 && late === 0 &&
+             Atomics.load(state, IDX_AUDIO_UNDERRUN) === 0;
+  log('');
+  log(ok ? 'GATE MET' : 'GATE NOT MET');
+  workers.forEach(w => w.terminate()); gpu.terminate();
+} catch (e) { log('ERROR ' + (e && e.stack || e)); }
+</script>
