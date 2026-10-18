@@ -12,6 +12,7 @@
 ✓ Recompilers excluded              9 interpreter objects, 0 JIT objects
 ✓ First execution under wasm32      harness/wasm-smoke, both targets PASSED
 ✓ MIFARE crypto verified            3 figures byte-identical vs native
+✓ Portal runs under wasm32          SkylanderPortal, 64 block replies identical
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -41,6 +42,35 @@ image that the game actually reads back through the portal.
 `MemArenaEmscripten` works at runtime, and refuses the fastmem reservation as
 designed while the native backend grants it. That asymmetry is the point, not a
 discrepancy.
+
+### The portal itself
+
+Correct figure bytes do not prove the portal answers correctly — the game reads
+figures back through `GetStatus()` and `QueryBlock()`, and it is those replies
+that have to match hardware. `SkylanderPortal` now runs under wasm32:
+
+```
+status reply is framed 'S'                      ok    ok
+figure accepted into a portal slot              ok    ok
+status changes once a figure is present         ok    ok
+all 64 block replies are correctly framed       ok    ok
+written block reads back identically            ok    ok
+figure removed from the portal                  ok    ok
+
+Spyro on portal, 64 blocks   fnv1a=  3c788e7b70c99db0 = 3c788e7b70c99db0
+```
+
+Every block reply — framing byte, status byte, block index and the 16 bytes of
+encrypted payload the game decrypts — is byte-identical across targets. The
+write/read check matters because that is how the game saves levels and gold
+onto a figure.
+
+**What is still not covered:** `SkylanderUSB`, the device wrapper the emulated
+IOS talks to. `SkylanderPortal` is the data path; the wrapper marshals it into
+USB control and interrupt transfers, and that needs IOS HLE to exercise. Its
+dependencies are deferred at link time with `-undefined dynamic_lookup` on the
+native side, so if that path is ever reached it fails loudly rather than
+answering.
 
 ### Three times the test was wrong, not the code
 

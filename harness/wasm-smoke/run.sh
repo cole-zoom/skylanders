@@ -25,6 +25,7 @@ echo "==> wasm32"
 em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 -sINITIAL_MEMORY=268435456 \
   -I$D/Source/Core -I$BW/Source/Core -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
   harness/wasm-smoke/smoke.cpp "$SKYW/SkylanderFigure.cpp.o" "$SKYW/SkylanderCrypto.cpp.o" \
+  "$SKYW/Skylander.cpp.o" \
   $BW/Source/Core/Common/libcommon.a $BW/Externals/fmt/fmt/libfmt.a \
   $BW/Externals/mbedtls/library/libmbedtls.a \
   $BW/Externals/mbedtls/library/libmbedx509.a \
@@ -32,19 +33,25 @@ em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 -sINITIAL_MEMOR
   -o /tmp/smoke.js
 
 echo "==> native"
-# native_stubs.cpp stands in for Skylander.cpp, which would drag the whole
-# emulated USB device stack in. ld64 keeps the unreached reference that
-# wasm-ld eliminates, hence the asymmetry.
+# Skylander.cpp holds two classes: SkylanderPortal (under test) and
+# SkylanderUSB (the IOS device wrapper, never called here). The wrapper's
+# dependencies -- Core::System, Mixer, TransferCommand -- must resolve at link
+# time even though they are unreachable. wasm-ld drops them at -O2; ld64 does
+# not, so the native link defers them with -undefined dynamic_lookup. If the
+# device path is ever reached they fail loudly at runtime rather than
+# returning a plausible answer.
 clang++ -std=c++23 -O2 \
   -I$D/Source/Core -I$BN/Source/Core -I/opt/homebrew/include -I$D/Externals/picojson \
-  harness/wasm-smoke/smoke.cpp harness/wasm-smoke/native_stubs.cpp \
-  "$SKYN/SkylanderFigure.cpp.o" "$SKYN/SkylanderCrypto.cpp.o" \
+  harness/wasm-smoke/smoke.cpp \
+  "$SKYN/SkylanderFigure.cpp.o" "$SKYN/SkylanderCrypto.cpp.o" "$SKYN/Skylander.cpp.o" \
+  "$BN/Source/Core/Core/CMakeFiles/core.dir/IOS/USB/Common.cpp.o" \
   $BN/Source/Core/Common/libcommon.a \
   $BN/Externals/mbedtls/library/libmbedtls.a \
   $BN/Externals/mbedtls/library/libmbedx509.a \
   $BN/Externals/mbedtls/library/libmbedcrypto.a \
   -L/opt/homebrew/lib -lfmt -liconv \
   -framework Foundation -framework IOKit -framework CoreFoundation \
+  -Wl,-undefined,dynamic_lookup \
   -o /tmp/smoke-native
 
 /tmp/smoke-native > /tmp/smoke-native.txt 2>&1 || true
@@ -53,7 +60,7 @@ node /tmp/smoke.js > /tmp/smoke-wasm.txt 2>&1 || true
 echo; echo "═══ NATIVE ═══"; cat /tmp/smoke-native.txt
 echo; echo "═══ WASM32 ═══"; cat /tmp/smoke-wasm.txt
 
-echo; echo "══ differential check: figure hashes must match ══"
+echo; echo "══ differential check: all hashes must match ══"
 grep 'fnv1a=' /tmp/smoke-native.txt | sed 's/.*fnv1a=//' | sort > /tmp/h-native
 grep 'fnv1a=' /tmp/smoke-wasm.txt   | sed 's/.*fnv1a=//' | sort > /tmp/h-wasm
 if [ ! -s /tmp/h-native ]; then echo "no hashes produced"; exit 1; fi
