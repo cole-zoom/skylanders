@@ -13,6 +13,7 @@
 ✓ First execution under wasm32      harness/wasm-smoke, both targets PASSED
 ✓ MIFARE crypto verified            3 figures byte-identical vs native
 ✓ Portal runs under wasm32          SkylanderPortal, 64 block replies identical
+✓ Emulator core boots under wasm32  Core::System + memory manager, 3.8 MB module
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -64,6 +65,78 @@ Every block reply — framing byte, status byte, block index and the 16 bytes of
 encrypted payload the game decrypts — is byte-identical across targets. The
 write/read check matters because that is how the game saves levels and gold
 onto a figure.
+
+## The core comes up
+
+`harness/wasm-core/` links a program against the **whole** emulator core for
+wasm32 — `libcore` plus VideoCommon, the Null/Software/OGL backends,
+AudioCommon, InputCommon, DiscIO, UICommon and Common, 3.8 MB of module — and
+runs it.
+
+```
+target: wasm32 (emscripten)
+
+Core::System
+  singleton constructed                     ok
+  memory manager reachable                  ok
+  MEM1 0x690000 size 0x02000000
+  MEM2 0        size 0x04000000
+  MEM1 allocated                            ok
+  MEM1 has a nonzero size                   ok
+  MEM1 round-trips first and last byte      ok
+  memory shut down cleanly                  ok
+PASSED
+```
+
+Guest RAM is allocated through `MemArenaEmscripten`, is writable through the
+pointers the emulator hands out, and shuts down cleanly.
+
+**MEM2 is null** because without a game loaded the core comes up in GameCube
+mode, where MEM2 does not exist. The 64 MB figure beside it is the size
+constant, not an allocation. Reaching Wii mode needs a boot configuration, not
+a port fix — that is the next step, not a defect.
+
+### Host USB is compiled out, the way Android does it
+
+The first run aborted immediately:
+
+```
+host_stubs: libusb_init was called.
+This build must use the EMULATED Skylander portal, never host USB.
+```
+
+That abort did its job. `Core::System` construction initialises the USB
+subsystem, which calls `libusb_init()` — so a browser build would have silently
+enumerated nothing.
+
+The fix follows an existing upstream pattern: Android already runs without
+`__LIBUSB__`, and every host-USB path in `Core` is guarded on that macro.
+Emscripten now joins it.
+
+One wrinkle made this more than a one-line change. The `LibUSB::LibUSB` CMake
+target must still exist, because `hidapi` and `inputcommon` link it
+unconditionally — so the find cannot simply be skipped as it is on Android.
+But `Core/CMakeLists.txt` selects the host-USB **sources** on
+`TARGET LibUSB::LibUSB` while the code inside them selects on `__LIBUSB__`.
+Leaving the target present and the macro undefined compiles `BTReal.cpp`
+against the stub header, which fails with errors naming neither libusb nor
+Emscripten. A `DOLPHIN_USE_LIBUSB` variable now keeps both gates in agreement.
+
+### A sixth allowlist
+
+`MemoryUtil.cpp`'s `MemPhysical()` falls through to Linux's `sysinfo()` on any
+unrecognised platform. Emscripten now returns `emscripten_get_heap_max()`,
+which is the meaningful equivalent — callers are asking how much memory is
+available, and for wasm that is how far the heap can grow.
+
+### LazyMemoryRegion
+
+Missed when `MemArenaEmscripten.cpp` was first written, and only surfaced at
+link time here. Every other backend makes it genuinely lazy — reserve address
+space, commit pages on touch. WebAssembly cannot reserve without committing, so
+it allocates up front with `calloc`. The semantics callers rely on (zeroed on
+`Create`, zeroed on `Clear`) are preserved; **the memory saving is not**, and a
+caller asking for a large region gets all of it resident immediately.
 
 ### Where the smoke test stops, and why
 

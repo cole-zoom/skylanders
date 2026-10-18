@@ -1,0 +1,51 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5ea7f8e..8ccdd8b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -702,8 +702,29 @@ if(ENABLE_CUBEB)
+ endif()
+ 
+ if(NOT ANDROID)
++  # The CMake target must exist either way: hidapi and inputcommon link
++  # LibUSB::LibUSB unconditionally, so skipping the find breaks configure.
+   dolphin_find_optional_system_library(LibUSB Externals/libusb)
+-  add_definitions(-D__LIBUSB__)
++
++  # The __LIBUSB__ define is what actually enables host USB. Emscripten joins
++  # Android in leaving it undefined: there is no host USB in a browser, every
++  # host-USB path in Core is already guarded on this macro, and compiling them
++  # out leaves only the EMULATED devices -- which is what this project needs,
++  # since the Skylander portal is emulated.
++  #
++  # Without this, Core::System construction calls libusb_init() and a browser
++  # build would silently enumerate nothing.
++  #
++  # DOLPHIN_USE_LIBUSB keeps the two gates in agreement. Core/CMakeLists.txt
++  # selects the host-USB sources on `TARGET LibUSB::LibUSB`, while the code
++  # inside them selects on `__LIBUSB__`. Android gets away with one flag
++  # because it skips the find entirely; here the target must exist for hidapi,
++  # so a separate variable is needed or BTReal.cpp compiles against the stub
++  # header and fails with errors naming neither libusb nor Emscripten.
++  if(NOT EMSCRIPTEN)
++    set(DOLPHIN_USE_LIBUSB TRUE)
++    add_definitions(-D__LIBUSB__)
++  endif()
+ endif()
+ 
+ if(ENABLE_SDL)
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 56c8dba..24c4470 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -732,7 +732,10 @@ if(ENABLE_CUBEB)
+   )
+ endif()
+ 
+-if(TARGET LibUSB::LibUSB)
++# DOLPHIN_USE_LIBUSB, not just the target: the target exists on Emscripten
++# because hidapi links it, but __LIBUSB__ is undefined there, so these sources
++# would compile against the stub headers.
++if(TARGET LibUSB::LibUSB AND DOLPHIN_USE_LIBUSB)
+   target_link_libraries(core PUBLIC LibUSB::LibUSB)
+   target_sources(core PRIVATE
+     IOS/USB/LibusbDevice.cpp
