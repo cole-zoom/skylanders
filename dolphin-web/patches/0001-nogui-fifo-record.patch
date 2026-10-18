@@ -1,5 +1,5 @@
 diff --git a/Source/Core/DolphinNoGUI/MainNoGUI.cpp b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
-index 3bf40ea..5bd3696 100644
+index 3bf40ea..f2575b5 100644
 --- a/Source/Core/DolphinNoGUI/MainNoGUI.cpp
 +++ b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
 @@ -4,7 +4,9 @@
@@ -12,16 +12,19 @@ index 3bf40ea..5bd3696 100644
  #include <cstdio>
  #include <string>
  #include <vector>
-@@ -20,6 +22,8 @@
+@@ -20,6 +22,11 @@
  #include "Core/BootManager.h"
  #include "Core/Core.h"
  #include "Core/DolphinAnalytics.h"
 +#include "Core/FifoPlayer/FifoDataFile.h"
 +#include "Core/FifoPlayer/FifoRecorder.h"
++#include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
++#include "Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h"
++#include "Common/FileUtil.h"
  #include "Core/Host.h"
  #include "Core/System.h"
  
-@@ -184,6 +188,14 @@ static std::unique_ptr<Platform> GetPlatform(const optparse::Values& options)
+@@ -184,6 +191,19 @@ static std::unique_ptr<Platform> GetPlatform(const optparse::Values& options)
  #define main app_main
  #endif
  
@@ -32,11 +35,16 @@ index 3bf40ea..5bd3696 100644
 +static int s_fifo_delay = 0;
 +static int s_shot_after = 0;
 +static std::string s_shot_path;
++static std::string s_skylander;   // "ID:VAR"
++static int s_sky_delay = 0;
++static bool s_sky_done = false;
++static int s_shot_count = 1;
++static int s_shot_every = 0;
 +
  int main(const int argc, char* argv[])
  {
    const auto parser =
-@@ -210,6 +222,32 @@ int main(const int argc, char* argv[])
+@@ -210,6 +230,52 @@ int main(const int argc, char* argv[])
  #endif
        });
  
@@ -51,12 +59,32 @@ index 3bf40ea..5bd3696 100644
 +      .set_default(0)
 +      .help("Wait this many seconds after boot before recording (lets the game "
 +            "reach a drawing state; recording at boot captures nothing)");
++  parser->add_option("--skylander")
++      .action("store")
++      .set_default("")
++      .help("Put a Skylander on the emulated portal, as ID:VARIANT "
++            "(e.g. 16:0 for Spyro). Creates the .sky file if absent.");
++  parser->add_option("--skylander-delay")
++      .type("int")
++      .action("store")
++      .set_default(20)
++      .help("Seconds after boot before placing the figure");
 +  parser->add_option("--screenshot-after")
 +      .type("int")
 +      .action("store")
 +      .set_default(0)
 +      .help("Save a PNG this many seconds after boot, then exit. Works for a "
 +            "game or for .dff playback; used to produce reference images.");
++  parser->add_option("--screenshot-count")
++      .type("int")
++      .action("store")
++      .set_default(1)
++      .help("Take this many screenshots instead of one");
++  parser->add_option("--screenshot-every")
++      .type("int")
++      .action("store")
++      .set_default(10)
++      .help("Seconds between screenshots when --screenshot-count > 1");
 +  parser->add_option("--screenshot-path")
 +      .action("store")
 +      .set_default("")
@@ -69,7 +97,7 @@ index 3bf40ea..5bd3696 100644
    optparse::Values& options = CommandLineParse::ParseArguments(parser.get(), argc, argv);
    std::vector<std::string> args = parser->args();
  
-@@ -283,9 +321,54 @@ int main(const int argc, char* argv[])
+@@ -283,9 +349,104 @@ int main(const int argc, char* argv[])
      return 1;
    }
  
@@ -78,23 +106,73 @@ index 3bf40ea..5bd3696 100644
 +  s_fifo_delay = static_cast<int>(options.get("fifo_delay"));
 +  s_shot_after = static_cast<int>(options.get("screenshot_after"));
 +  s_shot_path = static_cast<const char*>(options.get("screenshot_path"));
++  s_shot_count = static_cast<int>(options.get("screenshot_count"));
++  s_shot_every = static_cast<int>(options.get("screenshot_every"));
++  s_skylander = static_cast<const char*>(options.get("skylander"));
++  s_sky_delay = static_cast<int>(options.get("skylander_delay"));
 +
    auto core_state_changed_hook = Core::AddOnStateChangedCallback([](const Core::State state) {
      if (state == Core::State::Uninitialized)
        s_platform->Stop();
++
++    if (state == Core::State::Running && !s_skylander.empty() && !s_sky_done)
++    {
++      s_sky_done = true;
++      std::thread([] {
++        // The portal device only exists once emulation is up, and the game
++        // polls it continuously, so placing the figure late is equivalent to
++        // setting it down mid-session.
++        std::this_thread::sleep_for(std::chrono::seconds(s_sky_delay));
++        unsigned int id = 0, var = 0;
++        if (std::sscanf(s_skylander.c_str(), "%u:%u", &id, &var) != 2)
++        {
++          fprintf(stderr, "[sky] bad --skylander value '%s', want ID:VAR\n",
++                  s_skylander.c_str());
++          return;
++        }
++        const std::string path = File::GetUserPath(D_USER_IDX) +
++                                 fmt::format("sky_{}_{}.sky", id, var);
++        if (!File::Exists(path))
++        {
++          IOS::HLE::USB::SkylanderFigure fig(path);
++          if (!fig.Create(static_cast<u16>(id), static_cast<u16>(var)))
++          {
++            fprintf(stderr, "[sky] could not create %s\n", path.c_str());
++            return;
++          }
++          fig.Close();
++          fprintf(stderr, "[sky] created %s\n", path.c_str());
++        }
++        auto figure = std::make_unique<IOS::HLE::USB::SkylanderFigure>(path);
++        if (!figure->FileIsOpen())
++        {
++          fprintf(stderr, "[sky] could not open %s\n", path.c_str());
++          return;
++        }
++        const u8 slot = Core::System::GetInstance().GetSkylanderPortal().LoadSkylander(
++            std::move(figure));
++        fprintf(stderr, "[sky] placed id=%u var=%u in portal slot %u\n", id, var, slot);
++      }).detach();
++    }
 +
 +    if (state == Core::State::Running && s_shot_after > 0 && !s_fifo_started)
 +    {
 +      s_fifo_started = true;
 +      std::thread([] {
 +        std::this_thread::sleep_for(std::chrono::seconds(s_shot_after));
-+        if (s_shot_path.empty())
-+          Core::SaveScreenShot();
-+        else
-+          Core::SaveScreenShot(s_shot_path);
-+        fprintf(stderr, "[shot] saved %s\n",
-+                s_shot_path.empty() ? "(default path)" : s_shot_path.c_str());
-+        // Give the async screenshot a moment to reach disk before shutdown.
++        // A single timed screenshot usually lands on a loading screen or a
++        // fade. A burst makes it possible to find a frame with real content
++        // without re-running the whole boot each time.
++        for (int k = 0; k < s_shot_count; ++k)
++        {
++          if (k)
++            std::this_thread::sleep_for(std::chrono::seconds(s_shot_every));
++          if (s_shot_path.empty())
++            Core::SaveScreenShot();
++          else
++            Core::SaveScreenShot(fmt::format("{}_{:02d}", s_shot_path, k));
++          fprintf(stderr, "[shot] %d/%d\n", k + 1, s_shot_count);
++        }
 +        std::this_thread::sleep_for(std::chrono::seconds(3));
 +        s_platform->RequestShutdown();
 +      }).detach();
