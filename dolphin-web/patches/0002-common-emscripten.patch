@@ -35,10 +35,10 @@ index 188164b..f890c5f 100644
    void* m_reserved_region = nullptr;
 diff --git a/Source/Core/Common/MemArenaEmscripten.cpp b/Source/Core/Common/MemArenaEmscripten.cpp
 new file mode 100644
-index 0000000..a87c990
+index 0000000..bd660b2
 --- /dev/null
 +++ b/Source/Core/Common/MemArenaEmscripten.cpp
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,215 @@
 +// Copyright 2008 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -194,7 +194,97 @@ index 0000000..a87c990
 +{
 +  return WASM_PAGE_SIZE;
 +}
++
++// ── LazyMemoryRegion ────────────────────────────────────────────────────────
++//
++// Every other backend makes this genuinely lazy: it reserves address space and
++// commits pages only as they are touched, which matters because the regions
++// are large and mostly untouched. WebAssembly cannot reserve without
++// committing, so this allocates the whole thing up front.
++//
++// The semantics are preserved -- the region is zeroed on Create and on Clear,
++// which is all callers rely on. What is lost is the memory saving, and that is
++// a real cost rather than an implementation detail: a caller that asks for a
++// large region gets all of it resident immediately.
++
++LazyMemoryRegion::LazyMemoryRegion() = default;
++
++LazyMemoryRegion::~LazyMemoryRegion()
++{
++  Release();
++}
++
++void* LazyMemoryRegion::Create(size_t size)
++{
++  ASSERT(!m_memory);
++
++  if (size == 0)
++    return nullptr;
++
++  // calloc rather than malloc+memset: callers depend on the region being zero.
++  void* memory = std::calloc(1, size);
++  if (!memory)
++  {
++    ERROR_LOG_FMT(MEMMAP, "LazyMemoryRegion(emscripten): failed to allocate {} bytes", size);
++    return nullptr;
++  }
++
++  m_memory = memory;
++  m_size = size;
++  return m_memory;
++}
++
++void LazyMemoryRegion::Clear()
++{
++  ASSERT(m_memory);
++  if (!m_memory)
++    return;
++
++  // Native backends drop and re-map the pages, which both zeroes the region and
++  // returns it to the OS. Here the memory stays resident; only the zeroing is
++  // reproduced.
++  std::memset(m_memory, 0, m_size);
++}
++
++void LazyMemoryRegion::Release()
++{
++  if (m_memory)
++    std::free(m_memory);
++  m_memory = nullptr;
++  m_size = 0;
++}
 +}  // namespace Common
+diff --git a/Source/Core/Common/MemoryUtil.cpp b/Source/Core/Common/MemoryUtil.cpp
+index 0d66890..cdfe62d 100644
+--- a/Source/Core/Common/MemoryUtil.cpp
++++ b/Source/Core/Common/MemoryUtil.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "Common/MemoryUtil.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/heap.h>
++#endif
++
+ #include <cstddef>
+ #include <cstdlib>
+ 
+@@ -275,6 +279,15 @@ size_t MemPhysical()
+   system_info sysinfo;
+   get_system_info(&sysinfo);
+   return static_cast<size_t>(sysinfo.max_pages * B_PAGE_SIZE);
++#elif defined __EMSCRIPTEN__
++  // There is no physical memory to report. The meaningful equivalent is how
++  // far the wasm heap can grow, which is what callers are really asking about
++  // when they size caches against available RAM.
++  //
++  // Without this branch the fallback below calls Linux's sysinfo(), which
++  // Emscripten does not provide -- the link fails on a single undefined symbol
++  // naming neither this function nor the platform.
++  return static_cast<size_t>(emscripten_get_heap_max());
+ #else
+   struct sysinfo memInfo;
+   sysinfo(&memInfo);
 diff --git a/Source/Core/Common/Timer.cpp b/Source/Core/Common/Timer.cpp
 index fcbbd7b..7f8b911 100644
 --- a/Source/Core/Common/Timer.cpp

@@ -13,7 +13,7 @@ BUILD_DIR=dolphin-web/build-wasm
 TARGET="${1:-common}"
 
 # Apply the wasm port patches. Reverse-check first so re-runs are idempotent.
-for p in dolphin-web/patches/000[234]-*.patch; do
+for p in dolphin-web/patches/000[2345]-*.patch; do
   [ -e "$p" ] || continue
   case "$(basename "$p")" in
     *sfml*)  repo=dolphin/Externals/SFML/SFML; rel="../../../../$p" ;;
