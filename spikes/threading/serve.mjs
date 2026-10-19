@@ -9,7 +9,10 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 
-const TYPES = { '.html':'text/html', '.js':'text/javascript', '.mjs':'text/javascript' };
+// .wasm must be served as application/wasm or the browser refuses to stream-
+// compile it and silently falls back to a slower ArrayBuffer path.
+const TYPES = { '.html':'text/html', '.js':'text/javascript', '.mjs':'text/javascript',
+                '.wasm':'application/wasm' };
 const root = process.cwd();
 const port = Number(process.argv[2] ?? 8099);
 

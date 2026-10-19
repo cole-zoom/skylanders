@@ -23,7 +23,7 @@
 ✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
 ✓ IOS kernel                        constructs, serves device nodes, tears down — in the differential
 ✓ Portal USB device                 instantiates with the right identity (1430:0150)
-~ Disc                              DiscIO reads through a non-file BlobReader; no HTTP yet
+✓ Disc — THE REAL GAME             read in a browser over HTTP ranges, 0.0028% fetched
 ✓ Trace differ                      instruction-level, reports the FIRST divergence
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
@@ -500,6 +500,71 @@ seam between the config flag and a device the game can find — but its scanning
 is client-driven and `AddEmulatedDevices` is private. Reaching it means driving
 the `/dev/usb/oh0` device lifecycle, which is the same IPC plumbing the
 transfer test needs.
+
+## The real game, in a browser, over HTTP ranges
+
+```
+══ BROWSER (HTTP range requests) ══
+  disc size 4482.2 MB
+  DiscIO opened the disc                               ok
+  game id   SSPE52
+  name      Skylanders Spyro's Adventure
+  disc is a Wii disc                                   ok
+  partitions 2
+  filesystem opened inside the encrypted partition     ok
+  root entries: character/ hbm/ item/ level/ misc/ opening.bnr  (9 total)
+  boot DOL  offset=0x3ff00 size=5.6 MB
+  DOL header looks like a real executable              ok
+
+  fetched 128.9 KB in 28 requests (0.0028% of the disc)
+```
+
+Chrome, cross-origin isolated, reading the actual 4.5 GB disc through
+`emscripten_fetch` with `Range` headers. The encrypted Wii partition is
+decrypted, the filesystem is walked, and the **5.6 MB boot executable** — the
+thing Phase 2's recompiler will eventually translate — is located and its
+header validated.
+
+**128.9 KB of 4.5 GB.** Native fetching from a local file reports *the same
+byte count*: the transport does not change what DiscIO asks for. That is
+`docs/PLAN.md` Bet 05 demonstrated rather than assumed.
+
+### Why this needed a browser
+
+`emscripten_fetch` is built on `XMLHttpRequest`, which Node does not have. That
+is not a limitation worth working around — the browser *is* the target, and a
+synchronous ranged fetch from a worker is exactly what the shipped app does.
+`run-disc-browser.mjs` drives headless Chrome over the DevTools Protocol.
+
+Two servers, and they are not interchangeable:
+
+| | |
+|---|---|
+| `:8100` | the page and wasm, with **COOP/COEP** — pthreads need `SharedArrayBuffer` |
+| `:8101` | the disc, **ranges only**, with `Cross-Origin-Resource-Policy` so a cross-origin-isolated page may load it |
+
+`serve-disc.mjs` answers `416` to a request without a `Range` header. Serving
+the whole image on a rangeless request is exactly how a streaming client
+quietly becomes a downloading one, and the client refuses anything that is not
+`206 Partial Content` for the same reason.
+
+### Not RVZ
+
+The disc is a raw ISO converted with `dolphin-tool`. RVZ decoding lives in
+`WIARVZFileReader` (2,491 lines) which takes a `File::IOFile` and cannot be
+pointed at an arbitrary source, so serving RVZ directly means reimplementing
+its chunk index on top of `RangeBlobReader`. That is a **size** optimisation —
+3.8 GB versus 4.5 GB — not a correctness requirement, and it is deferred.
+
+### Three wrong assumptions on the way
+
+1. `GetGamePartition()` returns a `Partition` by value, not an optional;
+   `PARTITION_NONE` is the sentinel.
+2. Reading a file is `DiscIO::ReadFile` in `DiscExtractor`, not a method on
+   `FileSystem` — it needs the volume and partition to decrypt.
+3. **`main.dol` is not in the filesystem on Wii.** It lives at a fixed offset
+   referenced by the partition header, so `FindFileInfo("main.dol")` correctly
+   finds nothing. `GetBootDOLOffset` is the right call.
 
 ## The disc — DiscIO fed by something that is not a file
 
