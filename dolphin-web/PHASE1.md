@@ -23,6 +23,7 @@
 ✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
 ✓ IOS kernel                        constructs, serves device nodes, tears down — in the differential
 ✓ Portal USB device                 instantiates with the right identity (1430:0150)
+~ Disc                              DiscIO reads through a non-file BlobReader; no HTTP yet
 ✓ Trace differ                      instruction-level, reports the FIRST divergence
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
@@ -499,6 +500,46 @@ seam between the config flag and a device the game can find — but its scanning
 is client-driven and `AddEmulatedDevices` is private. Reaching it means driving
 the `/dev/usb/oh0` device lifecycle, which is the same IPC plumbing the
 transfer test needs.
+
+## The disc — DiscIO fed by something that is not a file
+
+`docs/PLAN.md` Bet 05 says the browser never holds the 3.8 GB disc; it asks for
+the ranges the game touches and caches them. Dolphin already has the seam —
+`DiscIO::BlobReader` is abstract and `DiscIO::CreateDisc` accepts one — so the
+open question was whether the *rest* of DiscIO works when fed by a non-file
+source.
+
+It does:
+
+```
+Disc through a ranged source
+  DiscIO created a volume from a non-file BlobReader   ok
+  game id=GSKE01  name=Harness Synthetic Disc
+  game id read back through the ranged source          ok
+  internal name read back                              ok
+  DiscIO issued 12 reads totalling 236 bytes of 8388608
+  DiscIO read a small fraction of the image            ok
+```
+
+**236 bytes out of 8 MB** is the number that matters. Streaming is viable
+precisely because DiscIO asks for what it needs rather than slurping the
+image — 0.003% here, for a header read. `RangeBlobReader` implements the
+contract over a `std::function` returning bytes for an offset and length;
+where those bytes come from is the source's problem.
+
+### Two things this is not
+
+**It is not RVZ.** RVZ decoding lives in `WIARVZFileReader`, which takes a
+`File::IOFile` and cannot be pointed at an arbitrary source. Serving the real
+disc over HTTP means reimplementing its chunk index on top of this layer — the
+capture header reports 128 KB chunks, zstd level 19 — which is separate work.
+This is the layer underneath that.
+
+**It is not HTTP.** The source here is an in-memory buffer. The byte-range
+plumbing is proven; the transport is not.
+
+The test uses a synthetic raw GameCube image with a valid header rather than
+the real disc, for the same reason: the real one is RVZ.
 
 ### What the differential covers
 
