@@ -38,6 +38,13 @@ em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
   $B/Source/Core/DiscIO/libdiscio.a \
   $B/Source/Core/UICommon/libuicommon.a \
   $B/Source/Core/Common/libcommon.a \
+  $B/Externals/cubeb/libcubeb.a \
+  $B/Externals/FatFs/libFatFs.a \
+  $B/Externals/FreeSurround/libFreeSurround.a \
+  $B/Externals/minizip-ng/minizip-ng/libminizip-ng.a \
+  $B/Externals/pugixml/pugixml/libpugixml.a \
+  $B/Externals/miniupnpc/miniupnp/miniupnpc/libminiupnpc.a \
+  $B/Externals/hidapi/libhidapi.a \
   $B/Externals/implot/libimplot.a $B/Externals/imgui/libimgui.a \
   $B/Externals/SFML/libsfml-network.a $B/Externals/SFML/libsfml-system.a \
   $B/Externals/curl/curl/lib/libcurl.a $B/Externals/enet/enet/libenet.a \

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iterator>
 
+#include "Common/FileUtil.h"
 #include "Common/Swap.h"
 
 #include "Common/CommonTypes.h"
