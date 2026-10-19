@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 
 #include "Common/CommonTypes.h"
 #include "Core/Core.h"
@@ -122,6 +123,67 @@ int main()
   state.pc = 0x8000'0000;
   state.gpr[1] = 0x8170'0000;
   check(state.pc == 0x8000'0000, "guest PC is settable");
+
+  // ── execute guest code ──
+  // Up to here the interpreter was only initialised. This actually fetches,
+  // decodes and runs Broadway instructions out of guest RAM.
+  //
+  // Encodings, hand-assembled so the expected results are checkable by hand:
+  //   addi  r3, r0, 0x1234   0x38601234   r3 = 0x1234
+  //   addi  r4, r0, 0x0100   0x38800100   r4 = 0x0100
+  //   add   r5, r3, r4       0x7CA32214   r5 = 0x1334
+  //   mullw r6, r3, r4       0x7CC321D6   r6 = 0x123400
+  //   or    r7, r3, r4       0x7C672378   r7 = 0x1334
+  std::printf("\nGuest execution\n");
+  static constexpr u32 PROGRAM[] = {
+      0x3860'1234, 0x3880'0100, 0x7CA3'2214, 0x7CC3'21D6, 0x7C67'2378,
+  };
+  constexpr u32 BASE = 0x8000'0000;
+
+  for (u32 i = 0; i < std::size(PROGRAM); ++i)
+    memory.Write_U32(PROGRAM[i], BASE + i * 4);
+  check(memory.Read_U32(BASE) == PROGRAM[0], "program reads back from guest RAM");
+
+  state.pc = BASE;
+  state.npc = BASE;
+  for (u32 i = 0; i < 3; ++i)
+    state.gpr[3 + i] = 0;
+
+  for (u32 i = 0; i < std::size(PROGRAM); ++i)
+    ppc.SingleStep();
+
+  std::printf("  r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x  pc=0x%08x\n", state.gpr[3],
+              state.gpr[4], state.gpr[5], state.gpr[6], state.gpr[7], state.pc);
+
+  check(state.gpr[3] == 0x0000'1234, "addi r3 -> 0x1234");
+  check(state.gpr[4] == 0x0000'0100, "addi r4 -> 0x0100");
+  check(state.gpr[5] == 0x0000'1334, "add r5 = r3 + r4");
+  check(state.gpr[6] == 0x0012'3400, "mullw r6 = r3 * r4");
+  check(state.gpr[7] == 0x0000'1334, "or r7 = r3 | r4");
+  check(state.pc == BASE + std::size(PROGRAM) * 4, "pc advanced past the program");
+
+  // Guest load/store. This is the path MemArenaEmscripten exists to serve:
+  // every guest memory access goes through the software MMU, since fastmem is
+  // refused on this backend. Arithmetic working proves the decoder; this
+  // proves the memory path.
+  //   stw r6, 0x200(r0)   0x90C00200   store r6 to guest 0x200
+  //   lwz r8, 0x200(r0)   0x81000200   load it back into r8
+  static constexpr u32 MEMPROG[] = {0x90C0'0200, 0x8100'0200};
+  constexpr u32 MBASE = 0x8000'0100;
+  for (u32 i = 0; i < std::size(MEMPROG); ++i)
+    memory.Write_U32(MEMPROG[i], MBASE + i * 4);
+
+  state.pc = MBASE;
+  state.npc = MBASE;
+  state.gpr[8] = 0;
+  for (u32 i = 0; i < std::size(MEMPROG); ++i)
+    ppc.SingleStep();
+
+  std::printf("  stored r6=0x%08x -> guest 0x200, loaded back r8=0x%08x\n", state.gpr[6],
+              state.gpr[8]);
+  check(state.gpr[8] == state.gpr[6], "lwz reads back what stw wrote");
+  check(memory.Read_U32(0x8000'0200) == state.gpr[6],
+        "host sees the guest store at the right address");
 
   ppc.Shutdown();
   Core::UndeclareAsCPUThread();

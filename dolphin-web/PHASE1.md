@@ -16,6 +16,7 @@
 ✓ Emulator core boots under wasm32  Core::System + memory manager, 3.8 MB module
 ✓ Wii memory map up                 MEM1 24 MB + MEM2 64 MB, both writable
 ✓ PowerPC interpreter initialises   no recompiler offered, thread affinity enforced
+✓ Broadway instructions EXECUTE     arithmetic + load/store through the software MMU
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -181,6 +182,53 @@ space, commit pages on touch. WebAssembly cannot reserve without committing, so
 it allocates up front with `calloc`. The semantics callers rely on (zeroed on
 `Create`, zeroed on `Clear`) are preserved; **the memory saving is not**, and a
 caller asking for a large region gets all of it resident immediately.
+
+## Guest code runs
+
+Everything above initialised things. This runs them: Broadway instructions
+fetched from guest RAM, decoded and executed by the interpreter, under
+WebAssembly.
+
+```
+Guest execution
+  program reads back from guest RAM                 ok
+  r3=0x00001234 r4=0x00000100 r5=0x00001334
+  r6=0x00123400 r7=0x00001334  pc=0x80000014
+  addi r3 -> 0x1234                                 ok
+  addi r4 -> 0x0100                                 ok
+  add   r5 = r3 + r4                                ok
+  mullw r6 = r3 * r4                                ok
+  or    r7 = r3 | r4                                ok
+  pc advanced past the program                      ok
+  stored r6=0x00123400 -> guest 0x200, loaded back r8=0x00123400
+  lwz reads back what stw wrote                     ok
+  host sees the guest store at the right address    ok
+```
+
+The encodings are hand-assembled so the expected results are checkable by hand
+rather than taken from the emulator being tested:
+
+| Instruction | Encoding | Result |
+|---|---|---|
+| `addi r3, r0, 0x1234` | `0x38601234` | `r3 = 0x1234` |
+| `addi r4, r0, 0x0100` | `0x38800100` | `r4 = 0x0100` |
+| `add r5, r3, r4` | `0x7CA32214` | `r5 = 0x1334` |
+| `mullw r6, r3, r4` | `0x7CC321D6` | `r6 = 0x123400` |
+| `or r7, r3, r4` | `0x7C672378` | `r7 = 0x1334` |
+| `stw r6, 0x200(r0)` | `0x90C00200` | guest `0x200` = `0x123400` |
+| `lwz r8, 0x200(r0)` | `0x81000200` | `r8 = 0x123400` |
+
+The arithmetic proves the decoder and the architectural state updates. The
+load/store pair proves the **memory path** — every guest access goes through
+the software MMU, because `MemArenaEmscripten` refuses fastmem, so this is the
+configuration the whole port depends on.
+
+**What this is not.** Seven instructions out of roughly a thousand Broadway
+opcodes. No branches, no condition register, no floating point, and above all
+**no paired singles** — the instruction class `docs/PLAN.md` §2 flags as a
+Fatal risk because of float contraction. Nothing is compared against native
+here either; the expected values are hand-derived, which catches a broken
+decoder but not a subtly wrong one.
 
 ### Where the smoke test stops, and why
 
