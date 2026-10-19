@@ -18,7 +18,12 @@
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/ConfigLoaders/BaseConfigLoader.h"
 #include "Core/ConfigManager.h"
+#include "Core/CoreTiming.h"
+#include "Core/IOS/IOS.h"
+#include "Core/WiiRoot.h"
+#include "UICommon/UICommon.h"
 #include "Core/Core.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/HW/Memmap.h"
@@ -62,7 +67,21 @@ int main()
   // and drags in the IOS filesystem, which asserts on an unset user path. The
   // CURRENT layer that Init creates is writable and is enough to override a
   // single setting.
+  // Order matters here and getting it wrong fails in two different places.
+  // IOS writes config during Init, which needs a writable BASE layer --
+  // Config::Init() alone creates the stack but no base, and the write lands on
+  // a null layer. But GenerateBaseConfigLoader reads Dolphin.ini and touches
+  // the IOS filesystem, which asserts on an empty NAND root. So the user
+  // directory and session Wii root must be established BEFORE the layer is
+  // added.
   Config::Init();
+  const std::string user_dir = "/tmp/dolphin-wasm-user/";
+  File::CreateFullPath(user_dir);
+  UICommon::SetUserDirectory(user_dir);
+  Core::InitializeWiiRoot(true);
+  Config::AddLayer(ConfigLoaders::GenerateBaseConfigLoader());
+  check(!File::GetUserPath(D_SESSION_WIIROOT_IDX).empty(), "NAND root and config base layer up");
+
   // SConfig must exist before System::Initialize(), which reads
   // SConfig::GetInstance().GetSimulatedMemorySize(). Omitting it segfaults
   // natively -- and, more worryingly, did NOT segfault under wasm32, where the
@@ -501,6 +520,25 @@ int main()
   // 1.25 * 3.5 - 4.375 is exact in both float32 and double, so the only way
   // this is nonzero is if the paired-single path is broken outright.
   check(state.ps[5].PS0AsDouble() == 0.0, "ps_madd exact case cancels to zero");
+
+  // ── IOS ──
+  // The Wii operating system, and the layer the game reaches the Skylander
+  // portal through. /dev/usb/oh0 is the node it opens to do so.
+  std::printf("\nIOS\n");
+  auto& core_timing = system.GetCoreTiming();
+  core_timing.Init();
+  IOS::HLE::Init(system);
+  auto* ios = system.GetIOS();
+  check(ios != nullptr, "IOS kernel constructed");
+  if (ios)
+  {
+    for (const char* node : {"/dev/aes", "/dev/sha", "/dev/es", "/dev/usb/oh0"})
+      check(ios->GetDeviceByName(node) != nullptr, node);
+  }
+  IOS::HLE::Shutdown(system);
+  check(system.GetIOS() == nullptr, "IOS shut down cleanly");
+  core_timing.Shutdown();
+  Core::ShutdownWiiRoot();
 
   ppc.Shutdown();
   Core::UndeclareAsCPUThread();
