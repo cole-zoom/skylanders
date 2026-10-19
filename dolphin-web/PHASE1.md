@@ -17,6 +17,7 @@
 ✓ Wii memory map up                 MEM1 24 MB + MEM2 64 MB, both writable
 ✓ PowerPC interpreter initialises   no recompiler offered, thread affinity enforced
 ✓ Broadway instructions EXECUTE     arithmetic + load/store through the software MMU
+✓ Paired singles execute            and the contraction risk is narrowed, not confirmed
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -229,6 +230,56 @@ opcodes. No branches, no condition register, no floating point, and above all
 Fatal risk because of float contraction. Nothing is compared against native
 here either; the expected values are hand-derived, which catches a broken
 decoder but not a subtly wrong one.
+
+## Paired singles, and what happened to the contraction risk
+
+`docs/PLAN.md` §2 carried float contraction as a **Fatal** risk: aarch64 fuses
+`a*c + b` into one rounding step while WebAssembly has no scalar FMA and rounds
+twice. Spike A found exactly that divergence in hand-written Rust.
+
+Paired singles now execute under wasm32 — they need `MSR[FP]` *and*
+`HID2[PSE]`, Broadway's paired-single enable, without which every `ps_*`
+instruction raises a program exception. The first run produced all-zero results
+and a PC that never advanced, which is what that exception looks like from
+outside.
+
+```
+ps_add  f3 = 4013000000000000 4000000020000000
+ps_mul  f4 = 4011800000000000 3ff0000040000000
+ps_madd f5 = 0000000000000000 3d10000000000000
+ps_madd exact case cancels to zero                    ok
+```
+
+**The risk is narrower than it looked.** Dolphin computes `ps_madd` in *double*
+(`NI_madd_msub`, which deliberately emulates Broadway's unusual FMA semantics
+in software). A float32 significand is 24 bits, so `a*c` is at most 48 bits —
+**exact** in double's 53. When `round(a*c) == a*c`, fused and unfused both round
+exactly once and cannot differ. Checked over 200,000 random float32 triples:
+zero disagreements.
+
+So contraction cannot change the result for paired singles carrying legitimate
+float32 data. It remains open for two cases: PS registers holding values that
+are *not* float32-exact, and `ppc2wasm`, which will compute in whatever
+precision it emits rather than inheriting Dolphin's doubles.
+
+**Two wrong attempts before that reasoning.** The first discriminator used
+values that give the same answer fused or unfused — it could not have detected
+contraction at all. The second used values finer than float32 can represent, so
+they never survived into the registers. Both passed or failed for reasons
+unrelated to the question being asked.
+
+### A native comparison was attempted and abandoned
+
+Linking the same program against the native core got as far as a binary, then
+died in `dyld` on deferred symbols, one rebuild per missing library. The oracle
+is a full build and its external set is long and circular. A native *generic*
+build — which would have matched the wasm configuration exactly — fails earlier
+still: `MemTools.cpp`, the macOS fastmem fault handler, does not compile under
+`_M_GENERIC`.
+
+So the paired-single result is **wasm-only**, and the expectations are derived
+from IEEE-754 reasoning rather than from native output. That is weaker than the
+differential used for the figure crypto and the portal.
 
 ### Where the smoke test stops, and why
 
