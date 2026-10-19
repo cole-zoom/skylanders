@@ -268,18 +268,42 @@ contraction at all. The second used values finer than float32 can represent, so
 they never survived into the registers. Both passed or failed for reasons
 unrelated to the question being asked.
 
-### A native comparison was attempted and abandoned
+### The native differential now exists
 
-Linking the same program against the native core got as far as a binary, then
-died in `dyld` on deferred symbols, one rebuild per missing library. The oracle
-is a full build and its external set is long and circular. A native *generic*
-build — which would have matched the wasm configuration exactly — fails earlier
-still: `MemTools.cpp`, the macOS fastmem fault handler, does not compile under
-`_M_GENERIC`.
+The previous attempt was abandoned: linking against the **oracle** build pulled
+in FFmpeg, Discord, libusb, cubeb and a long circular external set, with each
+missing library surfacing one at a time in `dyld` at runtime. And a native
+*generic* build — the one that would actually match the wasm configuration —
+did not compile at all.
 
-So the paired-single result is **wasm-only**, and the expectations are derived
-from IEEE-754 reasoning rather than from native output. That is weaker than the
-differential used for the figure crypto and the portal.
+Both are fixed. `harness/wasm-core/run.sh` builds the same source for wasm32
+and for a native **generic** build and diffs the output:
+
+```
+══ differential ══
+MATCH -- native and wasm32 agree on every value
+both targets PASSED
+```
+
+Every value agrees: the integer results, the guest load/store, and the
+paired-single bit patterns including `paired-single fnv1a=d0bbd6b37621525d`.
+Only the target banner and the host allocation addresses differ, and the runner
+normalises those away explicitly rather than ignoring whole lines.
+
+**Why generic rather than the oracle.** Both sides being `ENABLE_GENERIC`
+builds means the only difference between the two binaries is the target. A
+differential against the JIT-enabled oracle would have compared two different
+configurations and called the result a port check.
+
+**The `MemTools.cpp` fix.** That file is the fastmem fault handler. Its POSIX
+branch already excluded `_M_GENERIC`; its Apple branch did not, so a generic
+build on macOS hit `#error Unsupported architecture` before reaching the
+unsupported-platform stub at the bottom of the same file. Two guards make the
+Apple branch match the POSIX one. A JIT-less build has no fastmem faults to
+catch, so falling through to the stub is correct.
+
+This upgrades the paired-single result from "wasm-only, reasoned from
+IEEE-754" to the same differential footing as the figure crypto and the portal.
 
 ### Where the smoke test stops, and why
 

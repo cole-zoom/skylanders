@@ -1,0 +1,28 @@
+diff --git a/Source/Core/Core/MemTools.cpp b/Source/Core/Core/MemTools.cpp
+index a7919fb..18278c5 100644
+--- a/Source/Core/Core/MemTools.cpp
++++ b/Source/Core/Core/MemTools.cpp
+@@ -26,7 +26,11 @@
+ #include "Common/Thread.h"
+ #endif
+ 
+-#if defined(__APPLE__)
++// _M_GENERIC excluded to match the POSIX branch below, which already does so.
++// These defines only serve the Mach exception handler, which a generic build
++// does not use -- without the guard the #error below fires on macOS before the
++// unsupported-platform stub at the bottom of the file is ever reached.
++#if defined(__APPLE__) && !defined(_M_GENERIC)
+ #ifdef _M_X86_64
+ #define THREAD_STATE64_COUNT x86_THREAD_STATE64_COUNT
+ #define THREAD_STATE64 x86_THREAD_STATE64
+@@ -120,7 +124,9 @@ bool IsExceptionHandlerSupported()
+   return true;
+ }
+ 
+-#elif defined(__APPLE__) && !defined(USE_SIGACTION_ON_APPLE)
++// Likewise excluded for _M_GENERIC: a JIT-less build has no fastmem faults to
++// catch, and falls through to the stub that reports no handler is supported.
++#elif defined(__APPLE__) && !defined(USE_SIGACTION_ON_APPLE) && !defined(_M_GENERIC)
+ 
+ static void CheckKR(const char* name, kern_return_t kr)
+ {

@@ -31,10 +31,13 @@ void Host_UpdateTitle(const std::string&)
 void Host_UpdateDiscordClientID(const std::string&)
 {
 }
+bool Host_UIBlocksControllerState()
+{
+  return false;
+}
 bool Host_UpdateDiscordPresenceRaw(const std::string&, const std::string&, const std::string&,
                                    const std::string&, const std::string&, const std::string&,
-                                   const std::string&, const std::string&, const std::string&,
-                                   const std::string&, int, int)
+                                   long long, long long, int, int)
 {
   return false;
 }
@@ -94,7 +97,14 @@ extern "C" int pthread_setname_np(const char*)
 }
 
 // ── host USB: must never be reached ──
+//
+// Only for wasm. The native differential build links the real libusb (it has
+// __LIBUSB__ defined, since only Emscripten excludes it), and these would
+// collide with it. The invariant being protected -- "the browser build must
+// use the EMULATED portal" -- is a wasm invariant anyway.
+#if defined(__EMSCRIPTEN__)
 extern "C" {
+#if defined(__EMSCRIPTEN__)
 [[noreturn]] static void no_host_usb(const char* fn)
 {
   std::fprintf(stderr,
@@ -104,6 +114,7 @@ extern "C" {
                fn);
   std::abort();
 }
+#endif
 int libusb_init(void**) { no_host_usb("libusb_init"); }
 void libusb_exit(void*) { no_host_usb("libusb_exit"); }
 int libusb_handle_events_timeout_completed(void*, void*, int*) {
@@ -116,3 +127,4 @@ int libusb_interrupt_transfer(void*, unsigned char, unsigned char*, int, int*, u
   no_host_usb("libusb_interrupt_transfer");
 }
 }
+#endif  // __EMSCRIPTEN__
