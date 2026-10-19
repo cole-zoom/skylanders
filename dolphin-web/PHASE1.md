@@ -21,7 +21,7 @@
 ✓ Differential widened              19 instructions, 41 assertions, native == wasm32
 ✓ MMU address translation           BAT-mapped loads/stores, verified host-side
 ✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
-~ IOS kernel                        constructs under wasm with all device nodes; teardown traps
+✓ IOS kernel                        constructs, serves device nodes, tears down — in the differential
 ✓ Trace differ                      instruction-level, reports the FIRST divergence
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
@@ -412,57 +412,47 @@ Fixing it then broke the native build, because macOS declares the
 single-argument form and supplies a real implementation, so the stub is now
 wasm-only.
 
-## IOS — partial, and deliberately outside the differential
+## IOS — fixed, and back in the differential
 
-IOS is the Wii's operating system, and it is the layer the game reaches the
-Skylander portal through. `harness/wasm-core/ios_probe.cpp` is how far it gets.
+PR #17 left IOS failing on **both** targets, at different points: wasm
+constructed the kernel then trapped in its destructor, native SIGSEGV'd inside
+`IOS::HLE::Init` before the kernel existed. That PR predicted the cause:
 
-**Under wasm32 the kernel constructs and every device node is present:**
+> Two targets failing *differently* is the signature of missing
+> initialisation, not a port bug.
+
+It was. **One root cause, one ordering fix**, and both targets now pass:
 
 ```
-  guest memory up                                      ok
-  session NAND root is set                             ok
-  core timing initialised                              ok
+IOS
   IOS kernel constructed                               ok
   /dev/aes                                             ok
   /dev/sha                                             ok
   /dev/es                                              ok
   /dev/usb/oh0                                         ok      <- the portal's node
-  [about to destroy the kernel -- wasm32 traps here]
+  IOS shut down cleanly                                ok
 ```
 
-`/dev/usb/oh0` existing is the point: that is the node the game opens to reach
-the portal, and it is present under WebAssembly.
+**The ordering.** IOS writes config during `Init`, which needs a writable
+*base* layer — `Config::Init()` alone creates the stack but no base, so the
+write lands on a null layer (`Config::Layer::Set`, found with `lldb`). But
+`GenerateBaseConfigLoader` reads `Dolphin.ini` and touches the IOS filesystem,
+which asserts on an empty NAND root. So the user directory and session Wii root
+have to exist **before** the layer is added:
 
-**But both targets fail, at different points.**
+```
+Config::Init()
+  -> SetUserDirectory + InitializeWiiRoot(true)
+     -> Config::AddLayer(GenerateBaseConfigLoader())
+        -> SConfig::Init() -> System::Initialize()
+```
 
-| | Outcome |
-|---|---|
-| wasm32 | kernel constructs, all nodes present, then the **destructor traps** |
-| native | **SIGSEGV during `IOS::HLE::Init`**, before the kernel exists |
+Getting that sequence wrong fails in two unrelated places, and neither error
+names the ordering.
 
-Two targets failing *differently* is the signature of **missing
-initialisation**, not a port bug. Dolphin normally reaches IOS through
-`Core::Init`, which brings up considerably more than the probe does. The
-destructor that traps under wasm (`EmulationKernel::~EmulationKernel`) removes
-its CoreTiming events, clears the device map, and resets the socket manager —
-one of those three, not yet narrowed further.
-
-**Why it is not in the differential.** `coreboot.cpp` stays green on both
-targets; adding IOS would have made it red on both for a reason that is about
-setup rather than about the port. The probe records the state instead. Getting
-IOS up properly means standing up more of `Core::Init`, which is the next real
-block of work rather than another increment.
-
-### Two things that were needed just to get this far
-
-`UICommon::SetUserDirectory` alone leaves `D_SESSION_WIIROOT_IDX` empty, and
-`FS::MakeFileSystem` asserts on an empty root path.
-`Core::InitializeWiiRoot(true)` fills it in with a temporary NAND.
-
-Linking IOS pulled in the Wii Speak microphone, which needs cubeb — plus FatFs,
-FreeSurround, minizip-ng, pugixml, miniupnpc and hidapi. All were already built
-for wasm; they just had to be added to the link line.
+**It is back in the differential.** PR #17 set the rule that something leaves
+only while known-incomplete and returns the moment it works; `ios_probe.cpp` is
+deleted and the bring-up lives in `coreboot.cpp` alongside everything else.
 
 ### What the differential covers
 
