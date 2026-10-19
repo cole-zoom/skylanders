@@ -107,6 +107,32 @@ extern "C" int pthread_setname_np(unsigned long, const char*)
 }
 #endif
 
+// ── hidapi: no raw HID in a browser ──
+//
+// InputCommon links hidapi for real controllers. hidapi's own backend needs
+// libusb, which is deliberately compiled out of the wasm build, so the library
+// itself is dropped from the link and its entry points are stubbed instead.
+//
+// These return "no devices" rather than aborting, because unlike host USB this
+// is a path the emulator legitimately walks during input setup: enumerating
+// zero controllers is a correct answer in a browser, not a bug.
+#if defined(__EMSCRIPTEN__)
+extern "C" {
+struct hid_device_info;
+int hid_init(void) { return 0; }
+int hid_exit(void) { return 0; }
+hid_device_info* hid_enumerate(unsigned short, unsigned short) { return nullptr; }
+void hid_free_enumeration(hid_device_info*) {}
+void* hid_open_path(const char*) { return nullptr; }
+void hid_close(void*) {}
+int hid_read_timeout(void*, unsigned char*, size_t, int) { return -1; }
+int hid_write(void*, const unsigned char*, size_t) { return -1; }
+int hid_read(void*, unsigned char*, size_t) { return -1; }
+int hid_send_feature_report(void*, const unsigned char*, size_t) { return -1; }
+int hid_set_nonblocking(void*, int) { return -1; }
+}
+#endif
+
 // ── host USB: must never be reached ──
 //
 // Only for wasm. The native differential build links the real libusb (it has

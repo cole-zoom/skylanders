@@ -25,7 +25,7 @@ B=dolphin-web/build-wasm
 em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
   -D_M_GENERIC=1 -D_ARCH_32=1 \
   -sASSERTIONS=1 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
-  -sFETCH=1 \
+  -sFETCH=1 -sUSE_BZIP2=1 \
   -I$D/Source/Core -I$B/Source/Core \
   -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
   "$SRC" harness/wasm-core/host_stubs.cpp \
@@ -45,7 +45,6 @@ em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
   $B/Externals/minizip-ng/minizip-ng/libminizip-ng.a \
   $B/Externals/pugixml/pugixml/libpugixml.a \
   $B/Externals/miniupnpc/miniupnp/miniupnpc/libminiupnpc.a \
-  $B/Externals/hidapi/libhidapi.a \
   $B/Externals/implot/libimplot.a $B/Externals/imgui/libimgui.a \
   $B/Externals/SFML/libsfml-network.a $B/Externals/SFML/libsfml-system.a \
   $B/Externals/curl/curl/lib/libcurl.a $B/Externals/enet/enet/libenet.a \
@@ -56,4 +55,8 @@ em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
   $B/Externals/mbedtls/library/libmbedtls.a \
   $B/Externals/mbedtls/library/libmbedx509.a \
   $B/Externals/mbedtls/library/libmbedcrypto.a \
+  $B/Externals/lz4/lz4/build/cmake/liblz4.a \
+  $B/Externals/liblzma/liblzma.a \
+  $B/Externals/zlib-ng/zlib-ng/libz.a \
+  $B/Externals/zstd/zstd/build/cmake/lib/libzstd.a \
   -o "$OUT"
