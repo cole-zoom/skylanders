@@ -12,7 +12,9 @@
 #include <cstring>
 
 #include "Common/CommonTypes.h"
+#include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 static int g_failures = 0;
@@ -26,6 +28,10 @@ static void check(bool ok, const char* what)
 
 int main()
 {
+  // Unbuffered: a trap under PROXY_TO_PTHREAD loses buffered output, which
+  // makes a crash look like it happened one step earlier than it did.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+
 #if defined(__EMSCRIPTEN__)
   std::printf("target: wasm32 (emscripten)\n\n");
 #else
@@ -39,26 +45,87 @@ int main()
   auto& memory = system.GetMemory();
   check(true, "memory manager reachable");
 
-  memory.Init();
-  // Report before asserting: Memory::Init() sizes itself from config, and
-  // without a game loaded it comes up in GameCube mode, where MEM2 does not
-  // exist at all. Printing the actual values makes that visible instead of
-  // leaving two bare FAILs to interpret.
-  std::printf("  MEM1 %p size 0x%08x\n", static_cast<void*>(memory.GetRAM()),
-              memory.GetRamSize());
-  std::printf("  MEM2 %p size 0x%08x\n", static_cast<void*>(memory.GetEXRAM()),
-              memory.GetExRamSize());
-  check(memory.GetRAM() != nullptr, "MEM1 allocated");
-  check(memory.GetRamSize() > 0, "MEM1 has a nonzero size");
+  // Memmap gates MEM2 on System::IsWii(), which defaults false. Without this
+  // the core comes up as a GameCube and MEM2 is never allocated -- which is
+  // correct behaviour, and was the reason the first run reported a null MEM2.
+  // Skylanders is a Wii title, so Wii mode is what has to work.
+  system.SetIsWii(true);
+  check(system.IsWii(), "core is in Wii mode");
 
-  // Guest RAM must be writable through the pointers the emulator hands out.
+  memory.Init();
+  // GetRamSize() is NextPowerOf2(GetRamSizeReal()), so a 24 MB Wii MEM1
+  // reports as 32 MB through the rounded accessor. The real size is the one
+  // that matches hardware; the first version of this test asserted the rounded
+  // one and failed for a reason that had nothing to do with wasm.
+  std::printf("  MEM1 %p  real 0x%08x  rounded 0x%08x\n", static_cast<void*>(memory.GetRAM()),
+              memory.GetRamSizeReal(), memory.GetRamSize());
+  std::printf("  MEM2 %p  real 0x%08x  rounded 0x%08x\n", static_cast<void*>(memory.GetEXRAM()),
+              memory.GetExRamSizeReal(), memory.GetExRamSize());
+
+  check(memory.GetRAM() != nullptr, "MEM1 allocated");
+  check(memory.GetRamSizeReal() == 0x0180'0000, "MEM1 is 24 MB (Wii)");
+  check(memory.GetEXRAM() != nullptr, "MEM2 allocated");
+  check(memory.GetExRamSizeReal() == 0x0400'0000, "MEM2 is 64 MB (Wii)");
+
+  // Guest RAM must be writable through the pointers the emulator hands out,
+  // across the REAL extent -- the rounded size is larger than what is mapped.
   if (u8* ram = memory.GetRAM())
   {
+    const u32 n = memory.GetRamSizeReal();
     ram[0] = 0xAB;
-    ram[memory.GetRamSize() - 1] = 0xCD;
-    check(ram[0] == 0xAB && ram[memory.GetRamSize() - 1] == 0xCD,
-          "MEM1 round-trips first and last byte");
+    ram[n - 1] = 0xCD;
+    check(ram[0] == 0xAB && ram[n - 1] == 0xCD, "MEM1 round-trips first and last byte");
   }
+  if (u8* exram = memory.GetEXRAM())
+  {
+    const u32 n = memory.GetExRamSizeReal();
+    exram[0] = 0x12;
+    exram[n - 1] = 0x34;
+    check(exram[0] == 0x12 && exram[n - 1] == 0x34, "MEM2 round-trips first and last byte");
+  }
+
+  // ── PowerPC ──
+  // ENABLE_GENERIC excludes both recompilers, so the interpreter should be the
+  // only core offered. If a JIT showed up here the generic build would not be
+  // what it claims to be.
+  std::printf("\nPowerPC\n");
+  const auto cores = PowerPC::AvailableCPUCores();
+  std::printf("  available CPU cores:");
+  bool has_interp = false, has_jit = false;
+  for (const auto c : cores)
+  {
+    std::printf(" %d", static_cast<int>(c));
+    if (c == PowerPC::CPUCore::Interpreter)
+      has_interp = true;
+    if (c == PowerPC::CPUCore::JIT64 || c == PowerPC::CPUCore::JITARM64)
+      has_jit = true;
+  }
+  std::printf("\n");
+  check(has_interp, "interpreter is available");
+  check(!has_jit, "no recompiler is offered (generic build)");
+  check(PowerPC::DefaultCPUCore() == PowerPC::CPUCore::Interpreter ||
+            PowerPC::DefaultCPUCore() == PowerPC::CPUCore::CachedInterpreter,
+        "default core is an interpreter");
+
+  // PowerPC::Init asserts Core::IsCPUThread(). Dolphin enforces thread
+  // affinity on the emulated CPU, and that assertion fires correctly under
+  // wasm -- which is reassuring for the worker topology Spike C validated,
+  // since it means the checks guarding it are live rather than compiled out.
+  Core::DeclareAsCPUThread();
+  check(Core::IsCPUThread(), "this thread is now the CPU thread");
+
+  auto& ppc = system.GetPowerPC();
+  ppc.Init(PowerPC::CPUCore::Interpreter);
+  check(true, "PowerPC initialised with the interpreter");
+
+  auto& state = ppc.GetPPCState();
+  state.pc = 0x8000'0000;
+  state.gpr[1] = 0x8170'0000;
+  check(state.pc == 0x8000'0000, "guest PC is settable");
+
+  ppc.Shutdown();
+  Core::UndeclareAsCPUThread();
+  check(!Core::IsCPUThread(), "PowerPC shut down and CPU thread released");
 
   memory.Shutdown();
   check(true, "memory shut down cleanly");

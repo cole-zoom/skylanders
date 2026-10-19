@@ -17,8 +17,14 @@ B=dolphin-web/build-wasm
 # INITIAL_MEMORY must cover guest RAM before anything else: MEM1 (24 MB) plus
 # MEM2 (64 MB) plus the emulator's own allocations. 512 MB leaves headroom.
 # PROXY_TO_PTHREAD keeps main off the main thread, matching Spike C's topology.
+# These must match what CMake compiled the libraries with. Without
+# -D_M_GENERIC the headers present a different view to this translation unit
+# than they did to libcore -- MachineContext.h in particular falls through to
+# "#error No context definition for OS" instead of taking its generic path,
+# and anything that compiled would be an ODR hazard rather than a build error.
 em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
-  -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
+  -D_M_GENERIC=1 -D_ARCH_32=1 \
+  -sASSERTIONS=1 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
   -I$D/Source/Core -I$B/Source/Core \
   -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
   "$SRC" harness/wasm-core/host_stubs.cpp \

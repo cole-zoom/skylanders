@@ -14,6 +14,8 @@
 ✓ MIFARE crypto verified            3 figures byte-identical vs native
 ✓ Portal runs under wasm32          SkylanderPortal, 64 block replies identical
 ✓ Emulator core boots under wasm32  Core::System + memory manager, 3.8 MB module
+✓ Wii memory map up                 MEM1 24 MB + MEM2 64 MB, both writable
+✓ PowerPC interpreter initialises   no recompiler offered, thread affinity enforced
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -91,10 +93,52 @@ PASSED
 Guest RAM is allocated through `MemArenaEmscripten`, is writable through the
 pointers the emulator hands out, and shuts down cleanly.
 
-**MEM2 is null** because without a game loaded the core comes up in GameCube
-mode, where MEM2 does not exist. The 64 MB figure beside it is the size
-constant, not an allocation. Reaching Wii mode needs a boot configuration, not
-a port fix — that is the next step, not a defect.
+### Wii mode, and the PowerPC core
+
+`System::SetIsWii(true)` is all Wii mode needed — `Memmap` gates MEM2 on it,
+and it defaults false, which is why the first run reported a null MEM2. The
+full Wii memory map now comes up, and the PowerPC core initialises on top of
+it:
+
+```
+MEM1 0x690000   real 0x01800000  rounded 0x02000000
+MEM2 0x26d0000  real 0x04000000  rounded 0x04000000
+MEM1 is 24 MB (Wii)                        ok
+MEM2 is 64 MB (Wii)                        ok
+MEM1 round-trips first and last byte       ok
+MEM2 round-trips first and last byte       ok
+
+PowerPC
+  available CPU cores: 5 0
+  interpreter is available                 ok
+  no recompiler is offered (generic build) ok
+  this thread is now the CPU thread        ok
+  PowerPC initialised with the interpreter ok
+  guest PC is settable                     ok
+```
+
+88 MB of guest RAM, allocated through `MemArenaEmscripten` and writable across
+its real extent.
+
+`available CPU cores: 5 0` is CachedInterpreter and Interpreter — **no
+recompiler is offered**, confirming `ENABLE_GENERIC` is doing what it claims
+rather than silently falling back to something.
+
+Two things the earlier run got wrong, both the test's fault:
+
+- **MEM1 "32 MB"** was `GetRamSize()`, which is `NextPowerOf2(GetRamSizeReal())`.
+  The real size is 24 MB and always was. The test asserted the rounded accessor
+  and failed for a reason unrelated to wasm.
+- **`-D_M_GENERIC=1` was missing** from the test's own compile. The libraries
+  had it; the test did not, so `MachineContext.h` fell through to
+  `#error No context definition for OS` instead of taking its existing generic
+  path. Anything that *had* compiled would have been an ODR hazard. Compile
+  flags for a program linking these libraries must match what CMake used.
+
+`PowerPC::Init` asserts `Core::IsCPUThread()`, which fired correctly and needed
+`Core::DeclareAsCPUThread()`. That assertion being live under wasm is
+reassuring for the worker topology Spike C validated — the thread-affinity
+checks are real, not compiled out.
 
 ### Host USB is compiled out, the way Android does it
 
