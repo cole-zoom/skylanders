@@ -22,6 +22,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/CoreTiming.h"
 #include "Core/IOS/IOS.h"
+#include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
 #include "Core/WiiRoot.h"
 #include "UICommon/UICommon.h"
 #include "Core/Core.h"
@@ -535,6 +536,44 @@ int main()
     for (const char* node : {"/dev/aes", "/dev/sha", "/dev/es", "/dev/usb/oh0"})
       check(ios->GetDeviceByName(node) != nullptr, node);
   }
+  // ── the emulated portal device ──
+  // PR #9 could not do this. Instantiating SkylanderUSB emits its vtable,
+  // which references SubmitTransfer, which reaches Core::System,
+  // MemoryManager and the IOS kernel -- so with only the Skylanders objects
+  // linked it was a cliff, not a slope. The full core is linked now, so the
+  // device the game actually enumerates can finally be constructed and
+  // inspected.
+  //
+  // The real Portal of Power is VID 0x1430 (Activision) / PID 0x0150, with two
+  // 64-byte interrupt endpoints. If any of this were wrong the game would
+  // never find the portal -- the same "Can't find the USB Wireless Receiver"
+  // screen the headless gameplay capture hit for a different reason.
+  std::printf("\nEmulated portal device\n");
+  IOS::HLE::USB::SkylanderUSB portal_device;
+  const auto dd = portal_device.GetDeviceDescriptor();
+  std::printf("  usb identity %04x:%04x  maxpacket=%u configs=%u\n", dd.idVendor, dd.idProduct,
+              dd.bMaxPacketSize0, dd.bNumConfigurations);
+  check(dd.idVendor == 0x1430, "vendor is 0x1430 (Activision)");
+  check(dd.idProduct == 0x0150, "product is 0x0150 (Portal of Power)");
+  check(dd.bNumConfigurations == 1, "one configuration");
+
+  const auto ifaces = portal_device.GetInterfaces(0);
+  check(ifaces.size() == 1 && ifaces[0].bInterfaceClass == 0x03, "one HID interface");
+
+  const auto eps = portal_device.GetEndpoints(0, 0, 0);
+  check(eps.size() == 2, "two endpoints");
+  if (eps.size() == 2)
+  {
+    // 0x81 IN / 0x02 OUT, attribute 3 = interrupt, 64-byte packets.
+    check(eps[0].bEndpointAddress == 0x81 && eps[0].bmAttributes == 0x03 &&
+              eps[0].wMaxPacketSize == 0x40,
+          "endpoint 0x81 is a 64-byte interrupt IN");
+    check(eps[1].bEndpointAddress == 0x02 && eps[1].bmAttributes == 0x03 &&
+              eps[1].wMaxPacketSize == 0x40,
+          "endpoint 0x02 is a 64-byte interrupt OUT");
+  }
+  check(portal_device.Attach(), "device attaches");
+
   IOS::HLE::Shutdown(system);
   check(system.GetIOS() == nullptr, "IOS shut down cleanly");
   core_timing.Shutdown();
