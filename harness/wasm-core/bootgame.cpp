@@ -37,6 +37,9 @@
 #include "AudioCommon/AudioCommon.h"
 #include "Common/Logging/LogManager.h"
 #include "Common/WindowSystemInfo.h"
+#include "VideoCommon/AsyncRequests.h"
+#include "VideoCommon/CommandProcessor.h"
+#include "VideoCommon/VideoBackendBase.h"
 #include "Core/HW/GCKeyboard.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/Wiimote.h"
@@ -118,9 +121,39 @@ int main(int argc, char** argv)
   const std::string location = argc > 1 ? argv[1] : "/tmp/ssa.iso";
   const u64 steps = argc > 2 ? std::strtoull(argv[2], nullptr, 0) : 2000;
   bool want_trace = false;
+  // --until-fifo: treat the step count as a cap and stop at the first FIFO
+  // write instead of running it out. Reaching the FIFO takes far more
+  // instructions than a fixed differential run, and every step past the
+  // milestone is browser time spent learning nothing.
+  bool stop_at_fifo = false;
+  u64 checkpoint = 0;
+  u64 trace_from = 0;
+  u64 dump_at = 0;
   for (int i = 1; i < argc; ++i)
+  {
     if (std::strcmp(argv[i], "--trace") == 0)
       want_trace = true;
+    else if (std::strcmp(argv[i], "--until-fifo") == 0)
+      stop_at_fifo = true;
+    // --checkpoint=N: emit a trace line every N steps instead of every step.
+    // A full trace to the first FIFO write would be 63 million lines, which is
+    // not transportable out of a browser. Checkpoints every 100k give ~630
+    // lines and localise a divergence to a 100k window; a second run with
+    // --trace over that window pinpoints the instruction. The line format is
+    // identical to --trace, so difftrace.py compares either without changes.
+    else if (std::strncmp(argv[i], "--checkpoint=", 13) == 0)
+      checkpoint = std::strtoull(argv[i] + 13, nullptr, 0);
+    // --from=N: skip emitting until step N. Pairs with --trace to capture a
+    // bounded window deep into the run.
+    else if (std::strncmp(argv[i], "--from=", 7) == 0)
+      trace_from = std::strtoull(argv[i] + 7, nullptr, 0);
+    // --dump-at=N: full register state at step N, plus the instruction words
+    // around the PC. This is the last step of localising a divergence: the
+    // checkpoint pass finds the 100k window, a traced window finds the step,
+    // and this says which register and which opcode.
+    else if (std::strncmp(argv[i], "--dump-at=", 10) == 0)
+      dump_at = std::strtoull(argv[i] + 10, nullptr, 0);
+  }
 
 #if defined(__EMSCRIPTEN__)
   std::printf("target: wasm32 (emscripten)  disc: %s\n\n", location.c_str());
@@ -245,6 +278,33 @@ int main(int argc, char** argv)
   Config::SetCurrent(Config::MAIN_SLOT_B, ExpansionInterface::EXIDeviceType::None);
   Config::SetCurrent(Config::MAIN_SERIAL_PORT_1, ExpansionInterface::EXIDeviceType::None);
 
+  // 1b. Single core. Dolphin's dual-core mode runs the GPU on its own thread
+  //     (Core.cpp spawns it in GetInitializedVideoGuard), which is the same
+  //     init-time thread hazard again. Single core runs the GPU inline on the
+  //     CPU thread, and also makes the run deterministic -- a differential
+  //     against a native oracle cannot tolerate a second thread deciding when
+  //     the FIFO is consumed.
+  Config::SetCurrent(Config::MAIN_CPU_THREAD, false);
+
+  // 1c. Null video backend. It registers the CP/PE MMIO the game writes to
+  //     and consumes the FIFO, but rasterises nothing -- which is exactly the
+  //     Phase 1 shape in docs/PLAN.md: correctness of the command stream, no
+  //     pixels.
+  Config::SetCurrent(Config::MAIN_GFX_BACKEND, std::string("Null"));
+
+  // 1d. Pin the emulated clock. SystemTimers.cpp:253 seeds the RTC from
+  //     Common::Timer::GetLocalTimeSinceJan1970() unless a custom RTC is set,
+  //     so every run starts the guest at a different wall-clock time. That is
+  //     invisible for 20,000 instructions and very visible at 63 million: the
+  //     step index of the first FIFO write drifted by a few hundred between
+  //     native runs, which makes step indices useless as a comparator and
+  //     would read as a wasm divergence when it is not one.
+  //
+  //     The value is arbitrary but fixed. What matters is that both targets
+  //     and every repeat run see the same one.
+  Config::SetCurrent(Config::MAIN_CUSTOM_RTC_ENABLE, true);
+  Config::SetCurrent(Config::MAIN_CUSTOM_RTC_VALUE, u32{0x5D000000});
+
   // 2. DSP HLE. HW::Init passes MAIN_DSP_HLE to DSPManager::Init and the LLE
   //    path spawns a dedicated DSP thread; HLE runs the DSP on the caller.
   //    HLE is already the default, so this guards against a stray config.
@@ -264,6 +324,25 @@ int main(int argc, char** argv)
   HW::Init(system, nullptr);
   INIT_MARK("HW::Init done");
   check(system.GetMemory().GetRAM() != nullptr, "hardware up, guest memory allocated");
+
+  // ── video ──
+  // After HW::Init, matching Core.cpp: HW::Init runs at Core.cpp:580 and the
+  // video guard at :601. The order matters because Memory::InitMMIO (the last
+  // thing HW::Init does) is what wires the CP and PE register blocks, and the
+  // backend expects that to have happened.
+  INIT_MARK("video backend");
+  VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
+  check(g_video_backend != nullptr, "Null video backend activated");
+
+  // Single core, so the GPU runs on this thread. Both of these are what
+  // Core.cpp does inside its init_video lambda; passthrough means AsyncRequests
+  // executes work inline instead of queueing it for a GPU thread that does not
+  // exist here.
+  Core::DeclareAsGPUThread();
+  AsyncRequests::GetInstance()->SetPassthrough(true);
+  const bool video_up = g_video_backend && g_video_backend->Initialize(wsi);
+  check(video_up, "video backend initialised");
+  INIT_MARK("video backend done");
 
   // IOS is NOT initialised here. HW::Init does it (HW.cpp:58, "Depends on
   // Memory"). Calling it again re-registers the IPCEvent and trips a
@@ -312,6 +391,24 @@ int main(int argc, char** argv)
   auto boot = std::make_unique<BootParameters>(
       BootParameters::Disc{location, std::move(volume), {}});
 
+  // Game metadata BEFORE boot. BootManager::BootCore does this at
+  // BootManager.cpp:56, and calling CBoot::BootUp directly skips it -- which
+  // leaves SConfig::m_region (ConfigManager.h:53, declared with no
+  // initialiser) holding indeterminate memory.
+  //
+  // That is not a cosmetic omission. Boot_BS2Emu.cpp:512 writes
+  // IsNTSC(m_region) ? 0 : 1 to 0x800000CC, so an unset region picks the wrong
+  // video standard, and the game reads it back 59.7 MILLION instructions later
+  // and takes a different branch. Native happened to read zeroed memory
+  // (NTSC_J -- wrong for a USA disc, but NTSC, so the write matched by luck);
+  // wasm read reused heap and got 4606276, which is not a Region at all.
+  //
+  // This is exactly the bug class the differential exists to catch: identical
+  // code, identical input, and a divergence that only appears because one
+  // target's uninitialised memory happens to be zero.
+  check(SConfig::GetInstance().SetPathsAndGameMetadata(system, *boot),
+        "game metadata set (region, paths)");
+
   const u32 pc_before = system.GetPPCState().pc;
   bool booted = false;
   {
@@ -324,6 +421,18 @@ int main(int argc, char** argv)
   auto& state = system.GetPPCState();
   std::printf("  entry pc  0x%08x (was 0x%08x)\n", state.pc, pc_before);
   std::printf("  msr=%08x  r1(sp)=%08x\n", state.msr.Hex, state.gpr[1]);
+
+  // Region and the low-memory video-mode global.
+  //
+  // Boot_BS2Emu.cpp:512 writes IsNTSC(region) ? 0 : 1 to 0x800000CC ("Fake the
+  // VI Init of the IPL"), and the game reads it back with `lwz r24, 204(r3)`
+  // at pc 0x803dfd00. If the two targets disagree about region they diverge
+  // there -- 59.7 million instructions after boot, which is a long way to
+  // travel to discover a configuration difference. Printing it here makes that
+  // class of mismatch visible immediately.
+  std::printf("  region    %d  lowmem[0x800000CC]=%08x\n",
+              static_cast<int>(SConfig::GetInstance().m_region),
+              system.GetMemory().Read_U32(0x800000CC));
   check(state.pc != 0 && state.pc != pc_before, "boot left the CPU at an entry point");
 
   // ── execute ──
@@ -332,17 +441,77 @@ int main(int argc, char** argv)
   u64 executed = 0;
   const u32 first_pc = state.pc;
   u32 min_pc = state.pc, max_pc = state.pc;
+
+  // ── FIFO milestones ──
+  // The Phase 1 gate is the first rendered frame's FIFO write, so the run has
+  // to report when the game first touches the graphics FIFO rather than only
+  // how far the PC got.
+  //
+  // Two distinct events, recorded separately because they answer different
+  // questions:
+  //
+  //   configured  CPBase/CPEnd become non-zero -- the game has told the
+  //               Command Processor where its FIFO lives. This proves the CP
+  //               register block is wired and the writes are landing.
+  //
+  //   written     CPWritePointer moves -- actual command data reached the
+  //               FIFO. This is the gate's event.
+  //
+  // CommandProcessor::GetFifo() is public, so neither needs a Dolphin patch.
+  // The gather pipe itself would be the earliest possible signal, but
+  // GPFifo::GetGatherPipeCount() is private and a flush lands here anyway.
+  auto& fifo = system.GetCommandProcessor().GetFifo();
+  const u32 wp_initial = fifo.CPWritePointer.load();
+  s64 fifo_configured_at = -1, fifo_written_at = -1;
+  u32 fifo_configured_pc = 0, fifo_written_pc = 0;
+
   for (u64 i = 0; i < steps; ++i)
   {
-    if (want_trace)
+    if (i >= trace_from && (want_trace || (checkpoint && i % checkpoint == 0)))
       Trace::EmitLine(i, state);
+    if (dump_at && i == dump_at)
+    {
+      Trace::EmitFullState(i, state);
+      // The instruction words either side of the PC. Code comes from the disc
+      // and is identical on both targets, so this only needs reading once --
+      // but printing it on both proves that assumption rather than trusting it.
+      auto& mem = system.GetMemory();
+      for (u32 a = state.pc - 16; a <= state.pc + 16; a += 4)
+        std::printf("D   code %08x: %08x%s\n", a, mem.Read_U32(a),
+                    a == state.pc ? "   <- pc" : "");
+      // Paired singles too: the float-contraction risk in docs/PLAN.md lands
+      // here, and a GPR-only dump would miss it.
+      for (int r = 0; r < 32; ++r)
+      {
+        if (state.ps[r].PS0AsU64() != 0 || state.ps[r].PS1AsU64() != 0)
+          std::printf("D   ps%-2d=%016llx %016llx\n", r,
+                      static_cast<unsigned long long>(state.ps[r].PS0AsU64()),
+                      static_cast<unsigned long long>(state.ps[r].PS1AsU64()));
+      }
+    }
     ppc.SingleStep();
     ++executed;
     min_pc = std::min(min_pc, state.pc);
     max_pc = std::max(max_pc, state.pc);
+
+    if (fifo_configured_at < 0 && fifo.CPBase.load() != 0)
+    {
+      fifo_configured_at = static_cast<s64>(i);
+      fifo_configured_pc = state.pc;
+    }
+    if (fifo_written_at < 0 && fifo.CPWritePointer.load() != wp_initial)
+    {
+      fifo_written_at = static_cast<s64>(i);
+      fifo_written_pc = state.pc;
+    }
+
     // A PC of zero means execution fell off into nothing, which is a failure
     // worth stopping on rather than tracing thousands of lines of it.
     if (state.pc == 0)
+      break;
+    // Stop as soon as the gate's event happens, unless a fixed step count was
+    // asked for. Running past it wastes minutes of browser time.
+    if (stop_at_fifo && fifo_written_at >= 0)
       break;
   }
 
@@ -353,7 +522,27 @@ int main(int argc, char** argv)
               static_cast<unsigned long long>(stats->requests),
               stats->bytes / (1024.0 * 1024.0));
 
-  check(executed == steps, "ran the full step count without falling off");
+  // Printed in a fixed format on both targets so a mismatch is visible without
+  // reading the trace.
+  if (fifo_configured_at >= 0)
+    std::printf("  fifo cfg  step %lld, pc 0x%08x, base=0x%08x end=0x%08x\n",
+                static_cast<long long>(fifo_configured_at), fifo_configured_pc,
+                fifo.CPBase.load(), fifo.CPEnd.load());
+  else
+    std::printf("  fifo cfg  not reached in %llu steps\n",
+                static_cast<unsigned long long>(executed));
+
+  if (fifo_written_at >= 0)
+    std::printf("  fifo wr   step %lld, pc 0x%08x, wp=0x%08x (was 0x%08x)\n",
+                static_cast<long long>(fifo_written_at), fifo_written_pc,
+                fifo.CPWritePointer.load(), wp_initial);
+  else
+    std::printf("  fifo wr   not reached in %llu steps\n",
+                static_cast<unsigned long long>(executed));
+
+  check(stop_at_fifo ? state.pc != 0 : executed == steps,
+        stop_at_fifo ? "ran until the FIFO write (or the cap) without falling off"
+                     : "ran the full step count without falling off");
   check(state.pc != 0, "pc is still valid");
 
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
