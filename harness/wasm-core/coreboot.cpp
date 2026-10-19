@@ -12,8 +12,14 @@
 #include <cstring>
 #include <iterator>
 
+#include "Common/Swap.h"
+
 #include "Common/CommonTypes.h"
+#include "Common/Config/Config.h"
+#include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -45,6 +51,35 @@ int main()
 
   auto& memory = system.GetMemory();
   check(true, "memory manager reachable");
+
+  // Config::SetCurrent writes into the layer stack, which does not exist until
+  // Config::Init() creates it -- without this the write is silently dropped
+  // and Config::Get keeps returning the compiled-in default. A frontend does
+  // this in UICommon::Init(); a bare test has to do it itself.
+  // Config::Init() creates the layer stack. The BASE layer that UICommon adds
+  // is deliberately NOT added here: GenerateBaseConfigLoader reads Dolphin.ini
+  // and drags in the IOS filesystem, which asserts on an unset user path. The
+  // CURRENT layer that Init creates is writable and is enough to override a
+  // single setting.
+  Config::Init();
+  // SConfig must exist before System::Initialize(), which reads
+  // SConfig::GetInstance().GetSimulatedMemorySize(). Omitting it segfaults
+  // natively -- and, more worryingly, did NOT segfault under wasm32, where the
+  // uninitialised singleton silently returned something. The differential
+  // caught that; wasm alone would have sailed past it.
+  SConfig::Init();
+  check(true, "config system initialised");
+
+  // Accurate MMU is off by default: Dolphin logs bad accesses and continues
+  // rather than raising a fault, because most games never rely on MMU
+  // exceptions and checking costs speed. The exception test below needs the
+  // real behaviour, and System::Initialize() latches it from config, so both
+  // have to happen before anything else.
+  Config::SetCurrent(Config::MAIN_MMU, true);
+  system.Initialize();
+  std::printf("  Config::Get(MAIN_MMU)=%d  system.IsMMUMode()=%d\n",
+              Config::Get(Config::MAIN_MMU) ? 1 : 0, system.IsMMUMode() ? 1 : 0);
+  check(system.IsMMUMode(), "accurate MMU enabled");
 
   // Memmap gates MEM2 on System::IsWii(), which defaults false. Without this
   // the core comes up as a GameCube and MEM2 is never allocated -- which is
@@ -266,6 +301,113 @@ int main()
   // guest round trip agree with itself while the stored bytes are wrong.
   check(memory.Read_U8(0x8000'0300) == 0x34, "host sees the byte at the right address");
   check(memory.Read_U16(0x8000'0304) == 0x1234, "host sees the halfword big-endian");
+
+  // ── address translation ──
+  // Everything above ran with the MMU off, so guest 0x80000000 reached MEM1
+  // only because translation was bypassed. Real game code runs translated, and
+  // the software MMU is the path MemArenaEmscripten exists to serve -- fastmem
+  // is refused on this backend, so every translated access goes through it.
+  //
+  // These BAT values are copied from CBoot::SetupBAT, which is what the real
+  // boot installs. It is private, so they are duplicated here rather than
+  // invented -- if upstream changes them this test keeps using the old ones,
+  // which is a real maintenance hazard and the reason for this comment.
+  //   DBAT0/IBAT0: 0x80000000 -> physical 0x00000000 (MEM1)
+  //   DBAT4/IBAT4: 0x90000000 -> physical 0x10000000 (MEM2, Wii only)
+  std::printf("\nAddress translation\n");
+  state.spr[SPR_IBAT0U] = 0x8000'1fff;
+  state.spr[SPR_IBAT0L] = 0x0000'0002;
+  state.spr[SPR_DBAT0U] = 0x8000'1fff;
+  state.spr[SPR_DBAT0L] = 0x0000'0002;
+  state.spr[SPR_IBAT4U] = 0x9000'1fff;
+  state.spr[SPR_IBAT4L] = 0x1000'0002;
+  state.spr[SPR_DBAT4U] = 0x9000'1fff;
+  state.spr[SPR_DBAT4L] = 0x1000'0002;
+  HID4(state).SBE = 1;
+  auto& mmu = system.GetMMU();
+  mmu.DBATUpdated();
+  mmu.IBATUpdated();
+  state.msr.IR = 1;
+  state.msr.DR = 1;
+  check(state.msr.IR == 1 && state.msr.DR == 1, "MSR[IR] and MSR[DR] enabled");
+
+  // Translation is checked BEHAVIOURALLY -- by where a guest store actually
+  // lands -- rather than by calling the translator. MMU::TranslateAddress is
+  // private, and the observable effect is what matters anyway: a translator
+  // that returned the right number while stores went elsewhere would pass a
+  // direct test and fail this one.
+  // Run a store/load pair with translation ON, then confirm from the host that
+  // the bytes landed in MEM1 at the translated physical offset.
+  //
+  // The base register matters here. In the rA field of a load or store, r0
+  // means LITERAL ZERO rather than the contents of r0 -- so `stw r3, 0x40(r0)`
+  // addresses 0x40, not 0x80000040, which is outside the BAT-mapped range and
+  // faults once translation is on. The untranslated tests above got away with
+  // it because effective and physical addresses were the same. A base register
+  // is loaded explicitly:
+  //
+  //   addis r5, r0, 0x8000   0x3CA08000   r5 = 0x80000000
+  //   stw   r3, 0x40(r5)     0x90650040
+  //   lwz   r17, 0x40(r5)    0x82250040
+  static constexpr u32 MMUPROG[] = {0x3CA0'8000, 0x9065'0040, 0x8225'0040};
+  constexpr u32 MBASE2 = 0x8000'0600;
+  for (u32 i = 0; i < std::size(MMUPROG); ++i)
+    memory.Write_U32(MMUPROG[i], MBASE2 + i * 4);
+
+  state.gpr[3] = 0xFEED'BEEF;
+  state.gpr[17] = 0;
+  state.pc = MBASE2;
+  state.npc = MBASE2;
+  for (u32 i = 0; i < std::size(MMUPROG); ++i)
+    ppc.SingleStep();
+
+  std::printf("  translated store/load: r17=0x%08x  MEM1[0x40]=0x%08x\n", state.gpr[17],
+              Common::swap32(reinterpret_cast<u32*>(memory.GetRAM())[0x40 / 4]));
+  check(state.gpr[17] == 0xFEED'BEEF, "lwz reads back through translation");
+  check(Common::swap32(reinterpret_cast<u32*>(memory.GetRAM())[0x40 / 4]) == 0xFEED'BEEF,
+        "the store landed at the translated physical address in MEM1");
+
+  // ── exceptions ──
+  // With translation on, an access outside every BAT-mapped range must raise a
+  // Data Storage Interrupt rather than silently reading zero or writing into
+  // the void. This is the first test here that asserts the emulator REFUSES
+  // something; everything before it checked that an operation succeeded.
+  //
+  //   addis r6, r0, 0xA000   0x3CC0A000   r6 = 0xA0000000, mapped by no BAT
+  //   lwz   r18, 0x0(r6)     0x82460000   must fault
+  std::printf("\nExceptions\n");
+  static constexpr u32 EXCPROG[] = {0x3CC0'A000, 0x8246'0000};
+  constexpr u32 EBASE = 0x8000'0700;
+  for (u32 i = 0; i < std::size(EXCPROG); ++i)
+    memory.Write_U32(EXCPROG[i], EBASE + i * 4);
+
+  state.Exceptions = 0;
+  state.spr[SPR_DAR] = 0;
+  state.gpr[18] = 0xCCCC'CCCC;
+  state.pc = EBASE;
+  state.npc = EBASE;
+  ppc.SingleStep();  // addis
+  ppc.SingleStep();  // the faulting load
+
+  std::printf("  DAR=0x%08x DSISR=0x%08x SRR0=0x%08x pc=0x%08x r18=0x%08x\n",
+              state.spr[SPR_DAR], state.spr[SPR_DSISR], state.spr[SPR_SRR0], state.pc,
+              state.gpr[18]);
+  // SingleStep raises AND dispatches in one call, so Exceptions is already
+  // clear by the time it returns -- the bit is not the observable. What is
+  // observable: the fault was recorded, and control transferred to the DSI
+  // vector at 0x80000300 instead of continuing past the load.
+  check(state.spr[SPR_DAR] == 0xA000'0000, "DAR records the faulting address");
+  check(state.spr[SPR_DSISR] != 0, "DSISR describes the fault");
+  // 0x00000300, not 0x80000300. PowerPC exception vectors live at the low
+  // addresses when MSR[IP] is clear, and at 0xFFF00000+offset when it is set.
+  // Expecting the 0x8000_0000 form was wrong -- that is where the vectors are
+  // REACHED from once a BAT maps them, not where the architecture puts them.
+  check(state.pc == 0x0000'0300, "control transferred to the DSI vector at 0x300");
+  check(state.spr[SPR_SRR0] == EBASE + 4, "SRR0 points at the faulting instruction");
+  check(state.gpr[18] == 0xCCCC'CCCC, "the faulting load did not write its target register");
+
+  // Clear it so the paired-single section below starts from a clean state.
+  state.Exceptions = 0;
 
   // ── paired singles ──
   // docs/PLAN.md §2 flags this as the Fatal risk: aarch64 contracts

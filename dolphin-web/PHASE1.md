@@ -19,6 +19,8 @@
 ✓ Broadway instructions EXECUTE     arithmetic + load/store through the software MMU
 ✓ Paired singles execute            and the contraction risk is narrowed, not confirmed
 ✓ Differential widened              19 instructions, 41 assertions, native == wasm32
+✓ MMU address translation           BAT-mapped loads/stores, verified host-side
+✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -290,6 +292,69 @@ Every value agrees: the integer results, the guest load/store, and the
 paired-single bit patterns including `paired-single fnv1a=d0bbd6b37621525d`.
 Only the target banner and the host allocation addresses differ, and the runner
 normalises those away explicitly rather than ignoring whole lines.
+
+## Address translation and exceptions
+
+Everything before this ran with the MMU **off**, so guest `0x80000000` reached
+MEM1 only because translation was bypassed. Real game code runs translated, and
+with fastmem refused on this backend every translated access goes through the
+software MMU — the path `MemArenaEmscripten` exists to serve.
+
+```
+Address translation
+  MSR[IR] and MSR[DR] enabled                              ok
+  translated store/load: r17=0xfeedbeef  MEM1[0x40]=0xfeedbeef
+  lwz reads back through translation                       ok
+  the store landed at the translated physical address      ok
+
+Exceptions
+  DAR=0xa0000000 DSISR=0x40000000 SRR0=0x80000704 pc=0x00000300
+  DAR records the faulting address                         ok
+  DSISR describes the fault                                ok
+  control transferred to the DSI vector at 0x300           ok
+  SRR0 points at the faulting instruction                  ok
+  the faulting load did not write its target register      ok
+```
+
+Translation is checked **behaviourally** — by where a guest store actually
+lands, confirmed from the host side — rather than by calling the translator.
+`MMU::TranslateAddress` is private, and the observable effect is what matters
+anyway: a translator returning the right number while stores went elsewhere
+would pass a direct test and fail this one.
+
+The exception test is the first here that asserts the emulator **refuses**
+something rather than succeeds at it.
+
+### Four things this cost, each a wrong assumption
+
+1. **`r0` means literal zero** in the `rA` field of a load or store. So
+   `stw r3, 0x40(r0)` addresses `0x40`, not `0x80000040` — outside the BAT
+   range, which faults once translation is on. The untranslated tests got away
+   with it because effective and physical addresses were the same.
+2. **Accurate MMU is off by default.** Dolphin logs bad accesses and continues,
+   because most games never rely on MMU exceptions and checking costs speed.
+   The log line says so explicitly: *"Enable MMU in advanced settings to
+   accurately emulate game crashes."*
+3. **`Config::SetCurrent` needs `Config::Init()`** or the write is silently
+   dropped and `Config::Get` keeps returning the compiled-in default. Adding
+   UICommon's *base* layer on top is worse — `GenerateBaseConfigLoader` reads
+   `Dolphin.ini` and drags in the IOS filesystem, which asserts on an unset
+   user path.
+4. **Exception vectors are at `0x300`, not `0x80000300`.** PowerPC puts them at
+   the low addresses when `MSR[IP]` is clear. The `0x8000_0000` form is where
+   they are *reached from* once a BAT maps them, not where the architecture
+   puts them.
+
+### The differential caught something wasm alone would have missed
+
+`System::Initialize()` reads `SConfig::GetInstance().GetSimulatedMemorySize()`.
+Without `SConfig::Init()` first, the native build **segfaults** — and wasm32
+did **not**. The uninitialised singleton silently returned something under
+wasm and the test sailed past it.
+
+That is the failure direction this project has hit repeatedly, now caught
+rather than shipped. It is also the clearest argument yet for the differential
+existing at all: a wasm-only run would have reported PASSED.
 
 ### What the differential covers
 
