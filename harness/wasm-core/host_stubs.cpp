@@ -91,10 +91,21 @@ void Host_RefreshDSPDebuggerWindow()
 // Emscripten's pthread implementation does not provide pthread_setname_np.
 // Dolphin names its threads for debugging only, so a no-op is correct -- the
 // names simply do not appear.
-extern "C" int pthread_setname_np(const char*)
+// wasm only. Emscripten's pthread implementation does not provide
+// pthread_setname_np, and Dolphin calls the two-argument form
+// (pthread_t, const char*). Defining it unconditionally breaks the native
+// build, where macOS declares the single-argument form in <pthread.h> and
+// supplies a real implementation.
+//
+// wasm-ld only WARNS on a signature mismatch here rather than erroring, so the
+// wrong arity links cleanly and corrupts the call at runtime -- the warning is
+// the only signal.
+#if defined(__EMSCRIPTEN__)
+extern "C" int pthread_setname_np(unsigned long, const char*)
 {
   return 0;
 }
+#endif
 
 // ── host USB: must never be reached ──
 //
