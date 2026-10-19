@@ -24,6 +24,8 @@
 ✓ IOS kernel                        constructs, serves device nodes, tears down — in the differential
 ✓ Portal USB device                 instantiates with the right identity (1430:0150)
 ✓ Disc — THE REAL GAME             read in a browser over HTTP ranges, 0.0028% fetched
+✓ THE GAME BOOTS AND RUNS          native: 200,000 instructions of real Skylanders code
+~ Boot in the browser              stalls in AudioCommon::InitSoundStream
 ✓ Trace differ                      instruction-level, reports the FIRST divergence
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
@@ -500,6 +502,75 @@ seam between the config flag and a device the game can find — but its scanning
 is client-driven and `AddEmulatedDevices` is private. Reaching it means driving
 the `/dev/usb/oh0` device lifecycle, which is the same IPC plumbing the
 transfer test needs.
+
+## The game boots and executes
+
+```
+  booting SSPE52 (Skylanders Spyro's Adventure)
+  BOOT: Faking Wii BS2...
+  BOOT: Setup Wii Memory...
+  IOS: Starting IOS 0000000100000038
+
+  CBoot::BootUp returned success                       ok
+  entry pc  0x80006310 (was 0x00000000)
+  msr=00002032  r1(sp)=816ffff0
+
+  stepping 200000 instructions...
+  executed  200000 instructions
+  pc range  0x800061d0 .. 0x800065e8
+  disc      224 requests, 6.13 MB fetched
+```
+
+**Real Skylanders code, executing under the interpreter**, with the disc
+streamed through `RangeBlobReader`. The apploader ran out of the disc, copied
+the executable into guest memory, and left the CPU at `0x80006310` with a stack
+pointer. 6.13 MB fetched in 224 ranged requests.
+
+The trace shows **95 unique PCs across 20,000 instructions** — the game is in a
+wait loop at its entry point, which is what a title does while waiting on
+hardware it has not been given yet. Executing is not the same as progressing,
+and that distinction is Phase 2's problem, not this gate's.
+
+### Six missing initialisation steps, each found by a crash
+
+The boot path needs far more than the differential did, and none of the
+failures named what was missing:
+
+| Symptom | Cause |
+|---|---|
+| `EXC_BAD_ACCESS` in `MMIO::ReadHandler<u32>::Read` | `Memory::Init` allocates the map; `HW::Init` registers the devices behind it |
+| `EXC_BAD_ACCESS` in `AudioInterface::Init` | the sound stream must exist *before* `HW::Init` |
+| `CoreTiming Event "IPCEvent" is already registered` | `HW::Init` already calls `IOS::HLE::Init` (HW.cpp:58) |
+| `CoreTiming Event "invalidateEmulatedCache" ...` | `HW::Init` initialises the CPU too; the core is chosen via `MAIN_CPU_CORE`, not `PowerPC::Init` |
+| assertion in `ControllerInterface::UpdateInput` | the boot reads controller state; `WindowSystemType::Headless` is enough |
+| bare `SIGABRT`, no Dolphin frames | `InputConfig::GetController` **aborts** when no controllers were created — found by breaking on `abort()` |
+
+The last one is worth keeping: a bare `SIGABRT` with no Dolphin frames in the
+default backtrace. `breakpoint set -n abort` found it in one step, and
+`lldb` has now been the fastest tool twice in this phase.
+
+### The browser boot stalls, and the location is known
+
+```
+target: wasm32 (emscripten)  disc: http://127.0.0.1:8101/
+  controller interface up (headless)                   ok
+  controller configs loaded                            ok
+  [init] sound stream...            <- never returns
+```
+
+`AudioCommon::InitSoundStream` does not return under wasm. It was localised by
+printing either side of each init step, after an earlier diagnosis — that the
+module had not started at all — turned out to be wrong: it *had* started and
+was printing, but the page only flushed its buffer every 500 lines.
+
+Selecting the null audio backend did **not** fix it, so cubeb opening a device
+is not the whole story. Native with the same config boots fine, so this is a
+genuine wasm divergence rather than a configuration mistake.
+
+A browser build will drive audio through an AudioWorklet (Spike C) rather than
+cubeb, so the eventual answer is probably to replace this path rather than make
+it return. **The Phase 1 gate — a boot trace diffed against native — needs the
+browser side, so the gate is not met.**
 
 ## The real game, in a browser, over HTTP ranges
 
