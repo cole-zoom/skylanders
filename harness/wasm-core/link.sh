@@ -26,6 +26,8 @@ em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
   -D_M_GENERIC=1 -D_ARCH_32=1 \
   -sASSERTIONS=1 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
   -sFETCH=1 -sUSE_BZIP2=1 \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8 \
+  -sPTHREAD_POOL_SIZE=8 \
   -I$D/Source/Core -I$B/Source/Core \
   -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
   "$SRC" harness/wasm-core/host_stubs.cpp \

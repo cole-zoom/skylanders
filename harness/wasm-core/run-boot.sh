@@ -23,15 +23,25 @@ cat > /tmp/bootweb/index.html <<HTML
 <!doctype html><meta charset=utf8><title>booting Skylanders</title>
 <pre id=out>running…</pre>
 <script>
-const lines = [];
-const flush = () => document.getElementById('out').textContent = lines.join('\n');
+// Output is accumulated in an array the runner drains INCREMENTALLY.
+//
+// The DOM is only a human-visible tail. Rendering every line into it, and
+// having the runner read the whole thing each poll, meant shipping a growing
+// buffer across CDP twice a second -- at 20k trace lines that is megabytes per
+// poll, and the page died partway through a run. The trace it had produced up
+// to that point was correct, so the failure looked like an emulation
+// divergence when it was only a transport that could not keep up.
+window.__lines = [];
+window.__done = false;
+const tail = () => {
+  const l = window.__lines;
+  document.getElementById('out').textContent = l.slice(-40).join('\n');
+};
 var Module = {
   arguments: ['http://127.0.0.1:8101/', '$STEPS', '--trace'],
-  // Flush every line until stepping starts. Batching from the beginning hides
-  // the setup phase entirely, which is exactly where a browser boot stalls.
-  print:    (t) => { lines.push(t); if (lines.length < 400 || lines.length % 2000 === 0) flush(); },
-  printErr: (t) => { lines.push('! ' + t); },
-  onExit:   (c) => { lines.push('EXIT ' + c); flush(); },
+  print:    (t) => { window.__lines.push(t); if (window.__lines.length % 500 === 0) tail(); },
+  printErr: (t) => { window.__lines.push('! ' + t); },
+  onExit:   (c) => { window.__lines.push('EXIT ' + c); window.__done = true; tail(); },
 };
 </script>
 <script src="bootgame.js"></script>

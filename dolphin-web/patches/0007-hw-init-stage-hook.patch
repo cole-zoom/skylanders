@@ -1,0 +1,84 @@
+diff --git a/Source/Core/Core/HW/HW.cpp b/Source/Core/Core/HW/HW.cpp
+index 58b4bea..1c43c85 100644
+--- a/Source/Core/Core/HW/HW.cpp
++++ b/Source/Core/Core/HW/HW.cpp
+@@ -29,36 +29,59 @@
+ 
+ namespace HW
+ {
++
++// Harness instrumentation hook (weak).
++//
++// Reports progress through HW::Init to a differential-test harness. Declared
++// weak so that every binary linking libcore WITHOUT a harness -- which is all
++// of them in a normal build -- gets the empty default and pays one call.
++//
++// This exists because HW::Init stalls under Emscripten and the usual way to
++// find out where (printf between the calls) is unavailable: with
++// PROXY_TO_PTHREAD, printf is proxied to the browser main thread, so a stall
++// that involves that thread wedges the reporting channel along with the code
++// being reported on.
++// A weak DEFINITION, not a weak declaration. An undefined weak declaration
++// resolves to null on ELF and wasm, but Mach-O requires weak_import for that
++// and otherwise fails the link -- which it did, for every harness binary that
++// does not define the hook. A weak definition links everywhere and is simply
++// replaced when a harness supplies a strong one.
++extern "C" __attribute__((weak)) void harness_hw_stage(const char* name)
++{
++  (void)name;
++}
++#define HW_STAGE(x) harness_hw_stage(x)
++
+ void Init(Core::System& system, const Sram* override_sram)
+ {
+-  system.GetCoreTiming().Init();
+-  system.GetSystemTimers().PreInit();
++  HW_STAGE("CoreTiming"); system.GetCoreTiming().Init();
++  HW_STAGE("SystemTimers::PreInit"); system.GetSystemTimers().PreInit();
+ 
+-  State::Init(system);
++  HW_STAGE("State"); State::Init(system);
+ 
+   // Init the whole Hardware
+-  system.GetAudioInterface().Init();
+-  system.GetVideoInterface().Init();
+-  system.GetSerialInterface().Init();
+-  system.GetProcessorInterface().Init();
+-  system.GetExpansionInterface().Init(override_sram);  // Needs to be initialized before Memory
+-  system.GetHSP().Init();
+-  system.GetMemory().Init();  // Needs to be initialized before AddressSpace
+-  AddressSpace::Init();
+-  system.GetMemoryInterface().Init();
+-  system.GetDSP().Init(Config::Get(Config::MAIN_DSP_HLE));
+-  system.GetDVDInterface().Init();
+-  system.GetGPFifo().Init();
+-  system.GetCPU().Init(Config::Get(Config::MAIN_CPU_CORE));
+-  system.GetSystemTimers().Init();
++  HW_STAGE("AudioInterface"); system.GetAudioInterface().Init();
++  HW_STAGE("VideoInterface"); system.GetVideoInterface().Init();
++  HW_STAGE("SerialInterface"); system.GetSerialInterface().Init();
++  HW_STAGE("ProcessorInterface"); system.GetProcessorInterface().Init();
++  HW_STAGE("ExpansionInterface"); system.GetExpansionInterface().Init(override_sram);  // Needs to be initialized before Memory
++  HW_STAGE("HSP"); system.GetHSP().Init();
++  HW_STAGE("Memory"); system.GetMemory().Init();  // Needs to be initialized before AddressSpace
++  HW_STAGE("AddressSpace"); AddressSpace::Init();
++  HW_STAGE("MemoryInterface"); system.GetMemoryInterface().Init();
++  HW_STAGE("DSP"); system.GetDSP().Init(Config::Get(Config::MAIN_DSP_HLE));
++  HW_STAGE("DVDInterface"); system.GetDVDInterface().Init();
++  HW_STAGE("GPFifo"); system.GetGPFifo().Init();
++  HW_STAGE("CPU"); system.GetCPU().Init(Config::Get(Config::MAIN_CPU_CORE));
++  HW_STAGE("SystemTimers"); system.GetSystemTimers().Init();
+ 
+   if (system.IsWii())
+   {
+-    system.GetWiiIPC().Init();
+-    IOS::HLE::Init(system);  // Depends on Memory
++    HW_STAGE("WiiIPC"); system.GetWiiIPC().Init();
++    HW_STAGE("IOS::HLE"); IOS::HLE::Init(system);  // Depends on Memory
+   }
+ 
+-  system.GetMemory().InitMMIO(system);
++  HW_STAGE("InitMMIO"); system.GetMemory().InitMMIO(system);
+ }
+ 
+ void Shutdown(Core::System& system)
