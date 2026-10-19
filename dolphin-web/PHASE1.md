@@ -22,6 +22,7 @@
 ✓ MMU address translation           BAT-mapped loads/stores, verified host-side
 ✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
 ~ IOS kernel                        constructs under wasm with all device nodes; teardown traps
+✓ Trace differ                      instruction-level, reports the FIRST divergence
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -356,6 +357,60 @@ wasm and the test sailed past it.
 That is the failure direction this project has hit repeatedly, now caught
 rather than shipped. It is also the clearest argument yet for the differential
 existing at all: a wasm-only run would have reported PASSED.
+
+## The trace differ
+
+`docs/PLAN.md` Bet 04 makes native Dolphin the test oracle. Until now that was
+aspirational: every assertion in this harness was hand-written, and **six of
+them turned out to be wrong**, each failing in the direction of looking like a
+port bug. That approach does not survive a boot sequence of millions of
+instructions.
+
+`harness/wasm-core/run-trace.sh` captures an instruction-level CPU trace from
+both targets and diffs them:
+
+```
+native: 101 steps    wasm32: 101 steps
+MATCH -- 101 steps identical
+```
+
+One line per executed instruction — step, PC, a hash of all 32 GPRs, CR, MSR,
+LR, CTR — written to **stdout**, because Emscripten's MEMFS is not shared with
+the host and `NODERAWFS` conflicts with `PROXY_TO_PTHREAD`. The `T ` prefix
+separates trace lines from ordinary program output in the same stream.
+
+**The value is in the word *first*.** Once two runs disagree, every later line
+disagrees too; a plain `diff` reports thousands of lines of consequence. The
+differ reports the earliest divergence, six lines of context, and which fields
+changed:
+
+```
+FIRST DIVERGENCE at trace line 39 (step 00000027)
+  ok   step=00000026  pc=80001020  gpr_hash=3290fca432f7e02c  ...
+  NAT  step=00000027  pc=80001010  gpr_hash=3290fca432f7e02c  ...
+  WASM step=00000027  pc=80001010  gpr_hash=deadbeefdeadbeef  ...
+
+  fields that differ: gpr_hash
+  only register contents differ. Re-run both with --dump-at=39
+```
+
+It distinguishes the two cases that matter: a differing **PC** means control
+flow diverged — a branch or exception resolved differently — while a differing
+**gpr_hash** means only data changed. `--dump-at=N` is the second pass,
+replaying to that step and printing all 32 registers.
+
+**It was verified by breaking it.** A differ that always says MATCH is worse
+than no differ, so a divergence was injected into a known-good trace and the
+tool was checked for finding exactly that step and exiting non-zero.
+
+### One real bug it surfaced immediately
+
+Linking the trace test warned about a `pthread_setname_np` signature mismatch:
+the stub took one argument, Dolphin calls the two-argument form. **`wasm-ld`
+only warns** — the wrong arity links cleanly and corrupts the call at runtime.
+Fixing it then broke the native build, because macOS declares the
+single-argument form and supplies a real implementation, so the stub is now
+wasm-only.
 
 ## IOS — partial, and deliberately outside the differential
 
