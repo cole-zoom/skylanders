@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
+
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
@@ -37,6 +41,7 @@
 #include "Core/HW/GCPad.h"
 #include "Core/HW/Wiimote.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "Core/HW/EXI/EXI_Device.h"
 #include "Core/HW/HW.h"
 #include "Core/HW/Memmap.h"
 #include "Core/IOS/IOS.h"
@@ -50,6 +55,52 @@
 #include "bytesources.h"
 #include "rangeblob.h"
 #include "trace.h"
+
+// Progress markers that bypass stdout.
+//
+// Under PROXY_TO_PTHREAD, printf from the proxied main thread sends each write
+// to the real browser main thread. If that thread is blocked, printf blocks
+// too -- so a stall observed through printf may be a stall in *printing*
+// rather than in the code being traced. The original symptom was output
+// stopping MID-WORD, which a line-buffered stdout cannot otherwise produce.
+//
+// console.log is no better: with PROXY_TO_PTHREAD main() runs on a worker, so
+// its console output lands in a context the page never sees and page-scoped
+// CDP never reports.
+//
+// So the marker goes through memory instead. pthreads means the wasm heap is
+// a SharedArrayBuffer, and the page holds the same buffer -- the worker stores
+// a string, the page reads it with no proxying, no event loop, and no
+// cooperation from the stalled thread. That is the one channel that still
+// works when the thing being diagnosed is the output path itself.
+extern "C" {
+volatile char g_harness_stage[96] = "start";
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE const char* harness_stage() { return (const char*)g_harness_stage; }
+#endif
+}
+
+static void InitMark(const char* msg)
+{
+  std::size_t i = 0;
+  for (; msg[i] && i < sizeof(g_harness_stage) - 1; ++i)
+    g_harness_stage[i] = msg[i];
+  g_harness_stage[i] = '\0';
+#if !defined(__EMSCRIPTEN__)
+  std::printf("  [init] %s\n", msg);
+#endif
+}
+#define INIT_MARK(msg) InitMark(msg)
+
+// Satisfies the weak hook in Core/HW/HW.cpp so HW::Init reports which
+// sub-initialiser it is in. Without this the stall is only localisable to
+// "somewhere in HW::Init", which is twenty separate subsystems.
+extern "C" void harness_hw_stage(const char* name)
+{
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "HW::Init -> %s", name);
+  InitMark(buf);
+}
 
 static int g_failures = 0;
 
@@ -103,6 +154,7 @@ int main(int argc, char** argv)
   logm->SetEnable(Common::Log::LogType::IOS_FS, true);
   logm->SetEnable(Common::Log::LogType::COMMON, true);
   logm->SetEnable(Common::Log::LogType::MEMMAP, true);
+  logm->SetEnable(Common::Log::LogType::AUDIO, true);
   logm->EnableListener(Common::Log::LogListener::CONSOLE_LISTENER, true);
 
 
@@ -152,23 +204,65 @@ int main(int argc, char** argv)
   // ABORTS -- not returns null -- when no controllers were created. That
   // aborts with no message and no Dolphin frames in the default backtrace;
   // breaking on abort() is what found it.
+  INIT_MARK("Pad::Initialize");
   Pad::Initialize();
+  INIT_MARK("Keyboard::Initialize");
   Keyboard::Initialize();
+#if !defined(__EMSCRIPTEN__)
+  // Skipped under Emscripten as a precaution, NOT as a fix: this was suspected
+  // first and changing it made no difference -- the stall was in
+  // ExpansionInterface. It stays skipped because it is in the same hazard
+  // class (Wiimote::Initialize starts a real-Wiimote scanning thread, and
+  // thread creation from the proxied main thread is what deadlocks here), and
+  // because a browser has no Bluetooth Wiimotes to scan for.
+  //
+  // Revisit when Wii input is actually wired up: emulated Wiimotes are a
+  // separate path from the real-device scan, but this call covers both.
   Wiimote::Initialize(Wiimote::InitializeMode::DO_NOT_WAIT_FOR_WIIMOTES);
+#endif
   check(true, "controller configs loaded");
 
-  // Null audio. cubeb tries to open a real device, and under wasm that never
-  // returns -- the browser boot printed through "controller configs loaded"
-  // and then stalled here indefinitely. A browser build will drive audio
-  // through an AudioWorklet (Spike C) rather than cubeb, so selecting no
-  // backend is the right answer rather than a workaround.
+  // Three config choices below, all about threads.
+  //
+  // The browser boot stalled inside HW::Init, and the cause is a single
+  // Emscripten property: a pthread created from the proxied main thread is
+  // actually spawned BY the browser main thread. If the creator then waits on
+  // the new thread while the main thread is busy inside a proxied call,
+  // neither side can advance. Anything starting a thread during init is
+  // therefore a hazard, and these are the three that do.
+  //
+  // Only the EXI one was the real stall. The other two are the same hazard
+  // class, disabled so they cannot become the next one.
+
+  // 1. No EXI devices. THIS is what stalled. ExpansionInterface::Init builds
+  //    the devices configured for each slot, and a memory card constructs a
+  //    MemoryCard, whose constructor starts a flush thread
+  //    (Core/HW/GCMemcard/GCMemcardRaw.cpp:81).
+  //
+  //    A Wii saves to NAND, not to GameCube memory cards, so empty slots cost
+  //    this title nothing.
+  Config::SetCurrent(Config::MAIN_SLOT_A, ExpansionInterface::EXIDeviceType::None);
+  Config::SetCurrent(Config::MAIN_SLOT_B, ExpansionInterface::EXIDeviceType::None);
+  Config::SetCurrent(Config::MAIN_SERIAL_PORT_1, ExpansionInterface::EXIDeviceType::None);
+
+  // 2. DSP HLE. HW::Init passes MAIN_DSP_HLE to DSPManager::Init and the LLE
+  //    path spawns a dedicated DSP thread; HLE runs the DSP on the caller.
+  //    HLE is already the default, so this guards against a stray config.
+  Config::SetCurrent(Config::MAIN_DSP_HLE, true);
+
+  // 3. Null audio. InitSoundStream was never the problem -- the stage markers
+  //    show it returning normally, and the printf evidence that pointed here
+  //    was an artefact of the output channel wedging first. A browser build
+  //    drives audio through an AudioWorklet (Spike C) rather than cubeb, so
+  //    no backend is what this harness wants regardless: it boots and steps
+  //    the CPU, it does not play anything.
   Config::SetCurrent(Config::MAIN_AUDIO_BACKEND, std::string(BACKEND_NULLSOUND));
-  std::printf("  [init] sound stream...\n");
+  INIT_MARK("sound stream...");
   AudioCommon::InitSoundStream(system);
-  std::printf("  [init] sound stream done\n");
-  std::printf("  [init] HW::Init...\n");
+  INIT_MARK("sound stream done");
+  INIT_MARK("HW::Init...");
   HW::Init(system, nullptr);
-  std::printf("  [init] HW::Init done\n");
+  INIT_MARK("HW::Init done");
   check(system.GetMemory().GetRAM() != nullptr, "hardware up, guest memory allocated");
 
   // IOS is NOT initialised here. HW::Init does it (HW.cpp:58, "Depends on
@@ -202,6 +296,7 @@ int main(int argc, char** argv)
   source = Harness::FileByteSource(location, stats);
 #endif
 
+  INIT_MARK("DiscIO::CreateDisc");
   auto volume = DiscIO::CreateDisc(
       std::make_unique<Harness::RangeBlobReader>(source, disc_size));
   check(volume != nullptr, "disc opened");
@@ -221,6 +316,7 @@ int main(int argc, char** argv)
   bool booted = false;
   {
     const Core::CPUThreadGuard guard(system);
+    INIT_MARK("CBoot::BootUp");
     booted = CBoot::BootUp(system, guard, std::move(boot));
   }
   check(booted, "CBoot::BootUp returned success");
@@ -231,6 +327,7 @@ int main(int argc, char** argv)
   check(state.pc != 0 && state.pc != pc_before, "boot left the CPU at an entry point");
 
   // ── execute ──
+  INIT_MARK("stepping");
   std::printf("\n  stepping %llu instructions...\n", static_cast<unsigned long long>(steps));
   u64 executed = 0;
   const u32 first_pc = state.pc;

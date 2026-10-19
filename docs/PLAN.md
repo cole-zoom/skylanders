@@ -306,12 +306,38 @@ Get `Core` and `PowerPC` compiling to `wasm32` with the Null video backend, no a
 the memory arena with the software MMU path, stub the host USB stack, and bring up the
 `HttpBlobReader`.
 
-- The game's boot sequence executes under the interpreter
-- CPU state matches a captured native trace instruction for instruction
-- Differential harness running in CI from day one
+- The game's boot sequence executes under the interpreter — **done**
+- CPU state matches a captured native trace instruction for instruction — **done**, 20,000 steps
+  byte-identical between `wasm32` in Chrome and the native oracle
+- Differential harness running in CI from day one — **not yet**, it runs locally only
 
 > **Gate** — Boot to the first rendered frame's FIFO write, verified against the oracle. Speed is
 > irrelevant here; correctness is the whole deliverable.
+>
+> **Status: the CPU half is met, the FIFO half is not.** `harness/wasm-core/run-boot.sh` boots
+> `SSPE52` from the real disc over HTTP ranges on both targets and reports
+> `MATCH -- 20000 steps identical`. What is *not* yet shown is reaching the first FIFO write: 20,000
+> instructions is early boot, not a drawn frame.
+
+**What the browser boot needed, and what it cost.** Three subsystems had to be configured away
+before `HW::Init` would complete under Emscripten, all for one reason: a `pthread` created from the
+proxied main thread is spawned *by* the browser main thread, so a creator that waits on the new
+thread while that thread is mid-proxied-call deadlocks. The offender was
+`ExpansionInterface::Init` — a configured memory card constructs a `MemoryCard`, whose constructor
+starts a flush thread. DSP LLE and cubeb are the same hazard class and are disabled alongside it.
+None of the three matters for this title in a browser (a Wii saves to NAND; audio will be an
+AudioWorklet), so nothing was given up — but it means **init-time thread creation is a standing
+constraint on this port**, not a one-off fix, and every subsystem brought up later has to be checked
+against it.
+
+**A measurement lesson worth keeping.** The stall was mis-localised to `AudioCommon::InitSoundStream`
+for a full day because the evidence was `printf`, and under `PROXY_TO_PTHREAD` `printf` is proxied to
+the browser main thread — the same thread the deadlock holds. The output channel wedged *before* the
+code being diagnosed, so the last line printed named an innocent function two steps behind the real
+one. The fix was to report progress through the wasm heap instead: pthreads makes it a
+`SharedArrayBuffer`, so the page can read a marker the worker wrote without the stalled thread
+cooperating. **When diagnosing a hang, the reporting channel must not share the resource being
+contended** — that is the generalisable part, and it applies to every later bring-up here.
 
 ### Phase 2 — `ppc2wasm`, the recompiler · ~4–6 months
 
