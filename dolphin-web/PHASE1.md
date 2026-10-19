@@ -21,6 +21,7 @@
 ✓ Differential widened              19 instructions, 41 assertions, native == wasm32
 ✓ MMU address translation           BAT-mapped loads/stores, verified host-side
 ✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
+~ IOS kernel                        constructs under wasm with all device nodes; teardown traps
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -355,6 +356,58 @@ wasm and the test sailed past it.
 That is the failure direction this project has hit repeatedly, now caught
 rather than shipped. It is also the clearest argument yet for the differential
 existing at all: a wasm-only run would have reported PASSED.
+
+## IOS — partial, and deliberately outside the differential
+
+IOS is the Wii's operating system, and it is the layer the game reaches the
+Skylander portal through. `harness/wasm-core/ios_probe.cpp` is how far it gets.
+
+**Under wasm32 the kernel constructs and every device node is present:**
+
+```
+  guest memory up                                      ok
+  session NAND root is set                             ok
+  core timing initialised                              ok
+  IOS kernel constructed                               ok
+  /dev/aes                                             ok
+  /dev/sha                                             ok
+  /dev/es                                              ok
+  /dev/usb/oh0                                         ok      <- the portal's node
+  [about to destroy the kernel -- wasm32 traps here]
+```
+
+`/dev/usb/oh0` existing is the point: that is the node the game opens to reach
+the portal, and it is present under WebAssembly.
+
+**But both targets fail, at different points.**
+
+| | Outcome |
+|---|---|
+| wasm32 | kernel constructs, all nodes present, then the **destructor traps** |
+| native | **SIGSEGV during `IOS::HLE::Init`**, before the kernel exists |
+
+Two targets failing *differently* is the signature of **missing
+initialisation**, not a port bug. Dolphin normally reaches IOS through
+`Core::Init`, which brings up considerably more than the probe does. The
+destructor that traps under wasm (`EmulationKernel::~EmulationKernel`) removes
+its CoreTiming events, clears the device map, and resets the socket manager —
+one of those three, not yet narrowed further.
+
+**Why it is not in the differential.** `coreboot.cpp` stays green on both
+targets; adding IOS would have made it red on both for a reason that is about
+setup rather than about the port. The probe records the state instead. Getting
+IOS up properly means standing up more of `Core::Init`, which is the next real
+block of work rather than another increment.
+
+### Two things that were needed just to get this far
+
+`UICommon::SetUserDirectory` alone leaves `D_SESSION_WIIROOT_IDX` empty, and
+`FS::MakeFileSystem` asserts on an empty root path.
+`Core::InitializeWiiRoot(true)` fills it in with a temporary NAND.
+
+Linking IOS pulled in the Wii Speak microphone, which needs cubeb — plus FatFs,
+FreeSurround, minizip-ng, pugixml, miniupnpc and hidapi. All were already built
+for wasm; they just had to be added to the link line.
 
 ### What the differential covers
 
