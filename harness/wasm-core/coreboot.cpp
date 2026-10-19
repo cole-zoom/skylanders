@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <memory>
+#include <vector>
 
 #include "Common/FileUtil.h"
 #include "Common/Swap.h"
@@ -23,6 +25,9 @@
 #include "Core/CoreTiming.h"
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
+#include "DiscIO/Volume.h"
+
+#include "rangeblob.h"
 #include "Core/WiiRoot.h"
 #include "UICommon/UICommon.h"
 #include "Core/Core.h"
@@ -578,6 +583,57 @@ int main()
   check(system.GetIOS() == nullptr, "IOS shut down cleanly");
   core_timing.Shutdown();
   Core::ShutdownWiiRoot();
+
+  // ── disc, through a ranged byte source ──
+  // docs/PLAN.md Bet 05: the browser never holds the 3.8 GB disc, it asks for
+  // the ranges the game touches. DiscIO::CreateDisc accepts a BlobReader, so
+  // the question is whether the rest of DiscIO works when fed by something
+  // that is not a file.
+  //
+  // A synthetic raw disc image is used rather than the real RVZ, because RVZ
+  // decoding lives in WIARVZFileReader, which takes a File::IOFile and cannot
+  // be pointed at an arbitrary source. Serving RVZ over HTTP means
+  // reimplementing its chunk index on top of this layer -- separate work. What
+  // is tested here is the layer underneath: a non-file source driving DiscIO.
+  std::printf("\nDisc through a ranged source\n");
+
+  // Minimal GameCube disc header: six-byte game id at 0, magic at 0x1C.
+  constexpr u64 DISC_SIZE = 8 * 1024 * 1024;
+  auto image = std::make_shared<std::vector<u8>>(DISC_SIZE, 0);
+  const char kGameId[] = "GSKE01";
+  std::memcpy(image->data(), kGameId, 6);
+  (*image)[0x1C] = 0xC2;  // GameCube magic 0xC2339F3D, big-endian
+  (*image)[0x1D] = 0x33;
+  (*image)[0x1E] = 0x9F;
+  (*image)[0x1F] = 0x3D;
+  const char kName[] = "Harness Synthetic Disc";
+  std::memcpy(image->data() + 0x20, kName, sizeof(kName));
+
+  // The source counts its own calls so the test can show DiscIO reads a small
+  // fraction of the image rather than slurping it.
+  auto source = [image](u64 offset, u64 size) -> std::vector<u8> {
+    if (offset + size > image->size())
+      return {};
+    return std::vector<u8>(image->begin() + offset, image->begin() + offset + size);
+  };
+
+  auto reader = std::make_unique<Harness::RangeBlobReader>(source, DISC_SIZE);
+  auto* reader_raw = reader.get();
+  auto volume = DiscIO::CreateDisc(std::move(reader));
+  check(volume != nullptr, "DiscIO created a volume from a non-file BlobReader");
+  if (volume)
+  {
+    std::printf("  game id=%s  name=%s\n", volume->GetGameID().c_str(),
+                volume->GetInternalName().c_str());
+    check(volume->GetGameID() == "GSKE01", "game id read back through the ranged source");
+    check(volume->GetInternalName() == kName, "internal name read back");
+    std::printf("  DiscIO issued %llu reads totalling %llu bytes of %llu\n",
+                static_cast<unsigned long long>(reader_raw->ReadCount()),
+                static_cast<unsigned long long>(reader_raw->BytesRead()),
+                static_cast<unsigned long long>(DISC_SIZE));
+    check(reader_raw->BytesRead() < DISC_SIZE / 10,
+          "DiscIO read a small fraction of the image, not all of it");
+  }
 
   ppc.Shutdown();
   Core::UndeclareAsCPUThread();
