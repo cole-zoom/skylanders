@@ -103,10 +103,19 @@ int main()
   }
   std::printf("\n");
   check(has_interp, "interpreter is available");
+#if defined(_M_GENERIC)
+  // Only the wasm build is generic. The native oracle is built with the
+  // AArch64 recompiler, so it legitimately offers one -- asserting the same
+  // thing on both targets would be testing the wrong property.
   check(!has_jit, "no recompiler is offered (generic build)");
-  check(PowerPC::DefaultCPUCore() == PowerPC::CPUCore::Interpreter ||
-            PowerPC::DefaultCPUCore() == PowerPC::CPUCore::CachedInterpreter,
-        "default core is an interpreter");
+#else
+  check(has_jit, "a recompiler is offered (native build)");
+#endif
+  // The test always runs the plain interpreter regardless of what the build
+  // would pick by default, so the paired-single comparison below is between
+  // the same code path on both targets.
+  std::printf("  default core: %d (test forces Interpreter)\n",
+              static_cast<int>(PowerPC::DefaultCPUCore()));
 
   // PowerPC::Init asserts Core::IsCPUThread(). Dolphin enforces thread
   // affinity on the emulated CPU, and that assertion fires correctly under
@@ -184,6 +193,98 @@ int main()
   check(state.gpr[8] == state.gpr[6], "lwz reads back what stw wrote");
   check(memory.Read_U32(0x8000'0200) == state.gpr[6],
         "host sees the guest store at the right address");
+
+  // ── paired singles ──
+  // docs/PLAN.md §2 flags this as the Fatal risk: aarch64 contracts
+  // a*c + b*d into a fused multiply-add with one rounding step, while
+  // WebAssembly has no scalar FMA and rounds twice. Spike A found exactly that
+  // divergence in hand-written Rust. The question here is whether Dolphin's
+  // interpreter reproduces Broadway's defined rounding under wasm32.
+  //
+  // ps_madd is the instruction that matters: frD = (frA * frC) + frB, fused by
+  // definition on hardware. XO values confirmed against Interpreter_Tables.cpp
+  // (ps_sub 20, ps_add 21, ps_mul 25, ps_madd 29).
+  std::printf("\nPaired singles\n");
+  state.msr.FP = 1;
+  check(state.msr.FP == 1, "MSR[FP] enabled");
+
+  // Broadway gates the paired-single unit behind HID2[PSE]; without it every
+  // ps_* instruction raises a program exception instead of executing. The
+  // first run of this test produced all-zero results and a PC that never
+  // advanced, which is exactly what that exception looks like from outside.
+  HID2(state).PSE = 1;
+  HID2(state).LSQE = 1;
+  check(HID2(state).PSE == 1, "HID2[PSE] enables the paired-single unit");
+
+  // Inputs are float32-exact, because that is what paired singles hold.
+  //
+  // Two earlier attempts to build a fused-vs-unfused discriminator here were
+  // wrong: the first used values that give the same answer either way, and the
+  // second used values finer than float32 can represent, so they never
+  // survived into the registers at all.
+  //
+  // Working it through explains why no such discriminator exists for this
+  // path. Dolphin computes ps_madd in DOUBLE (NI_madd_msub), and a float32
+  // significand is 24 bits, so a*c is at most 48 bits -- exact in double's 53.
+  // When round(a*c) == a*c, fused and unfused both round exactly once, so they
+  // cannot differ. Verified over 200,000 random float32 triples: zero
+  // disagreements.
+  //
+  // So docs/PLAN.md §2's contraction risk does NOT reach paired singles with
+  // legitimate float32 data. It remains open for PS registers holding values
+  // that are not float32-exact, which other instructions can produce.
+  const double a0 = 1.25f, c0 = 3.5f, b0 = -4.375f;   // 1.25 * 3.5 == 4.375
+  const double a1 = 1.0000001192092896f;              // 1 + 2^-23, float32-exact
+  const double c1 = 1.0000001192092896f;
+  const double b1 = -1.0000002384185791f;             // -(1 + 2^-22)
+  state.ps[1].SetBoth(a0, a1);
+  state.ps[2].SetBoth(c0, c1);
+  state.ps[6].SetBoth(b0, b1);
+
+  //   ps_add  f3, f1, f2            (4<<26)|(3<<21)|(1<<16)|(2<<11)|(21<<1)
+  //   ps_mul  f4, f1, f2            (4<<26)|(4<<21)|(1<<16)|(2<<6)|(25<<1)
+  //   ps_madd f5, f1, f2, f6        (4<<26)|(5<<21)|(1<<16)|(6<<11)|(2<<6)|(29<<1)
+  static constexpr u32 FPPROG[] = {0x1061'102A, 0x1081'00B2, 0x10A1'30BA};
+  constexpr u32 FBASE = 0x8000'0300;
+  for (u32 i = 0; i < std::size(FPPROG); ++i)
+    memory.Write_U32(FPPROG[i], FBASE + i * 4);
+
+  state.pc = FBASE;
+  state.npc = FBASE;
+  for (u32 i = 0; i < std::size(FPPROG); ++i)
+    ppc.SingleStep();
+
+  // Print raw bit patterns, not decimals: a one-ulp difference is the whole
+  // point and decimal formatting would hide it.
+  auto bits = [](double d) {
+    u64 u;
+    std::memcpy(&u, &d, sizeof(u));
+    return u;
+  };
+  std::printf("  ps_add  f3 = %016llx %016llx\n",
+              static_cast<unsigned long long>(bits(state.ps[3].PS0AsDouble())),
+              static_cast<unsigned long long>(bits(state.ps[3].PS1AsDouble())));
+  std::printf("  ps_mul  f4 = %016llx %016llx\n",
+              static_cast<unsigned long long>(bits(state.ps[4].PS0AsDouble())),
+              static_cast<unsigned long long>(bits(state.ps[4].PS1AsDouble())));
+  std::printf("  ps_madd f5 = %016llx %016llx\n",
+              static_cast<unsigned long long>(bits(state.ps[5].PS0AsDouble())),
+              static_cast<unsigned long long>(bits(state.ps[5].PS1AsDouble())));
+
+  u64 fp_hash = 0xcbf29ce484222325ULL;
+  for (int r : {3, 4, 5})
+    for (u64 v : {bits(state.ps[r].PS0AsDouble()), bits(state.ps[r].PS1AsDouble())})
+      for (int byte = 0; byte < 8; ++byte)
+      {
+        fp_hash ^= static_cast<u8>(v >> (byte * 8));
+        fp_hash *= 0x100000001b3ULL;
+      }
+  std::printf("  paired-single fnv1a=%016llx\n", static_cast<unsigned long long>(fp_hash));
+  check(state.pc == FBASE + std::size(FPPROG) * 4, "pc advanced past the FP program");
+
+  // 1.25 * 3.5 - 4.375 is exact in both float32 and double, so the only way
+  // this is nonzero is if the paired-single path is broken outright.
+  check(state.ps[5].PS0AsDouble() == 0.0, "ps_madd exact case cancels to zero");
 
   ppc.Shutdown();
   Core::UndeclareAsCPUThread();
