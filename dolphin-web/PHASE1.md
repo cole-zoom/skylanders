@@ -22,6 +22,7 @@
 ✓ MMU address translation           BAT-mapped loads/stores, verified host-side
 ✓ Exceptions                        DSI raised, dispatched, SRR0/DAR/DSISR correct
 ✓ IOS kernel                        constructs, serves device nodes, tears down — in the differential
+✓ Portal USB device                 instantiates with the right identity (1430:0150)
 ✓ Trace differ                      instruction-level, reports the FIRST divergence
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
@@ -453,6 +454,51 @@ names the ordering.
 **It is back in the differential.** PR #17 set the rule that something leaves
 only while known-incomplete and returns the moment it works; `ios_probe.cpp` is
 deleted and the bring-up lives in `coreboot.cpp` alongside everything else.
+
+## The portal device — PR #9's cliff, climbed
+
+PR #9 recorded that `SkylanderUSB` could not be reached at all:
+
+> Merely constructing a `SkylanderUSB` emits its vtable. The vtable references
+> every virtual, including `SubmitTransfer`, whose body calls
+> `cmd->GetEmulationKernel().GetSystem()` [...] **It is a cliff, not a slope.**
+
+That was true while only the Skylanders objects were linked. The full core is
+linked now, so the device the game actually enumerates can be constructed:
+
+```
+Emulated portal device
+  usb identity 1430:0150  maxpacket=64 configs=1
+  vendor is 0x1430 (Activision)                        ok
+  product is 0x0150 (Portal of Power)                  ok
+  one HID interface                                    ok
+  endpoint 0x81 is a 64-byte interrupt IN              ok
+  endpoint 0x02 is a 64-byte interrupt OUT             ok
+  device attaches                                      ok
+```
+
+This is the USB identity the game enumerates on. If any of it were wrong the
+game would never find the portal — the same *"Can't find the USB Wireless
+Receiver"* screen the headless gameplay capture hit, for a different reason.
+
+**What is still not covered.** Submitting a transfer. `SubmitTransfer` reads
+its payload through `memory.GetPointerForRange(cmd->data_address, ...)` from a
+`CtrlMessage` carrying an IOS request, so driving it needs IPC plumbing rather
+than a direct call. The layer table from PR #9 now reads:
+
+| Layer | Status |
+|---|---|
+| `SkylanderFigure` — data and MIFARE crypto | verified, byte-identical |
+| `SkylanderPortal` — status, block read/write | verified, byte-identical |
+| `SkylanderUSB` — **identity and descriptors** | **verified** |
+| `SkylanderUSB` — transfer dispatch | needs an IOS request |
+| The game talking to any of it | needs the disc and a boot |
+
+**A note on reach.** `USBScanner` would have been the better test — it is the
+seam between the config flag and a device the game can find — but its scanning
+is client-driven and `AddEmulatedDevices` is private. Reaching it means driving
+the `/dev/usb/oh0` device lifecycle, which is the same IPC plumbing the
+transfer test needs.
 
 ### What the differential covers
 
