@@ -194,6 +194,79 @@ int main()
   check(memory.Read_U32(0x8000'0200) == state.gpr[6],
         "host sees the guest store at the right address");
 
+  // ── branches, condition register, shifts ──
+  // The differential only covers what the test covers, so this widens it past
+  // straight-line arithmetic into control flow and the CR -- the parts a
+  // decoder is most likely to get subtly wrong.
+  //
+  //   subf   r10, r4, r3      0x7D441850   r10 = r3 - r4
+  //   neg    r11, r3          0x7D6300D0   r11 = -r3
+  //   rlwinm r9, r3, 4, 0,27  0x54692036   r9  = (r3 << 4) & ~0xF
+  //   cmpwi  cr0, r3, 0x1234  0x2C031234   sets cr0 EQ
+  //   mfcr   r12              0x7D800026   r12 = CR
+  //   beq    +8               0x41820008   taken, skips the next instruction
+  //   addi   r13, r0, 0x0BAD  0x39A00BAD   must NOT execute
+  //   addi   r14, r0, 0x600D  0x39C0600D   must execute
+  std::printf("\nControl flow and CR\n");
+  static constexpr u32 CTRLPROG[] = {
+      0x3860'1234, 0x3880'0100, 0x7D44'1850, 0x7D63'00D0, 0x5469'2036,
+      0x2C03'1234, 0x7D80'0026, 0x4182'0008, 0x39A0'0BAD, 0x39C0'600D,
+  };
+  constexpr u32 CBASE = 0x8000'0400;
+  for (u32 i = 0; i < std::size(CTRLPROG); ++i)
+    memory.Write_U32(CTRLPROG[i], CBASE + i * 4);
+
+  state.pc = CBASE;
+  state.npc = CBASE;
+  for (u32 r = 9; r <= 14; ++r)
+    state.gpr[r] = 0;
+  // One step per instruction, minus the one the branch skips.
+  for (u32 i = 0; i < std::size(CTRLPROG) - 1; ++i)
+    ppc.SingleStep();
+
+  std::printf("  r9=0x%08x r10=0x%08x r11=0x%08x r12=0x%08x r13=0x%08x r14=0x%08x\n",
+              state.gpr[9], state.gpr[10], state.gpr[11], state.gpr[12], state.gpr[13],
+              state.gpr[14]);
+  check(state.gpr[10] == 0x0000'1134, "subf r10 = r3 - r4");
+  check(state.gpr[11] == 0xFFFF'EDCC, "neg r11 = -r3");
+  check(state.gpr[9] == 0x0001'2340, "rlwinm r9 = r3 << 4");
+  check((state.gpr[12] & 0xF000'0000) == 0x2000'0000, "cmpwi set cr0 EQ, visible via mfcr");
+  check(state.gpr[13] == 0, "branch skipped the instruction after it");
+  check(state.gpr[14] == 0x0000'600D, "execution resumed at the branch target");
+
+  // ── sub-word memory access ──
+  // Broadway is big-endian and wasm32 is little-endian, so byte and halfword
+  // accesses are where a byte-swap bug shows up. A word-sized round trip can
+  // pass while these are wrong, because swapping twice cancels.
+  //
+  //   stb r3, 0x300(r0)   0x98600300   stores the LOW byte of r3     (0x34)
+  //   lbz r15, 0x300(r0)  0x89E00300
+  //   sth r3, 0x304(r0)   0xB0600304   stores the LOW halfword       (0x1234)
+  //   lhz r16, 0x304(r0)  0xA2000304
+  std::printf("\nSub-word memory\n");
+  static constexpr u32 SUBPROG[] = {0x9860'0300, 0x89E0'0300, 0xB060'0304, 0xA200'0304};
+  constexpr u32 SBASE = 0x8000'0500;
+  for (u32 i = 0; i < std::size(SUBPROG); ++i)
+    memory.Write_U32(SUBPROG[i], SBASE + i * 4);
+
+  state.gpr[3] = 0x0000'1234;
+  state.gpr[15] = 0;
+  state.gpr[16] = 0;
+  state.pc = SBASE;
+  state.npc = SBASE;
+  for (u32 i = 0; i < std::size(SUBPROG); ++i)
+    ppc.SingleStep();
+
+  std::printf("  r15(byte)=0x%08x r16(half)=0x%08x  guest[0x300]=0x%02x guest[0x304]=0x%04x\n",
+              state.gpr[15], state.gpr[16], memory.Read_U8(0x8000'0300),
+              memory.Read_U16(0x8000'0304));
+  check(state.gpr[15] == 0x34, "lbz reads back the byte stb wrote");
+  check(state.gpr[16] == 0x1234, "lhz reads back the halfword sth wrote");
+  // Checked from the host side too: a consistent byte-swap bug would make the
+  // guest round trip agree with itself while the stored bytes are wrong.
+  check(memory.Read_U8(0x8000'0300) == 0x34, "host sees the byte at the right address");
+  check(memory.Read_U16(0x8000'0304) == 0x1234, "host sees the halfword big-endian");
+
   // ── paired singles ──
   // docs/PLAN.md §2 flags this as the Fatal risk: aarch64 contracts
   // a*c + b*d into a fused multiply-add with one rounding step, while

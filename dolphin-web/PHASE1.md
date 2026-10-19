@@ -18,6 +18,7 @@
 ✓ PowerPC interpreter initialises   no recompiler offered, thread affinity enforced
 ✓ Broadway instructions EXECUTE     arithmetic + load/store through the software MMU
 ✓ Paired singles execute            and the contraction risk is narrowed, not confirmed
+✓ Differential widened              19 instructions, 41 assertions, native == wasm32
 · Host USB stubbed                  not started
 · HttpBlobReader                    not started
 · Differential harness in CI        not started
@@ -289,6 +290,35 @@ Every value agrees: the integer results, the guest load/store, and the
 paired-single bit patterns including `paired-single fnv1a=d0bbd6b37621525d`.
 Only the target banner and the host allocation addresses differ, and the runner
 normalises those away explicitly rather than ignoring whole lines.
+
+### What the differential covers
+
+19 distinct Broadway instructions across five areas, 41 assertions, every value
+agreeing between native and wasm32:
+
+| Area | Instructions |
+|---|---|
+| Integer arithmetic | `addi` `add` `subf` `neg` `mullw` `or` |
+| Shift / rotate | `rlwinm` |
+| Condition register | `cmpwi` `mfcr` |
+| Control flow | `bc` (taken `beq`) |
+| Word memory | `stw` `lwz` |
+| Sub-word memory | `stb` `lbz` `sth` `lhz` |
+| Paired singles | `ps_add` `ps_mul` `ps_madd` |
+
+Two of these are worth more than their count suggests.
+
+**The conditional branch** is checked by what it *skips*: the instruction after
+`beq` writes `0x0BAD` into a register, and the test asserts that register is
+still zero. A branch that silently fell through would pass a test that only
+looked at the target.
+
+**Sub-word memory is the endianness check.** Broadway is big-endian, wasm32 is
+little-endian, and a word-sized round trip can pass while byte swapping is
+wrong — swapping twice cancels. `stb`/`lbz` and `sth`/`lhz` are verified from
+*both* sides: the guest reads back what it wrote, and the host independently
+sees the right bytes at the right guest addresses. A consistent swap bug would
+satisfy the first check and fail the second.
 
 **Why generic rather than the oracle.** Both sides being `ENABLE_GENERIC`
 builds means the only difference between the two binaries is the target. A
