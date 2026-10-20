@@ -1,0 +1,33 @@
+diff --git a/Source/Core/Core/IOS/USB/USBScanner.cpp b/Source/Core/Core/IOS/USB/USBScanner.cpp
+index 2893d10..a4db857 100644
+--- a/Source/Core/Core/IOS/USB/USBScanner.cpp
++++ b/Source/Core/Core/IOS/USB/USBScanner.cpp
+@@ -223,8 +223,28 @@ void USBScanner::WakeupSantrollerDevice(libusb_device* device)
+ #endif
+ }
+ 
++
++// Harness instrumentation hook (weak).
++//
++// Reports every USB device the scanner publishes. The scanner runs on its own
++// std::thread, which is this port's standing hazard: a thread that does not
++// run under Emscripten would leave the emulated Skylander portal present on
++// one target and absent on the other -- a one-sided configuration difference,
++// which is the shape of three of the four divergences found so far.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_usb_device(unsigned vid, unsigned pid,
++                                                         const char* name)
++{
++  (void)vid;
++  (void)pid;
++  (void)name;
++}
++
+ void USBScanner::AddDevice(std::unique_ptr<USB::Device> device, DeviceMap* new_devices)
+ {
++  harness_usb_device(device->GetVid(), device->GetPid(), "");
+   (*new_devices)[device->GetId()] = std::move(device);
+ }
+ 
