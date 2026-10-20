@@ -1,0 +1,40 @@
+diff --git a/Source/Core/Core/HW/VideoInterface.cpp b/Source/Core/Core/HW/VideoInterface.cpp
+index 42e0f35..e7c9fa3 100644
+--- a/Source/Core/Core/HW/VideoInterface.cpp
++++ b/Source/Core/Core/HW/VideoInterface.cpp
+@@ -432,6 +432,24 @@ void VideoInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
+   }
+ }
+ 
++
++// Harness instrumentation hook (weak).
++//
++// Reports VI's internal scanline state at the point it decides whether to
++// assert a display interrupt. The decision itself is pure integer arithmetic
++// on m_half_line_count and the programmed VCT/HCT registers, so when two
++// targets reach the same instruction at the same tick and disagree about
++// asserting, one of those values must already differ.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_vi_state(unsigned half_lines, unsigned hlw,
++                                                       unsigned vct0, unsigned hct0,
++                                                       unsigned mask0, unsigned int0)
++{
++  (void)half_lines; (void)hlw; (void)vct0; (void)hct0; (void)mask0; (void)int0;
++}
++
+ void VideoInterfaceManager::UpdateInterrupts()
+ {
+   if ((m_interrupt_register[0].IR_INT && m_interrupt_register[0].IR_MASK) ||
+@@ -989,6 +1007,10 @@ void VideoInterfaceManager::Update(u64 ticks)
+   // Check if we need to assert IR_INT. Note that the granularity of our current horizontal
+   // position is limited to half-lines.
+ 
++  harness_vi_state(m_half_line_count, m_h_timing_0.HLW, m_interrupt_register[0].VCT,
++                   m_interrupt_register[0].HCT, m_interrupt_register[0].IR_MASK,
++                   m_interrupt_register[0].IR_INT);
++
+   for (UVIInterruptRegister& reg : m_interrupt_register)
+   {
+     u32 target_halfline = (reg.HCT > m_h_timing_0.HLW) ? 1 : 0;

@@ -1,0 +1,40 @@
+diff --git a/Source/Core/Core/HW/ProcessorInterface.cpp b/Source/Core/Core/HW/ProcessorInterface.cpp
+index 10cca6c..b83fed8 100644
+--- a/Source/Core/Core/HW/ProcessorInterface.cpp
++++ b/Source/Core/Core/HW/ProcessorInterface.cpp
+@@ -178,6 +178,26 @@ void ProcessorInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
+   }
+ }
+ 
++
++// Harness instrumentation hook (weak).
++//
++// Logs every interrupt assert/deassert with its cause. Needed because an
++// external interrupt is NOT necessarily raised by a timed event: devices
++// assert it from inside guest MMIO accesses, so a CoreTiming event log can be
++// identical on two targets while the interrupt still arrives at a different
++// instruction.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_pi_interrupt(unsigned cause, int set,
++                                                           unsigned cause_now, unsigned mask_now)
++{
++  (void)cause;
++  (void)set;
++  (void)cause_now;
++  (void)mask_now;
++}
++
+ void ProcessorInterfaceManager::UpdateException()
+ {
+   auto& ppc_state = m_system.GetPPCState();
+@@ -248,6 +268,8 @@ void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
+     m_interrupt_cause |= cause_mask;
+   else
+     m_interrupt_cause &= ~cause_mask;  // is there any reason to have this possibility?
++
++  harness_pi_interrupt(cause_mask, set ? 1 : 0, m_interrupt_cause, m_interrupt_mask);
+   // F|RES: i think the hw devices reset the interrupt in the PI to 0
+   // if the interrupt cause is eliminated. that isn't done by software (afaik)
+   UpdateException();

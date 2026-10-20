@@ -331,6 +331,37 @@ the memory arena with the software MMU path, stub the host USB stack, and bring 
 > same Command Processor state. `run-boot.sh` separately compares a full instruction trace over the
 > first 20,000 steps (`MATCH -- 20000 steps identical`).
 
+**The first real wasm divergence, and it was the region bug again.** At step 64,452,098 native had
+taken an external interrupt and wasm had not, with **identical GPRs**. Not a computation bug: the
+guest state matched exactly and a scheduled interrupt arrived at a different time.
+
+Localising it took four instrumentation hooks, each ruling out a layer:
+
+| hook | question | answer |
+|---|---|---|
+| CoreTiming event dispatch | do events fire at different ticks? | **no** — identical ticks *and* steps |
+| PI interrupt assert | is the interrupt raised differently? | **yes** — native `set=1`, wasm `set=0` |
+| VI scanline state | why? | wasm was **one half-line behind**: hl 524 vs 525 |
+| ticks-at-boot | from when? | from the **first VI event**: 11583 vs 23166 |
+
+`GetTicksPerSample()` is `2 * TicksPerSecond / CLOCK_FREQUENCIES[m_clock & 1]`, and
+`VideoInterface.cpp:162` sets `m_clock = IsNTSC(region)` — 27MHz or 54MHz. **`VideoInterface::Init`
+runs inside `HW::Init`**, which the harness called *before* `SetPathsAndGameMetadata`. So VI read an
+uninitialised `SConfig::m_region`: native got zeroed memory (`NTSC_J` — still NTSC, so the clock was
+right **by luck**), wasm got reused heap and ran VI at **half rate**. One half-line of drift, and 64
+million instructions later a vertical-retrace interrupt fired on one target and not the other.
+
+Fixed by opening the disc and setting metadata before `HW::Init`, which is what
+`BootManager::BootCore` does (`BootManager.cpp:56`, long before `Core::Init` reaches `HW::Init`).
+After the fix the first divergence moves from **64M to 470M instructions**.
+
+**The lesson is the ordering, not the register.** This is the *second* bug from the same
+uninitialised `m_region`, found at a different consumer, long after the first was "fixed" — because
+the fix set it early enough for `CBoot::BootUp` and not early enough for `HW::Init`. Anything the
+harness initialises in a different order from `BootManager::BootCore` is a latent version of this,
+and a divergence 64 million instructions deep is the cheap outcome; being right by luck on one
+target is the expensive one.
+
 **The draws are not in the FIFO.** The game emits `GX_CMD_CALL_DL` and the drawing commands live in
 guest memory, not in the command stream. A 256 KB live capture contains 400 display lists and
 **zero draws**. Dolphin's own recorder expands display lists inline before writing a `.dff`

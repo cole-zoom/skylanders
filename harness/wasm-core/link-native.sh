@@ -26,7 +26,8 @@ B=dolphin-web/build-native-generic
 # defines make the headers present a different view to this translation unit
 # than they did to libcore.
 clang++ -std=c++23 -O2 -D_M_GENERIC=1 -D_ARCH_64=1 \
-  -I$D/Source/Core -I$B/Source/Core -I/opt/homebrew/include -I$D/Externals/picojson \
+  -I$D/Source/Core -I$B/Source/Core -I/opt/homebrew/include -I/usr/local/include \
+  -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
   "$SRC" harness/wasm-core/host_stubs.cpp \
   $B/Source/Core/Core/libcore.a \
   $B/Source/Core/VideoCommon/libvideocommon.a \
@@ -59,7 +60,7 @@ clang++ -std=c++23 -O2 -D_M_GENERIC=1 -D_ARCH_64=1 \
   $B/Externals/cubeb/libcubeb.a \
   $B/Externals/miniupnpc/miniupnp/miniupnpc/libminiupnpc.a \
   $B/Externals/hidapi/libhidapi.a \
-  -L/opt/homebrew/lib -lfmt -liconv -lbz2 -llzma -lcurl -lzstd -lavcodec -lavformat -lavutil -lswscale -lusb-1.0 -llz4 -llzo2 -lxxhash -lresolv \
+  -L/opt/homebrew/lib -L/usr/local/lib -lfmt -liconv -lbz2 -llzma -lcurl -lzstd -lavcodec -lavformat -lavutil -lswscale -lusb-1.0 -llz4 -llzo2 -lxxhash -lresolv \
   -framework Foundation -framework IOKit -framework CoreFoundation \
   -framework AudioUnit -framework AudioToolbox -framework CoreAudio \
   -framework Cocoa -framework ForceFeedback -framework OpenGL -framework Metal -framework QuartzCore -framework IOSurface \

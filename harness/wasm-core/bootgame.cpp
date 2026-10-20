@@ -107,6 +107,32 @@ extern "C" void harness_gp_bytes(const u8* data, size_t size)
   g_fifo_bytes.insert(g_fifo_bytes.end(), data, data + size);
 }
 
+// The EXECUTED command stream, with display lists expanded.
+//
+// Two different things are worth capturing and they are not the same stream:
+//
+//   gather pipe   what the CPU wrote. Contains CALL_DL pointers and none of
+//                 the geometry they refer to, because a display list's body
+//                 lives in guest memory and never crosses the FIFO. A 256 KB
+//                 capture this way held 400 display lists and ZERO draws.
+//
+//   commands      what the GPU executed, display lists followed. This is the
+//                 same shape Dolphin's FifoRecorder writes to a .dff, so the
+//                 existing decoder reads it unchanged.
+//
+// Keeping both is deliberate: the first is the transport, the second is the
+// content, and the difference between them is exactly how much of this game's
+// geometry is hiding in display lists.
+static std::vector<u8> g_gx_bytes;
+static size_t g_gx_limit = 0;
+
+extern "C" void harness_gx_command(const u8* data, u32 size)
+{
+  if (g_gx_limit == 0 || g_gx_bytes.size() >= g_gx_limit)
+    return;
+  g_gx_bytes.insert(g_gx_bytes.end(), data, data + size);
+}
+
 // base64, so the capture costs 1.33 bytes per byte through the CDP channel
 // instead of 2 for hex. Written out rather than pulled from a library because
 // the harness links no base64 and this is twenty lines.
@@ -134,6 +160,52 @@ static void EmitBase64(const std::vector<u8>& v)
   }
   if (!line.empty())
     std::printf("F %s\n", line.c_str());
+}
+
+// ── CoreTiming event log ──
+//
+// Answers the one question a register trace cannot. At step 64,453,122 native
+// and wasm hold IDENTICAL GPRs, but native has taken an external interrupt and
+// wasm has not. Nothing about the guest's computed state differs -- what
+// differs is WHEN a scheduled event fired, and that lives in the event queue,
+// not in the register file.
+//
+// Gated on the same --from window as tracing, because events fire constantly
+// (SyncGPUCallback alone is every 1000 ticks) and logging 64 million steps of
+// them is neither transportable out of a browser nor necessary.
+static bool g_event_log_on = false;
+// The step the CPU loop is on, so an event can be tied to an instruction
+// count. Ticks and steps are NOT the same clock: CoreTiming advances by
+// slice_length - downcount, and the apploader runs before stepping begins, so
+// the two run at different offsets and potentially different rates. When the
+// event ticks match but the guest diverges, the mapping between them is the
+// only place left to look.
+static u64 g_cur_step = 0;
+
+extern "C" void harness_vi_state(unsigned half_lines, unsigned hlw, unsigned vct0,
+                                 unsigned hct0, unsigned mask0, unsigned int0)
+{
+  if (!g_event_log_on)
+    return;
+  std::printf("V hl=%u hlw=%u vct0=%u hct0=%u mask0=%u int0=%u step=%llu\n", half_lines, hlw,
+              vct0, hct0, mask0, int0, static_cast<unsigned long long>(g_cur_step));
+}
+
+extern "C" void harness_pi_interrupt(unsigned cause, int set, unsigned cause_now,
+                                     unsigned mask_now)
+{
+  if (!g_event_log_on)
+    return;
+  std::printf("I cause=%08x set=%d now=%08x mask=%08x step=%llu\n", cause, set, cause_now,
+              mask_now, static_cast<unsigned long long>(g_cur_step));
+}
+
+extern "C" void harness_core_event(const char* name, long long scheduled, long long now)
+{
+  if (!g_event_log_on)
+    return;
+  std::printf("E %s sched=%lld now=%lld step=%llu\n", name, scheduled, now,
+              static_cast<unsigned long long>(g_cur_step));
 }
 
 static void InitMark(const char* msg)
@@ -179,6 +251,7 @@ int main(int argc, char** argv)
   // instructions than a fixed differential run, and every step past the
   // milestone is browser time spent learning nothing.
   bool stop_at_fifo = false;
+  bool want_events = false;
   u64 checkpoint = 0;
   u64 trace_from = 0;
   u64 dump_at = 0;
@@ -188,6 +261,8 @@ int main(int argc, char** argv)
       want_trace = true;
     else if (std::strcmp(argv[i], "--until-fifo") == 0)
       stop_at_fifo = true;
+    else if (std::strcmp(argv[i], "--events") == 0)
+      want_events = true;
     // --checkpoint=N: emit a trace line every N steps instead of every step.
     // A full trace to the first FIFO write would be 63 million lines, which is
     // not transportable out of a browser. Checkpoints every 100k give ~630
@@ -211,6 +286,10 @@ int main(int argc, char** argv)
     // count, because the interesting thing is the commands, not the distance.
     else if (std::strncmp(argv[i], "--capture-fifo=", 15) == 0)
       g_fifo_limit = std::strtoull(argv[i] + 15, nullptr, 0);
+    // --capture-gx=N: capture N bytes of EXECUTED command stream, display
+    // lists followed. This is the one that contains geometry.
+    else if (std::strncmp(argv[i], "--capture-gx=", 13) == 0)
+      g_gx_limit = std::strtoull(argv[i] + 13, nullptr, 0);
   }
 
 #if defined(__EMSCRIPTEN__)
@@ -378,38 +457,23 @@ int main(int argc, char** argv)
   INIT_MARK("sound stream...");
   AudioCommon::InitSoundStream(system);
   INIT_MARK("sound stream done");
-  INIT_MARK("HW::Init...");
-  HW::Init(system, nullptr);
-  INIT_MARK("HW::Init done");
-  check(system.GetMemory().GetRAM() != nullptr, "hardware up, guest memory allocated");
-
-  // ── video ──
-  // After HW::Init, matching Core.cpp: HW::Init runs at Core.cpp:580 and the
-  // video guard at :601. The order matters because Memory::InitMMIO (the last
-  // thing HW::Init does) is what wires the CP and PE register blocks, and the
-  // backend expects that to have happened.
-  INIT_MARK("video backend");
-  VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
-  check(g_video_backend != nullptr, "Null video backend activated");
-
-  // Single core, so the GPU runs on this thread. Both of these are what
-  // Core.cpp does inside its init_video lambda; passthrough means AsyncRequests
-  // executes work inline instead of queueing it for a GPU thread that does not
-  // exist here.
-  Core::DeclareAsGPUThread();
-  AsyncRequests::GetInstance()->SetPassthrough(true);
-  const bool video_up = g_video_backend && g_video_backend->Initialize(wsi);
-  check(video_up, "video backend initialised");
-  INIT_MARK("video backend done");
-
-  // IOS is NOT initialised here. HW::Init does it (HW.cpp:58, "Depends on
-  // Memory"). Calling it again re-registers the IPCEvent and trips a
-  // CoreTiming assertion about duplicate event names -- which is how this was
-  // discovered.
-  check(system.GetIOS() != nullptr, "IOS up (via HW::Init)");
-
-  auto& ppc = system.GetPowerPC();
-  check(ppc.GetMode() == PowerPC::CoreMode::Interpreter, "running the interpreter");
+  // ── disc and game metadata, BEFORE HW::Init ──
+  //
+  // Order is load-bearing, and getting it wrong cost a real divergence.
+  // VideoInterface::Init reads SConfig::m_region (VideoInterface.cpp:159) to
+  // pick the VI clock: m_clock = IsNTSC(region), selecting 27MHz or 54MHz.
+  // VI::Init runs inside HW::Init, so the region has to be set BEFORE that --
+  // which is exactly what BootManager::BootCore does, calling
+  // SetPathsAndGameMetadata at BootManager.cpp:56, long before Core::Init
+  // reaches HW::Init.
+  //
+  // With the metadata set afterwards instead, VI read an uninitialised region.
+  // Native happened to read zeroed memory (NTSC_J -- still NTSC, so
+  // IsNTSC gave 1 and the clock was right by luck); wasm read reused heap and
+  // got a value that is not a Region at all, so IsNTSC gave 0 and VI ran at
+  // half the tick rate. Ticks per half-line came out 23166 instead of 11583,
+  // VI fell exactly one half-line behind, and 64 MILLION instructions later a
+  // vertical-retrace interrupt fired on one target and not the other.
 
   // ── the disc ──
   auto stats = std::make_shared<Harness::SourceStats>();
@@ -449,29 +513,6 @@ int main(int argc, char** argv)
   auto boot = std::make_unique<BootParameters>(
       BootParameters::Disc{location, std::move(volume), {}});
 
-  // The DSP emulator has to be Initialize()d, not just constructed.
-  //
-  // HW::Init calls DSPManager::Init, which CREATES the emulator; Core.cpp:613
-  // then calls Initialize() on it, and the harness skipped that. The guest's
-  // DSPInit performs a mailbox handshake with the DSP and spins until it
-  // answers, so an uninitialised DSP hangs the game -- which is exactly what
-  // happened: GX set-up completed, two EFB copies went out, and then the game
-  // sat in a three-instruction loop at 0x803873a0 waiting on a flag, for ten
-  // billion instructions.
-  //
-  // The second argument is the DSP THREAD, forced false. Core.cpp decides it
-  // from the host core count; here it is another init-time thread and so
-  // another Emscripten deadlock, and a second thread would break determinism
-  // besides.
-  check(system.GetDSP().GetDSPEmulator() != nullptr, "DSP emulator exists");
-  check(system.GetDSP().GetDSPEmulator()->Initialize(system.IsWii(), false),
-        "DSP emulator initialised");
-  AudioCommon::PostInitSoundStream(system);
-
-  // Known starting execution state, as Core.cpp:620 does.
-  system.GetCPU().Break();
-  system.GetPowerPC().SetMode(PowerPC::CoreMode::Interpreter);
-
   // Game metadata BEFORE boot. BootManager::BootCore does this at
   // BootManager.cpp:56, and calling CBoot::BootUp directly skips it -- which
   // leaves SConfig::m_region (ConfigManager.h:53, declared with no
@@ -504,6 +545,76 @@ int main(int argc, char** argv)
   // state that something much later depends on, and skipping it fails far from
   // the cause.
   ConfigLoaders::TransferSYSCONFControlToGuest();
+
+  INIT_MARK("HW::Init...");
+  HW::Init(system, nullptr);
+  INIT_MARK("HW::Init done");
+  check(system.GetMemory().GetRAM() != nullptr, "hardware up, guest memory allocated");
+
+  // ── video ──
+  // After HW::Init, matching Core.cpp: HW::Init runs at Core.cpp:580 and the
+  // video guard at :601. The order matters because Memory::InitMMIO (the last
+  // thing HW::Init does) is what wires the CP and PE register blocks, and the
+  // backend expects that to have happened.
+  INIT_MARK("video backend");
+  VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
+  check(g_video_backend != nullptr, "Null video backend activated");
+
+  // Single core, so the GPU runs on this thread. Both of these are what
+  // Core.cpp does inside its init_video lambda; passthrough means AsyncRequests
+  // executes work inline instead of queueing it for a GPU thread that does not
+  // exist here.
+  Core::DeclareAsGPUThread();
+  AsyncRequests::GetInstance()->SetPassthrough(true);
+  const bool video_up = g_video_backend && g_video_backend->Initialize(wsi);
+  check(video_up, "video backend initialised");
+  INIT_MARK("video backend done");
+
+  // IOS is NOT initialised here. HW::Init does it (HW.cpp:58, "Depends on
+  // Memory"). Calling it again re-registers the IPCEvent and trips a
+  // CoreTiming assertion about duplicate event names -- which is how this was
+  // discovered.
+  check(system.GetIOS() != nullptr, "IOS up (via HW::Init)");
+
+  auto& ppc = system.GetPowerPC();
+  check(ppc.GetMode() == PowerPC::CoreMode::Interpreter, "running the interpreter");
+
+
+  // The DSP emulator has to be Initialize()d, not just constructed.
+  //
+  // HW::Init calls DSPManager::Init, which CREATES the emulator; Core.cpp:613
+  // then calls Initialize() on it, and the harness skipped that. The guest's
+  // DSPInit performs a mailbox handshake with the DSP and spins until it
+  // answers, so an uninitialised DSP hangs the game -- which is exactly what
+  // happened: GX set-up completed, two EFB copies went out, and then the game
+  // sat in a three-instruction loop at 0x803873a0 waiting on a flag, for ten
+  // billion instructions.
+  //
+  // The second argument is the DSP THREAD, forced false. Core.cpp decides it
+  // from the host core count; here it is another init-time thread and so
+  // another Emscripten deadlock, and a second thread would break determinism
+  // besides.
+  check(system.GetDSP().GetDSPEmulator() != nullptr, "DSP emulator exists");
+  check(system.GetDSP().GetDSPEmulator()->Initialize(system.IsWii(), false),
+        "DSP emulator initialised");
+  AudioCommon::PostInitSoundStream(system);
+
+  // Known starting execution state, as Core.cpp:620 does.
+  system.GetCPU().Break();
+  system.GetPowerPC().SetMode(PowerPC::CoreMode::Interpreter);
+
+
+  // Logging starts BEFORE the boot, not at the first stepped instruction.
+  // CBoot::BootUp runs the apploader as real guest code, which advances
+  // CoreTiming -- so by the time the step loop begins, VI has already counted
+  // hundreds of half-lines. An offset introduced there is invisible to any
+  // window that starts at step 0.
+  g_event_log_on = want_events;
+  // The emulated clock at the moment boot begins. If the two targets are
+  // already at different ticks here, everything scheduled afterwards is
+  // offset, and no amount of CPU-state comparison downstream will show why.
+  std::printf("  ticks at boot = %lld\n",
+              static_cast<long long>(system.GetCoreTiming().GetTicks()));
 
   const u32 pc_before = system.GetPPCState().pc;
   bool booted = false;
@@ -576,6 +687,30 @@ int main(int argc, char** argv)
 
   for (u64 i = 0; i < steps; ++i)
   {
+    // Liveness, not logging. The stepping phase produces NO output for
+    // minutes at a time -- a 256 KB capture takes ~4 billion instructions --
+    // so a watchdog based on output alone cannot tell a working run from a
+    // wedged one. Folding the step count into the stage marker gives the
+    // browser-side poller something that advances on its own, which is what
+    // makes a stall timeout safe to apply at all.
+    //
+    // Every 2^22 steps (~4M) so the cost is nothing and the marker still
+    // moves several times a minute under the wasm interpreter.
+    if ((i & 0x3FFFFF) == 0)
+    {
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "stepping %lluM",
+                    static_cast<unsigned long long>(i / 1000000));
+      InitMark(buf);
+    }
+
+    // Events are logged over the same window as the trace. --events turns
+    // logging on from the first step, which --from cannot express: a window
+    // starting at zero is indistinguishable from "no window".
+    g_cur_step = i;
+    if (i >= trace_from && (want_events || trace_from))
+      g_event_log_on = true;
+
     if (i >= trace_from && (want_trace || (checkpoint && i % checkpoint == 0)))
       Trace::EmitLine(i, state);
     if (dump_at && i == dump_at)
@@ -624,6 +759,8 @@ int main(int argc, char** argv)
       break;
     if (g_fifo_limit && g_fifo_bytes.size() >= g_fifo_limit)
       break;
+    if (g_gx_limit && g_gx_bytes.size() >= g_gx_limit)
+      break;
   }
 
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
@@ -653,7 +790,7 @@ int main(int argc, char** argv)
 
   // Both --until-fifo and --capture-fifo stop early ON PURPOSE, so the step
   // count is not the success condition for them -- staying on valid code is.
-  const bool early_stop_ok = stop_at_fifo || g_fifo_limit;
+  const bool early_stop_ok = stop_at_fifo || g_fifo_limit || g_gx_limit;
   check(early_stop_ok ? state.pc != 0 : executed == steps,
         early_stop_ok ? "ran until the stop condition without falling off"
                       : "ran the full step count without falling off");
@@ -669,9 +806,15 @@ int main(int argc, char** argv)
 
   if (g_fifo_limit)
   {
-    std::printf("  fifo cap  %zu bytes of GX command stream\n", g_fifo_bytes.size());
-    check(g_fifo_bytes.size() >= g_fifo_limit, "captured the requested command stream");
+    std::printf("  fifo cap  %zu bytes of gather-pipe stream\n", g_fifo_bytes.size());
+    check(g_fifo_bytes.size() >= g_fifo_limit, "captured the requested gather-pipe stream");
     EmitBase64(g_fifo_bytes);
+  }
+  if (g_gx_limit)
+  {
+    std::printf("  gx cap    %zu bytes of executed command stream\n", g_gx_bytes.size());
+    check(g_gx_bytes.size() >= g_gx_limit, "captured the requested command stream");
+    EmitBase64(g_gx_bytes);
   }
 
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);

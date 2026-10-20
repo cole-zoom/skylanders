@@ -23,7 +23,13 @@ on:
 jobs:
   native-differential:
     name: native differential (no disc)
-    runs-on: ubuntu-latest
+    # macOS, not Linux. harness/wasm-core/link-native.sh names the static
+    # libraries it links explicitly, and that list includes libvideometal.a,
+    # which exists only on macOS. More importantly the oracle has to match the
+    # one the harness is developed against: a differential whose reference is
+    # built by a different toolchain on a different platform is comparing two
+    # unknowns.
+    runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -37,24 +43,29 @@ jobs:
             https://github.com/dolphin-emu/dolphin.git dolphin
 
       - name: apply patches
-        run: |
-          set -euo pipefail
-          for p in dolphin-web/patches/*.patch; do
-            echo "applying $p"
-            git -C dolphin apply --verbose "../$p"
-          done
+        # Not a plain loop over the patch directory: 0003 patches SFML, which
+        # is a submodule, so its paths are relative to the submodule root. A
+        # top-level loop fails on it, which is exactly how the first nightly
+        # run failed. scripts/apply-patches.sh owns that mapping so CI and a
+        # human checkout cannot diverge.
+        run: scripts/apply-patches.sh dolphin
 
       - name: build dependencies
+        # Dolphin vendors its Externals, so macOS needs little beyond the
+        # toolchain Xcode already provides.
+        # fmt matters beyond "it is a dependency": Dolphin's CMake picks up
+        # Homebrew's fmt when it is present, so libcore gets compiled against
+        # those headers. link-native.sh then has to use the SAME ones, or the
+        # harness and libcore disagree about a type that crosses between them
+        # -- an ODR violation that links cleanly and misbehaves at runtime.
+        # Installing it here makes CI match the development machine.
+        #
+        # The rest of the list is link-native.sh's -l flags, minus what the
+        # macOS SDK already provides (bz2, curl, iconv, resolv). Discovering
+        # them one failed run at a time costs ten minutes of Dolphin build per
+        # missing library, so they go in together.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config \
-            libasound2-dev libpulse-dev libudev-dev libevdev-dev \
-            libusb-1.0-0-dev libcurl4-openssl-dev libmbedtls-dev \
-            libxi-dev libxrandr-dev libgl1-mesa-dev \
-            libbluetooth-dev libhidapi-dev libsystemd-dev \
-            libminiupnpc-dev libpugixml-dev liblzo2-dev \
-            libzstd-dev libbz2-dev zlib1g-dev libspng-dev
+          brew install cmake ninja pkg-config fmt ffmpeg lzo zstd lz4 xz xxhash libusb
 
       - name: configure (ENABLE_GENERIC, matching link-native.sh)
         # ENABLE_GENERIC is not a preference: wasm cannot JIT, so the oracle
@@ -70,7 +81,12 @@ jobs:
             -DUSE_DISCORD_PRESENCE=OFF -DENABLE_VULKAN=OFF -DENABLE_SDL=OFF
 
       - name: build libraries
-        run: ninja -C dolphin-web/build-native-generic Source/Core/Core/libcore.a
+        # Everything, not just libcore. link-native.sh links a fixed list of
+        # static libraries -- VideoCommon, the backends, DiscIO, InputCommon,
+        # UICommon and a dozen Externals -- and building only libcore leaves
+        # the link failing on a dozen missing archives. With Qt, NoGUI and
+        # tests all off, "everything" is those libraries plus dolphin-tool.
+        run: ninja -C dolphin-web/build-native-generic
 
       - name: coreboot differential
         run: |

@@ -21,6 +21,8 @@ import base64
 import sys
 from collections import Counter
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fifo_inventory import decode, assess_capture
 from gx_vertex import VertexFormats
 from gx_arrays import GuestRAM, ArrayDescriptors

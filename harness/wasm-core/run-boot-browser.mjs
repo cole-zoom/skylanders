@@ -62,11 +62,32 @@ try {
   if (!target) throw new Error('no page target');
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise(r => ws.onopen = r);
+  // Every CDP call races a timeout.
+  //
+  // Without one this awaits a reply FOREVER: if a response is dropped or the
+  // socket hiccups, the promise never settles, the poll loop stops iterating,
+  // and the run hangs with the process alive and Chrome healthy. That
+  // happened -- a capture sat wedged for an hour, and because the loop was no
+  // longer iterating it never reached its own iteration cap to report a
+  // timeout. A hang that cannot even time out is the worst version of this.
+  //
+  // 15s is enormous for a round trip that normally takes single-digit
+  // milliseconds, so it only fires when something is genuinely wrong, and a
+  // null return feeds the existing bad-poll tolerance rather than aborting.
+  const CDP_TIMEOUT_MS = 15000;
   const send = (id, method, params) => new Promise(res => {
-    const h = ev => { const m = JSON.parse(ev.data);
-      if (m.id === id) { ws.removeEventListener('message', h); res(m); } };
+    let done = false;
+    const finish = v => {
+      if (done) return;
+      done = true;
+      ws.removeEventListener('message', h);
+      clearTimeout(timer);
+      res(v);
+    };
+    const h = ev => { const m = JSON.parse(ev.data); if (m.id === id) finish(m); };
+    const timer = setTimeout(() => finish(null), CDP_TIMEOUT_MS);
     ws.addEventListener('message', h);
-    ws.send(JSON.stringify({ id, method, params }));
+    try { ws.send(JSON.stringify({ id, method, params })); } catch { finish(null); }
   });
   // Drain the page's line buffer incrementally.
   //
@@ -79,6 +100,19 @@ try {
   const out = [];
   let stalled = 0;
   let badPolls = 0;
+  // Stall watchdog.
+  //
+  // Deliberately NOT a wall-clock cap on the run. The stepping phase is
+  // silent for many minutes by design -- a 256 KB capture is about 4 billion
+  // interpreted instructions -- so "no output for N minutes" would kill a
+  // perfectly healthy run. What it watches instead is PROGRESS: new output
+  // lines, or the stage marker, which bootgame advances every ~4M steps
+  // precisely so that a working-but-silent run still looks alive.
+  //
+  // 5 minutes of neither moving means something is actually wrong.
+  const STALL_MS = 5 * 60 * 1000;
+  let lastProgress = Date.now();
+  let lastStage = '';
   // ~2 hours of idle polls. A boot-and-compare run finishes in minutes, but
   // capturing 256 KB of command stream takes 4 BILLION instructions, which the
   // wasm interpreter does far slower than native. The old 20-minute cap timed
@@ -90,8 +124,15 @@ try {
         var L = window.__lines || [];
         var stage = '?';
         try {
-          if (typeof Module !== 'undefined' && Module._harness_stage && Module.HEAPU8) {
-            var p = Module._harness_stage(), h = Module.HEAPU8, e = p;
+          // Read through the pointer the page captured in
+          // onRuntimeInitialized -- never by calling the export from here.
+          // Calling it before the runtime is up ABORTS the module, so a poll
+          // arriving a moment too early kills the run it is observing. That
+          // happened. Module.calledRun is not a usable guard either: under
+          // PROXY_TO_PTHREAD main() runs on a worker and it never becomes
+          // true on this thread.
+          if (typeof Module !== 'undefined' && window.__stagePtr && Module.HEAPU8) {
+            var p = window.__stagePtr, h = Module.HEAPU8, e = p;
             while (h[e]) e++;
             stage = String.fromCharCode.apply(null, h.subarray(p, e));
           }
@@ -127,7 +168,30 @@ try {
     out.push(...chunk);
     from += chunk.length;
     stalled = chunk.length ? 0 : stalled + 1;
-    if (done && from >= n) break;
+    // Completion is detected from the OUTPUT, not only from window.__done.
+    //
+    // bootgame ends with _exit() rather than returning -- a booted emulator
+    // leaves threads and device state live, and unwinding them terminates in
+    // libc++abi after the result has printed. But _exit() bypasses
+    // Emscripten's onExit, so window.__done never becomes true, and a run that
+    // finished perfectly looks identical to one that hung: output stops, and
+    // the stage marker (only written inside the step loop) stops too.
+    //
+    // That is not hypothetical -- a completed capture was reported STALLED
+    // for exactly this reason, with all 4,600 lines of its payload already
+    // drained.
+    const finished = out.length && /^(PASSED|FAILED)\b/.test(out[out.length - 1]);
+    if ((done || finished) && from >= n) break;
+
+    if (chunk.length || stage !== lastStage) {
+      lastStage = stage;
+      lastProgress = Date.now();
+    } else if (Date.now() - lastProgress > STALL_MS) {
+      console.log(`STALLED — no output and no stage change for ` +
+                  `${Math.round(STALL_MS / 60000)} min ` +
+                  `(stage=[${stage}], ${from} lines). Giving up.`);
+      break;
+    }
     if (i > 0 && i % 60 === 0)
       console.log(`--- t=${i / 2}s, ${from} lines, stage=[${stage}]`);
     // Only idle when there was nothing to collect; a producing run should be

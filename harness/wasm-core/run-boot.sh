@@ -42,6 +42,13 @@ var Module = {
   print:    (t) => { window.__lines.push(t); if (window.__lines.length % 500 === 0) tail(); },
   printErr: (t) => { window.__lines.push('! ' + t); },
   onExit:   (c) => { window.__lines.push('EXIT ' + c); window.__done = true; tail(); },
+  // Take the stage pointer exactly once, here. Calling an exported function
+  // before the runtime is up ABORTS the module, and Module.calledRun is not a
+  // usable guard under PROXY_TO_PTHREAD -- main() runs on a worker, so it
+  // never becomes true on this thread and the marker reads '?' forever.
+  onRuntimeInitialized: () => {
+    try { window.__stagePtr = Module._harness_stage(); } catch (e) {}
+  },
 };
 </script>
 <script src="bootgame.js"></script>
