@@ -331,6 +331,49 @@ the memory arena with the software MMU path, stub the host USB stack, and bring 
 > same Command Processor state. `run-boot.sh` separately compares a full instruction trace over the
 > first 20,000 steps (`MATCH -- 20000 steps identical`).
 
+**Both targets now run identically for billions of instructions.** With synthetic input driving the
+game past its attract loop, at a fixed 5 billion instructions:
+
+```
+MATCH -- gx-native and gx-wasm are byte-identical (1167944 bytes)
+724 draws, 33,258 vertices, 821 EFB copies
+```
+
+CPU state matches at every checkpoint to 3 billion instructions, and the GX command stream — what
+the emulator actually sends to the GPU — is byte-identical. That is the strongest statement this
+project can currently make: the browser build is not approximately right, it is *the same*.
+
+### Four divergences, and what they were actually about
+
+| # | found at | cause | class |
+|---|---|---|---|
+| 1 | 64M | VI clock from uninitialised region: `HW::Init` ran before `SetPathsAndGameMetadata` | ordering |
+| 2 | 477M | `Wiimote::Initialize` skipped on one target "as a precaution" | one-sided config |
+| 3 | 531M | host network state reaching the oracle through `/dev/net/ip/top` | one-sided config |
+| 4 | — | a flag passed to native but not the browser (literal `$f` from a heredoc) | one-sided config |
+
+**Not one of them was an emulation bug.** Every single one was the harness configuring its two
+targets differently, or reading state before something set it. The recompiler, the float
+contraction, the memory arena — none of the things the plan worried about — produced a single
+divergence. What did was *the harness itself*.
+
+Three lessons that generalise past this project:
+
+1. **A reference that depends on its environment is not a reference.** Native read host network
+   state, so it would not reproduce against itself on a different network. That makes every
+   comparison built on it unfalsifiable, which is worse than a comparison that fails.
+2. **Being right by luck is more dangerous than being wrong.** Native read an uninitialised region
+   as `NTSC_J` — the wrong region for a USA disc — and still produced correct VI timing, because the
+   only thing consulted was `IsNTSC()`. A harness that only ran natively would never have found it.
+3. **A precaution applied to one target is a divergence by construction.** Skipping Wiimote init
+   "just in case" cost a bug that surfaced 477 million instructions away, and the fourth divergence
+   was introduced *in the same commit as the comment warning about it*.
+
+**What finding them required** was instrumentation at four layers, because a CPU-state differential
+stops being informative the moment the guest reads a device register. Weak hooks now report
+CoreTiming dispatches, PI interrupt asserts, VI scanline state, IOS replies with device names, and
+the GX command stream. Each one ruled out a layer so the next became meaningful.
+
 **The first real wasm divergence, and it was the region bug again.** At step 64,452,098 native had
 taken an external interrupt and wasm had not, with **identical GPRs**. Not a computation bug: the
 guest state matched exactly and a scheduled interrupt arrived at a different time.
