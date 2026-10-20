@@ -1,0 +1,48 @@
+diff --git a/Source/Core/Core/IOS/IOS.cpp b/Source/Core/Core/IOS/IOS.cpp
+index f49b82e..665723e 100644
+--- a/Source/Core/Core/IOS/IOS.cpp
++++ b/Source/Core/Core/IOS/IOS.cpp
+@@ -795,6 +795,27 @@ void EmulationKernel::EnqueueIPCRequest(u32 address)
+ }
+ 
+ // Called to send a reply to an IOS syscall
++
++// Harness instrumentation hook (weak).
++//
++// Reports every IPC reply IOS queues: the command, the device file descriptor,
++// the return value, and how far in the future the reply lands. The game polls
++// IPC_PPCCTRL waiting for these, so a reply that is queued differently -- or
++// not queued at all -- stalls the guest at an MMIO read with no other symptom.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_ios_reply(unsigned command, unsigned fd,
++                                                        int return_value, long long cycles,
++                                                        const char* device)
++{
++  (void)command;
++  (void)fd;
++  (void)return_value;
++  (void)cycles;
++  (void)device;
++}
++
+ void EmulationKernel::EnqueueIPCReply(const Request& request, const s32 return_value,
+                                       s64 cycles_in_future, CoreTiming::FromThread from)
+ {
+@@ -805,6 +826,15 @@ void EmulationKernel::EnqueueIPCReply(const Request& request, const s32 return_v
+   memory.Write_U32(request.command, request.address + 8);
+   // IOS also overwrites the command type with the reply type.
+   memory.Write_U32(IPC_REPLY, request.address);
++  {
++    // The device name is what makes this log actionable: "an IOCTLV on fd 7
++    // did not reply" names nothing, while "/dev/usb/oh0 did not reply" points
++    // straight at a subsystem that is compiled out under Emscripten.
++    const auto dev = GetDeviceByFileDescriptor(request.fd);
++    harness_ios_reply(request.command, request.fd, return_value,
++                      static_cast<long long>(cycles_in_future),
++                      dev ? dev->GetDeviceName().c_str() : "<none>");
++  }
+   system.GetCoreTiming().ScheduleEvent(cycles_in_future, s_event_enqueue, request.address, from);
+ }
+ 

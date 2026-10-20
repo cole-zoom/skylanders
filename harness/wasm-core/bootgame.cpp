@@ -182,6 +182,15 @@ static bool g_event_log_on = false;
 // only place left to look.
 static u64 g_cur_step = 0;
 
+extern "C" void harness_ios_reply(unsigned command, unsigned fd, int return_value,
+                                  long long cycles, const char* device)
+{
+  if (!g_event_log_on)
+    return;
+  std::printf("R cmd=%u fd=%u ret=%d cycles=%lld dev=%s step=%llu\n", command, fd, return_value,
+              cycles, device, static_cast<unsigned long long>(g_cur_step));
+}
+
 extern "C" void harness_vi_state(unsigned half_lines, unsigned hlw, unsigned vct0,
                                  unsigned hct0, unsigned mask0, unsigned int0)
 {
@@ -378,18 +387,24 @@ int main(int argc, char** argv)
   Pad::Initialize();
   INIT_MARK("Keyboard::Initialize");
   Keyboard::Initialize();
-#if !defined(__EMSCRIPTEN__)
-  // Skipped under Emscripten as a precaution, NOT as a fix: this was suspected
-  // first and changing it made no difference -- the stall was in
-  // ExpansionInterface. It stays skipped because it is in the same hazard
-  // class (Wiimote::Initialize starts a real-Wiimote scanning thread, and
-  // thread creation from the proxied main thread is what deadlocks here), and
-  // because a browser has no Bluetooth Wiimotes to scan for.
+  // Wiimote::Initialize is NOT optional, and skipping it was a mistake.
   //
-  // Revisit when Wii input is actually wired up: emulated Wiimotes are a
-  // separate path from the real-device scan, but this call covers both.
+  // It was skipped under Emscripten in #24 as a "precaution" -- it starts a
+  // real-Wiimote scanning thread, and init-time thread creation is the
+  // deadlock hazard on this port. It was explicitly recorded as making no
+  // difference at the time, because the stall it was suspected of was
+  // ExpansionInterface.
+  //
+  // It made a difference 477 MILLION instructions later. Without it, IOS's
+  // emulated Bluetooth adapter /dev/usb/oh1/57e/305 does not answer an
+  // IOCTLV, so no IPC reply is queued, the game keeps polling IPC_PPCCTRL at
+  // 0xCD000004, and the two targets diverge at an MMIO read.
+  //
+  // The lesson is about the precaution, not the Wiimote: disabling a
+  // subsystem "just in case" on one target of a differential makes the two
+  // targets different by construction, and the cost surfaces nowhere near the
+  // change.
   Wiimote::Initialize(Wiimote::InitializeMode::DO_NOT_WAIT_FOR_WIIMOTES);
-#endif
   check(true, "controller configs loaded");
 
   // Three config choices below, all about threads.
