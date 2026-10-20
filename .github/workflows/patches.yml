@@ -36,17 +36,24 @@ jobs:
   apply:
     name: patches apply to a fresh Dolphin
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
       - name: clone Dolphin
-        # Submodules are required, not optional: patch 0003 lands inside
-        # Externals/SFML/SFML, and without them the apply fails with a
-        # confusing "directory does not exist".
+        # Only the submodules the patches actually touch.
+        #
+        # --recurse-submodules fetches roughly twenty of them and did not
+        # finish inside twenty minutes, which is far too slow for a check that
+        # runs on a pull request. Exactly one patch (0003) lands in a
+        # submodule, so only that one is initialised.
+        #
+        # If a future patch targets another submodule, apply-patches.sh fails
+        # with "directory does not exist" -- the same message as a missing
+        # mapping, and the fix is to add the path in both places.
         run: |
-          git clone --depth 1 --recurse-submodules --shallow-submodules \
-            https://github.com/dolphin-emu/dolphin.git dolphin
+          git clone --depth 1 https://github.com/dolphin-emu/dolphin.git dolphin
+          git -C dolphin submodule update --init --depth 1 Externals/SFML/SFML
 
       - name: apply
         run: scripts/apply-patches.sh dolphin
