@@ -53,7 +53,13 @@ jobs:
       - name: build dependencies
         # Dolphin vendors its Externals, so macOS needs little beyond the
         # toolchain Xcode already provides.
-        run: brew install cmake ninja pkg-config
+        # fmt matters beyond "it is a dependency": Dolphin's CMake picks up
+        # Homebrew's fmt when it is present, so libcore gets compiled against
+        # those headers. link-native.sh then has to use the SAME ones, or the
+        # harness and libcore disagree about a type that crosses between them
+        # -- an ODR violation that links cleanly and misbehaves at runtime.
+        # Installing it here makes CI match the development machine.
+        run: brew install cmake ninja pkg-config fmt
 
       - name: configure (ENABLE_GENERIC, matching link-native.sh)
         # ENABLE_GENERIC is not a preference: wasm cannot JIT, so the oracle

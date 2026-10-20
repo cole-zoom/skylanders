@@ -90,7 +90,13 @@ try {
         var L = window.__lines || [];
         var stage = '?';
         try {
-          if (typeof Module !== 'undefined' && Module._harness_stage && Module.HEAPU8) {
+          // Module.calledRun gates this. Calling an exported function before
+          // the runtime has initialised does not fail softly -- Emscripten
+          // ABORTS the module ("native function called before runtime
+          // initialization"), so a poll that arrives a moment too early kills
+          // the run it is supposed to be observing.
+          if (typeof Module !== 'undefined' && Module.calledRun &&
+              Module._harness_stage && Module.HEAPU8) {
             var p = Module._harness_stage(), h = Module.HEAPU8, e = p;
             while (h[e]) e++;
             stage = String.fromCharCode.apply(null, h.subarray(p, e));

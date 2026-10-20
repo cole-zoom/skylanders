@@ -26,7 +26,8 @@ B=dolphin-web/build-native-generic
 # defines make the headers present a different view to this translation unit
 # than they did to libcore.
 clang++ -std=c++23 -O2 -D_M_GENERIC=1 -D_ARCH_64=1 \
-  -I$D/Source/Core -I$B/Source/Core -I/opt/homebrew/include -I$D/Externals/picojson \
+  -I$D/Source/Core -I$B/Source/Core -I/opt/homebrew/include -I/usr/local/include \
+  -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
   "$SRC" harness/wasm-core/host_stubs.cpp \
   $B/Source/Core/Core/libcore.a \
   $B/Source/Core/VideoCommon/libvideocommon.a \
