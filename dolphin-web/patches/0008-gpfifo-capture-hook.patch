@@ -1,0 +1,35 @@
+diff --git a/Source/Core/Core/HW/GPFifo.cpp b/Source/Core/Core/HW/GPFifo.cpp
+index 0de434b..e5d47b9 100644
+--- a/Source/Core/Core/HW/GPFifo.cpp
++++ b/Source/Core/Core/HW/GPFifo.cpp
+@@ -82,6 +82,22 @@ void GPFifoManager::ResetGatherPipe()
+   SetGatherPipeCount(0);
+ }
+ 
++
++// Harness capture hook (weak).
++//
++// UpdateGatherPipe is the single choke point for the GX command stream: every
++// 32 bytes the CPU writes to the write-gather pipe passes through here on its
++// way into the FIFO. Hooking it gives the exact byte sequence the GPU would
++// consume, in order, which is what a FIFO decoder needs.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_gp_bytes(const u8* data, size_t size)
++{
++  (void)data;
++  (void)size;
++}
++
+ void GPFifoManager::UpdateGatherPipe()
+ {
+   auto& system = m_system;
+@@ -95,6 +111,7 @@ void GPFifoManager::UpdateGatherPipe()
+     // copy the GatherPipe
+     memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe + processed,
+                      GATHER_PIPE_SIZE);
++    harness_gp_bytes(m_gather_pipe + processed, GATHER_PIPE_SIZE);
+     pipe_count -= GATHER_PIPE_SIZE;
+ 
+     // increase the CPUWritePointer

@@ -327,6 +327,27 @@ the memory arena with the software MMU path, stub the host USB stack, and bring 
 > same Command Processor state. `run-boot.sh` separately compares a full instruction trace over the
 > first 20,000 steps (`MATCH -- 20000 steps identical`).
 
+**The FIFO decodes.** `harness/src/decode_capture.py` decodes a GX command stream captured live out
+of `Core/HW/GPFifo.cpp`'s gather-pipe flush (patch 0008), rather than from a `.dff` recording. A
+256 KB capture from a native boot decodes at **100% coverage**: 76 CP / 557 BP / 89 XF register
+writes, 4 EFB copies, and a `pos,tex0` tri-strip. Reaching it took 4.0 billion instructions
+(~5.5 s emulated) and 454 disc requests / 13.16 MB.
+
+**Three bugs, all the same shape: the harness calls `CBoot::BootUp` directly and skips
+`BootManager::BootCore`.** Each one established global state that something much later depended on,
+and each failed a long way from its cause:
+
+| missing call | where | how it failed |
+|---|---|---|
+| `SetPathsAndGameMetadata` | `BootManager.cpp:56` | `SConfig::m_region` left uninitialised; wrong video standard read back **59.7 M instructions** later |
+| `FifoManager::Prepare()` | `Core.cpp:656` | `m_syncing_suspended` defaults to **false**, so `RunGpu()` never schedules the GPU; the FIFO filled and the game spun at `0x803873a0` for **10 billion instructions** |
+| `TransferSYSCONFControlToGuest()` | `BootManager.cpp:163` | a config save built a second `IOS::HLE::Kernel`, tripping `IOS.cpp:285` mid-run |
+
+**This is a standing hazard, not three incidents.** Anything else `BootCore` sets up is still unset,
+and the next one will also surface far from its cause. The harness should either move to
+`BootManager::BootCore` or audit that function line by line — the current approach discovers these
+one crash at a time.
+
 **Determinism had to be bought, not assumed.** The first attempt at this comparison failed because
 *native disagreed with itself*: the step index of the first FIFO write drifted by a few hundred
 between runs. `SystemTimers.cpp:253` seeds the emulated clock from

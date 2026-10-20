@@ -38,6 +38,7 @@
 #include "Common/Logging/LogManager.h"
 #include "Common/WindowSystemInfo.h"
 #include "VideoCommon/AsyncRequests.h"
+#include "VideoCommon/Fifo.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/VideoBackendBase.h"
 #include "Core/HW/GCKeyboard.h"
@@ -45,6 +46,9 @@
 #include "Core/HW/Wiimote.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "Core/HW/EXI/EXI_Device.h"
+#include "Core/HW/CPU.h"
+#include "Core/DSPEmulator.h"
+#include "Core/HW/DSP.h"
 #include "Core/HW/HW.h"
 #include "Core/HW/Memmap.h"
 #include "Core/IOS/IOS.h"
@@ -81,6 +85,55 @@ volatile char g_harness_stage[96] = "start";
 #if defined(__EMSCRIPTEN__)
 EMSCRIPTEN_KEEPALIVE const char* harness_stage() { return (const char*)g_harness_stage; }
 #endif
+}
+
+// ── GX command stream capture ──
+//
+// Core/HW/GPFifo.cpp calls this for every 32 bytes the game writes to the
+// write-gather pipe, which is the whole command stream in order. Accumulated
+// here and dumped as base64 so it survives the trip out of a browser, where
+// there is no filesystem to write to.
+//
+// Capped rather than unbounded: the stream grows without limit while the game
+// runs, and the point is to decode a representative slice, not to mirror a
+// session into memory.
+static std::vector<u8> g_fifo_bytes;
+static size_t g_fifo_limit = 0;
+
+extern "C" void harness_gp_bytes(const u8* data, size_t size)
+{
+  if (g_fifo_limit == 0 || g_fifo_bytes.size() >= g_fifo_limit)
+    return;
+  g_fifo_bytes.insert(g_fifo_bytes.end(), data, data + size);
+}
+
+// base64, so the capture costs 1.33 bytes per byte through the CDP channel
+// instead of 2 for hex. Written out rather than pulled from a library because
+// the harness links no base64 and this is twenty lines.
+static void EmitBase64(const std::vector<u8>& v)
+{
+  static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string line;
+  for (size_t i = 0; i < v.size(); i += 3)
+  {
+    const u32 a = v[i];
+    const u32 b = i + 1 < v.size() ? v[i + 1] : 0;
+    const u32 c = i + 2 < v.size() ? v[i + 2] : 0;
+    const u32 w = (a << 16) | (b << 8) | c;
+    line += T[(w >> 18) & 63];
+    line += T[(w >> 12) & 63];
+    line += i + 1 < v.size() ? T[(w >> 6) & 63] : '=';
+    line += i + 2 < v.size() ? T[w & 63] : '=';
+    // Bounded line length: one enormous line is harder to move and harder to
+    // read back than many short ones.
+    if (line.size() >= 76)
+    {
+      std::printf("F %s\n", line.c_str());
+      line.clear();
+    }
+  }
+  if (!line.empty())
+    std::printf("F %s\n", line.c_str());
 }
 
 static void InitMark(const char* msg)
@@ -153,6 +206,11 @@ int main(int argc, char** argv)
     // and this says which register and which opcode.
     else if (std::strncmp(argv[i], "--dump-at=", 10) == 0)
       dump_at = std::strtoull(argv[i] + 10, nullptr, 0);
+    // --capture-fifo=N: capture N bytes of GX command stream and dump them as
+    // base64. Implies running until the stream is full rather than to a step
+    // count, because the interesting thing is the commands, not the distance.
+    else if (std::strncmp(argv[i], "--capture-fifo=", 15) == 0)
+      g_fifo_limit = std::strtoull(argv[i] + 15, nullptr, 0);
   }
 
 #if defined(__EMSCRIPTEN__)
@@ -391,6 +449,29 @@ int main(int argc, char** argv)
   auto boot = std::make_unique<BootParameters>(
       BootParameters::Disc{location, std::move(volume), {}});
 
+  // The DSP emulator has to be Initialize()d, not just constructed.
+  //
+  // HW::Init calls DSPManager::Init, which CREATES the emulator; Core.cpp:613
+  // then calls Initialize() on it, and the harness skipped that. The guest's
+  // DSPInit performs a mailbox handshake with the DSP and spins until it
+  // answers, so an uninitialised DSP hangs the game -- which is exactly what
+  // happened: GX set-up completed, two EFB copies went out, and then the game
+  // sat in a three-instruction loop at 0x803873a0 waiting on a flag, for ten
+  // billion instructions.
+  //
+  // The second argument is the DSP THREAD, forced false. Core.cpp decides it
+  // from the host core count; here it is another init-time thread and so
+  // another Emscripten deadlock, and a second thread would break determinism
+  // besides.
+  check(system.GetDSP().GetDSPEmulator() != nullptr, "DSP emulator exists");
+  check(system.GetDSP().GetDSPEmulator()->Initialize(system.IsWii(), false),
+        "DSP emulator initialised");
+  AudioCommon::PostInitSoundStream(system);
+
+  // Known starting execution state, as Core.cpp:620 does.
+  system.GetCPU().Break();
+  system.GetPowerPC().SetMode(PowerPC::CoreMode::Interpreter);
+
   // Game metadata BEFORE boot. BootManager::BootCore does this at
   // BootManager.cpp:56, and calling CBoot::BootUp directly skips it -- which
   // leaves SConfig::m_region (ConfigManager.h:53, declared with no
@@ -409,6 +490,21 @@ int main(int argc, char** argv)
   check(SConfig::GetInstance().SetPathsAndGameMetadata(system, *boot),
         "game metadata set (region, paths)");
 
+  // Hand SYSCONF to the guest, as BootManager.cpp:163 does.
+  //
+  // While this is unset, ConfigLoaders::SaveToSYSCONF builds a STANDALONE
+  // IOS::HLE::Kernel to reach the NAND (BaseConfigLoader.cpp:90) -- and the
+  // Kernel constructor asserts that no IOS already exists (IOS.cpp:285,
+  // "using more than one IOS instance at a time is not supported"). Any config
+  // write once emulation is up then kills the run mid-flight.
+  //
+  // This is the THIRD thing found missing because the harness calls
+  // CBoot::BootUp directly instead of BootManager::BootCore, after the region
+  // and the FIFO sync. The pattern is consistent: BootCore establishes global
+  // state that something much later depends on, and skipping it fails far from
+  // the cause.
+  ConfigLoaders::TransferSYSCONFControlToGuest();
+
   const u32 pc_before = system.GetPPCState().pc;
   bool booted = false;
   {
@@ -417,6 +513,19 @@ int main(int argc, char** argv)
     booted = CBoot::BootUp(system, guard, std::move(boot));
   }
   check(booted, "CBoot::BootUp returned success");
+
+  // Arm GPU/CPU syncing. Core.cpp:656 does this immediately after boot, and it
+  // is not optional: FifoManager::Prepare() both registers the SyncGPUCallback
+  // CoreTiming event and sets m_syncing_suspended = true. The member defaults
+  // to FALSE, and RunGpu() only schedules the callback when it is true -- so
+  // without this call RunGpu() does nothing at all, the GPU never consumes the
+  // FIFO, and the FIFO just fills up.
+  //
+  // That was the stall: the game wrote 2,336 bytes of GX set-up, the read
+  // pointer never moved off CPBase (rwdist grew, rd == base), and the game sat
+  // in a three-instruction wait loop at 0x803873a0 for ten billion
+  // instructions. A default-false flag and a missing one-line call.
+  system.GetFifo().Prepare();
 
   auto& state = system.GetPPCState();
   std::printf("  entry pc  0x%08x (was 0x%08x)\n", state.pc, pc_before);
@@ -513,6 +622,8 @@ int main(int argc, char** argv)
     // asked for. Running past it wastes minutes of browser time.
     if (stop_at_fifo && fifo_written_at >= 0)
       break;
+    if (g_fifo_limit && g_fifo_bytes.size() >= g_fifo_limit)
+      break;
   }
 
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
@@ -540,10 +651,28 @@ int main(int argc, char** argv)
     std::printf("  fifo wr   not reached in %llu steps\n",
                 static_cast<unsigned long long>(executed));
 
-  check(stop_at_fifo ? state.pc != 0 : executed == steps,
-        stop_at_fifo ? "ran until the FIFO write (or the cap) without falling off"
-                     : "ran the full step count without falling off");
+  // Both --until-fifo and --capture-fifo stop early ON PURPOSE, so the step
+  // count is not the success condition for them -- staying on valid code is.
+  const bool early_stop_ok = stop_at_fifo || g_fifo_limit;
+  check(early_stop_ok ? state.pc != 0 : executed == steps,
+        early_stop_ok ? "ran until the stop condition without falling off"
+                      : "ran the full step count without falling off");
   check(state.pc != 0, "pc is still valid");
+
+  // Is anything draining the FIFO? If CPReadWriteDistance only grows, the GPU
+  // side never ran and a game waiting for FIFO space would stall -- a very
+  // different diagnosis from a game waiting on an interrupt.
+  std::printf("  fifo state  rwdist=%u rd=%08x wr=%08x base=%08x end=%08x gpread=%u\n",
+              fifo.CPReadWriteDistance.load(), fifo.CPReadPointer.load(),
+              fifo.CPWritePointer.load(), fifo.CPBase.load(), fifo.CPEnd.load(),
+              fifo.bFF_GPReadEnable.load());
+
+  if (g_fifo_limit)
+  {
+    std::printf("  fifo cap  %zu bytes of GX command stream\n", g_fifo_bytes.size());
+    check(g_fifo_bytes.size() >= g_fifo_limit, "captured the requested command stream");
+    EmitBase64(g_fifo_bytes);
+  }
 
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
 

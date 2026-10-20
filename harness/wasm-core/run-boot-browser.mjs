@@ -79,7 +79,12 @@ try {
   const out = [];
   let stalled = 0;
   let badPolls = 0;
-  for (let i = 0; i < 2400; i++) {
+  // ~2 hours of idle polls. A boot-and-compare run finishes in minutes, but
+  // capturing 256 KB of command stream takes 4 BILLION instructions, which the
+  // wasm interpreter does far slower than native. The old 20-minute cap timed
+  // such a run out while it was still making progress, which is the worst
+  // failure mode: it looks like a hang and is not one.
+  for (let i = 0; i < 14400; i++) {
     const r = await send(i + 1, 'Runtime.evaluate', { returnByValue: true, expression: `
       (function () {
         var L = window.__lines || [];
@@ -128,7 +133,7 @@ try {
     // Only idle when there was nothing to collect; a producing run should be
     // drained as fast as the round trip allows.
     if (!chunk.length) await sleep(500);
-    if (i === 2399) console.log(`TIMEOUT (stage=[${stage}], ${from} lines)`);
+    if (i === 14399) console.log(`TIMEOUT (stage=[${stage}], ${from} lines)`);
   }
   console.log(out.join('\n'));
   ws.close();
