@@ -46,7 +46,8 @@ def fresh_state():
                 logic_ops=set(), dst_alpha_used=set(), ztest=set(), zwrite=set(),
                 alpha_test=0, efb_copies=0, tev_color_writes=0,
                 tex_formats=set(), tex_filters=set(), line_point_width=0,
-                stopped_at_draw=False, bp_initial={}, decoded_bytes=0,
+                stopped_at_draw=False, truncated=False, display_lists=0,
+                display_list_bytes=0, bp_initial={}, decoded_bytes=0,
                 total_bytes=0, vfmt=VertexFormats(), cp=Counter(),
                 vtx_formats=Counter(), desync=False, cur_blend=0,
                 arrays=ArrayDescriptors(), ram=GuestRAM(), export=None)
@@ -72,12 +73,17 @@ def report(path, stream):
     print(f"  TEV stages in use       {sorted(st['tev_stages']) or 'none'}")
     print(f"  texture formats         {sorted(st['tex_formats']) or 'none'}")
     print(f"  EFB copies              {st['efb_copies']}")
+    print(f"  display lists called    {st['display_lists']}"
+          f" ({st['display_list_bytes']} bytes NOT in this stream)")
     if st["unknown_ops"]:
         print(f"  UNDECODED opcodes       "
               f"{ {hex(k): v for k, v in st['unknown_ops'].most_common(5)} }")
     pct = 100.0 * st["decoded_bytes"] / max(st["total_bytes"], 1)
     print(f"  decode coverage         {st['decoded_bytes']}/{st['total_bytes']}"
           f" bytes ({pct:.1f}%)")
+    if st["truncated"]:
+        print("  WARNING: final draw runs past the end -- capture is TRUNCATED.")
+        print("           Its vertex count describes data that is not here.")
     if st["desync"]:
         print("  WARNING: decoder desynchronised -- figures are a LOWER BOUND.")
     ok, msg = assess_capture(st)

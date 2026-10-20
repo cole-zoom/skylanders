@@ -114,6 +114,34 @@ def decode(stream, st):
             i += 5 + cnt * 4
         elif op in (0x20, 0x28, 0x30, 0x38):         # index-mode loads
             i += 5
+        elif op == 0x40:                             # GX_CMD_CALL_DL
+            # 9 bytes: opcode, u32 address, u32 size
+            # (VideoCommon/OpcodeDecoding.cpp:202-212).
+            #
+            # Skipping this as a 1-byte unknown walks straight into the address
+            # field and reads it as opcodes, which desynchronises the rest of
+            # the stream silently -- no desync flag fires, because the garbage
+            # still parses. That is what produced a single "tri-strip" of
+            # 34,583 vertices in a live capture, more than the entire title
+            # screen's 3,667.
+            #
+            # The display list's COMMANDS ARE NOT IN THIS STREAM. They live in
+            # guest memory at `address`, so a capture containing CALL_DL is
+            # missing however much geometry the list holds. Counted so that
+            # absence is visible rather than assumed away.
+            if i + 9 > n:
+                break
+            dl_addr = struct.unpack_from(">I", stream, i + 1)[0]
+            dl_size = struct.unpack_from(">I", stream, i + 5)[0]
+            st["display_lists"] += 1
+            st["display_list_bytes"] += dl_size & ~31
+            _ = dl_addr
+            i += 9
+        elif op in (0x44, 0x48):                     # UNKNOWN_METRICS, INVL_VC
+            # Genuinely one byte each, per OpcodeDecoding.cpp:205-218. Listing
+            # them explicitly keeps them out of the "undecoded" bucket, which
+            # should mean "we do not know", not "we know and it is fine".
+            i += 1
         elif op == 0x61:                             # load BP reg
             if i + 5 > n:
                 break
@@ -148,7 +176,21 @@ def decode(stream, st):
                 # features; stop and say so instead.
                 st["desync"] = True
                 return
-            i += 3 + vcount * vsize
+            end = i + 3 + vcount * vsize
+            if end > n:
+                # The draw's payload runs past the end of what we hold. The
+                # walk then simply stops, and because it stopped at a draw
+                # boundary rather than mid-opcode nothing else complains --
+                # so coverage reads 100% for a stream that was cut in half.
+                #
+                # That is actively misleading: coverage measures whether the
+                # walker consumed the bytes, not whether the capture contains
+                # a complete command stream. A live capture is cut at whatever
+                # byte the limit falls on, so this is the normal case for one,
+                # and the vertex count of the final draw describes data that
+                # was never captured.
+                st["truncated"] = True
+            i = end
         else:
             st["unknown_ops"][op] += 1
             i += 1
@@ -200,7 +242,8 @@ def main(path):
               logic_ops=set(), dst_alpha_used=set(), ztest=set(), zwrite=set(),
               alpha_test=0, efb_copies=0, tev_color_writes=0,
               tex_formats=set(), tex_filters=set(), line_point_width=0,
-              stopped_at_draw=False, bp_initial={}, decoded_bytes=0,
+              stopped_at_draw=False, truncated=False, display_lists=0,
+              display_list_bytes=0, bp_initial={}, decoded_bytes=0,
               total_bytes=0, vfmt=VertexFormats(), cp=Counter(),
               vtx_formats=Counter(), desync=False, cur_blend=0,
               arrays=ArrayDescriptors(), ram=GuestRAM(),
@@ -241,6 +284,8 @@ def main(path):
     print(f"  texture formats         {sorted(st['tex_formats']) or 'n/a'}")
     print(f"  primitives              {dict(st['prims']) or 'n/a'}")
     print(f"  line/point width writes {st['line_point_width']}")
+    print(f"  display lists called    {st['display_lists']}"
+          f" ({st['display_list_bytes']} bytes of commands NOT in this stream)")
     if st["unknown_ops"]:
         print(f"  UNDECODED opcodes       "
               f"{ {hex(k): v for k, v in st['unknown_ops'].most_common(5)} }")
@@ -249,6 +294,10 @@ def main(path):
     pct = 100.0 * st["decoded_bytes"] / max(st["total_bytes"], 1)
     print(f"\n  stream decode coverage  {st['decoded_bytes']}/{st['total_bytes']}"
           f" bytes ({pct:.1f}%)")
+    if st["truncated"]:
+        print("  WARNING: the final draw runs past the end of the stream --")
+        print("  the capture is TRUNCATED. Its vertex count describes data")
+        print("  that is not here, and coverage above is not a validity check.")
     if st["desync"]:
         print("  WARNING: decoder desynchronised (draw against an unconfigured")
         print("  vertex format). Figures above are a LOWER BOUND.")
