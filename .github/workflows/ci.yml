@@ -23,7 +23,7 @@ jobs:
     name: GX decoder tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -35,7 +35,7 @@ jobs:
     name: repo hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: no oversized or forbidden files
         # Mirrors .githooks/pre-commit. The hook is opt-in (it only runs if the
         # contributor has core.hooksPath set), so the same rules are enforced
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: every commit carries the five required sections
