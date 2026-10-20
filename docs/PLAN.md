@@ -309,7 +309,11 @@ the memory arena with the software MMU path, stub the host USB stack, and bring 
 - The game's boot sequence executes under the interpreter — **done**
 - CPU state matches a captured native trace instruction for instruction — **done**, 20,000 steps
   byte-identical between `wasm32` in Chrome and the native oracle
-- Differential harness running in CI from day one — **not yet**, it runs locally only
+- Differential harness running in CI from day one — **partly**. `ci.yml` gates every push on the GX
+  decoder tests, repo hygiene and commit format (~10s). `nightly.yml` builds Dolphin and runs
+  `coreboot` and `tracetest`, which need no disc — written but **not yet verified on a runner**.
+  Everything that touches the real disc (boot differential, FIFO milestone, capture comparison)
+  is still manual, and cannot move to a hosted runner: the disc is 4.7 GB and copyrighted
 
 > **Gate** — Boot to the first rendered frame's FIFO write, verified against the oracle. Speed is
 > irrelevant here; correctness is the whole deliverable.
@@ -326,6 +330,22 @@ the memory arena with the software MMU path, stub the host USB stack, and bring 
 > 63 million instructions of real game boot, landing on the same step index, the same PC and the
 > same Command Processor state. `run-boot.sh` separately compares a full instruction trace over the
 > first 20,000 steps (`MATCH -- 20000 steps identical`).
+
+**The draws are not in the FIFO.** The game emits `GX_CMD_CALL_DL` and the drawing commands live in
+guest memory, not in the command stream. A 256 KB live capture contains 400 display lists and
+**zero draws**. Dolphin's own recorder expands display lists inline before writing a `.dff`
+(`OpcodeDecoding.cpp:234` skips recording the `CALL_DL` opcode itself), which is why
+`harness/traces/*.dff` shows 238 real draws and a live capture shows none. **Following display
+lists into guest memory is the next piece of work** — until then the live path sees register state
+and nothing drawn.
+
+This was found by a decoder bug, not despite one: `CALL_DL` consumes nine bytes (opcode + u32
+address + u32 size) and the decoder skipped one, walking into the address field and reading it as
+opcodes. It invented a 34,583-vertex tri-strip out of a pointer — more geometry than the entire
+title screen's 3,667 vertices. **100% decode coverage was reported throughout**, because coverage
+measures whether the walker consumed the bytes, not whether it understood them. The lesson
+generalises past this decoder: *a metric that cannot distinguish comprehension from consumption is
+not a correctness check.*
 
 **The FIFO decodes.** `harness/src/decode_capture.py` decodes a GX command stream captured live out
 of `Core/HW/GPFifo.cpp`'s gather-pipe flush (patch 0008), rather than from a `.dff` recording. A
