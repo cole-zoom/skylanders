@@ -44,7 +44,9 @@
 #include "Core/HW/GCKeyboard.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/Wiimote.h"
+#include "InputCommon/ControllerEmu/ControllerEmu.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "InputCommon/InputConfig.h"
 #include "Core/HW/EXI/EXI_Device.h"
 #include "Core/HW/CPU.h"
 #include "Core/DSPEmulator.h"
@@ -174,6 +176,30 @@ static void EmitBase64(const std::vector<u8>& v)
 // (SyncGPUCallback alone is every 1000 ticks) and logging 64 million steps of
 // them is neither transportable out of a browser nor necessary.
 static bool g_event_log_on = false;
+
+// ── synthetic input ──
+//
+// The game draws an attract loop and stops loading from the disc: 454 disc
+// requests at 3 billion instructions and still 454 at ten billion, while it
+// renders 2,839 two-dimensional quads and polls the Bluetooth adapter. It is
+// waiting to be told to continue, and nothing in this harness ever presses
+// anything.
+//
+// Dolphin exposes SetInputOverrideFunction on an emulated controller, so this
+// needs no patch -- the override is consulted wherever the controller would
+// otherwise read a real device.
+//
+// The schedule is a pure function of the instruction count, which is what
+// makes it usable in a differential: both targets press at exactly the same
+// instruction. Anything driven by wall-clock would make the two runs
+// incomparable, which is the mistake that took the network offline.
+static bool g_press_a = false;
+
+// One emulated second is about 729 million instructions (the Wii CPU clock,
+// and this harness advances one tick per instruction). Press for ~0.2s every
+// ~2s: long enough to register, with gaps long enough for a menu to act on it.
+static constexpr u64 PRESS_PERIOD = 1458000000ull;  // ~2.0s
+static constexpr u64 PRESS_LENGTH = 150000000ull;   // ~0.2s
 // The step the CPU loop is on, so an event can be tied to an instruction
 // count. Ticks and steps are NOT the same clock: CoreTiming advances by
 // slice_length - downcount, and the apploader runs before stepping begins, so
@@ -278,6 +304,7 @@ int main(int argc, char** argv)
   // milestone is browser time spent learning nothing.
   bool stop_at_fifo = false;
   bool want_events = false;
+  bool want_input = false;
   u64 checkpoint = 0;
   u64 trace_from = 0;
   u64 dump_at = 0;
@@ -289,6 +316,10 @@ int main(int argc, char** argv)
       stop_at_fifo = true;
     else if (std::strcmp(argv[i], "--events") == 0)
       want_events = true;
+    // --input: drive the A button on a fixed, instruction-count schedule.
+    // Opt-in so that every existing differential baseline keeps its meaning.
+    else if (std::strcmp(argv[i], "--input") == 0)
+      want_input = true;
     // --checkpoint=N: emit a trace line every N steps instead of every step.
     // A full trace to the first FIFO write would be 63 million lines, which is
     // not transportable out of a browser. Checkpoints every 100k give ~630
@@ -422,6 +453,27 @@ int main(int argc, char** argv)
   // targets different by construction, and the cost surfaces nowhere near the
   // change.
   Wiimote::Initialize(Wiimote::InitializeMode::DO_NOT_WAIT_FOR_WIIMOTES);
+
+  if (want_input)
+  {
+    // The override is consulted wherever the emulated Wiimote would read a
+    // real device, so no Dolphin patch is needed and no actual input backend
+    // has to exist -- which matters in a browser, where there is none.
+    if (InputConfig* cfg = Wiimote::GetConfig())
+    {
+      if (auto* controller = cfg->GetController(0))
+      {
+        controller->SetInputOverrideFunction(
+            [](std::string_view group, std::string_view control,
+               ControlState state) -> std::optional<ControlState> {
+              if (group == "Buttons" && control == "A")
+                return g_press_a ? 1.0 : 0.0;
+              return std::nullopt;
+            });
+        check(true, "synthetic input installed (A on a fixed schedule)");
+      }
+    }
+  }
   check(true, "controller configs loaded");
 
   // Three config choices below, all about threads.
@@ -740,6 +792,8 @@ int main(int argc, char** argv)
     // logging on from the first step, which --from cannot express: a window
     // starting at zero is indistinguishable from "no window".
     g_cur_step = i;
+    if (want_input)
+      g_press_a = (i % PRESS_PERIOD) < PRESS_LENGTH;
     if (i >= trace_from && (want_events || trace_from))
       g_event_log_on = true;
 
