@@ -18,6 +18,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
+#include "Common/IOFile.h"
 #include "Core/Boot/Boot.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigLoaders/BaseConfigLoader.h"
@@ -54,6 +56,8 @@
 #include "Core/HW/HW.h"
 #include "Core/HW/Memmap.h"
 #include "Core/IOS/IOS.h"
+#include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
+#include "Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
@@ -220,6 +224,26 @@ static u64 g_cur_step = 0;
 // target looks like. Refusing the device symmetrically is both deterministic
 // and honest; refusing it on one target only would be the exact mistake that
 // caused the Wiimote divergence.
+extern "C" void harness_usb_device(unsigned vid, unsigned pid, const char* name)
+{
+  // Each distinct device once, ever.
+  //
+  // The USB scanner rescans every 50ms for the lifetime of the process, so an
+  // unconditional print here emits the same line thousands of times -- and
+  // keeps emitting after the step loop has finished, because the scanner is
+  // on its own thread. A browser run never terminated: the step marker sat at
+  // "stepping 1996M" while the line count climbed past 19,000.
+  //
+  // Not gated on the event window, because device presence is exactly the
+  // kind of per-target difference that is invisible until it costs hundreds
+  // of millions of instructions, and it is established before any window
+  // would open.
+  static std::set<std::pair<unsigned, unsigned>> seen;
+  if (!seen.insert({vid, pid}).second)
+    return;
+  std::printf("  usb device %04x:%04x %s\n", vid, pid, name);
+}
+
 extern "C" int harness_block_device(const char* path)
 {
   return std::strncmp(path, "/dev/net/", 9) == 0 ? 1 : 0;
@@ -305,6 +329,8 @@ int main(int argc, char** argv)
   bool stop_at_fifo = false;
   bool want_events = false;
   bool want_input = false;
+  bool want_skylander = false;
+  u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
   u64 trace_from = 0;
   u64 dump_at = 0;
@@ -320,6 +346,15 @@ int main(int argc, char** argv)
     // Opt-in so that every existing differential baseline keeps its meaning.
     else if (std::strcmp(argv[i], "--input") == 0)
       want_input = true;
+    // --skylander[=ID:VAR]: create a figure and place it on the portal.
+    // Defaults to Whirlwind (0, 0x0000), one of the figures that shipped with
+    // Spyro's Adventure, so the id/var pair is known-good for this disc.
+    else if (std::strncmp(argv[i], "--skylander", 11) == 0)
+    {
+      want_skylander = true;
+      if (argv[i][11] == '=')
+        std::sscanf(argv[i] + 12, "%hu:%hx", &sky_id, &sky_var);
+    }
     // --checkpoint=N: emit a trace line every N steps instead of every step.
     // A full trace to the first FIFO write would be 63 million lines, which is
     // not transportable out of a browser. Checkpoints every 100k give ~630
@@ -634,6 +669,33 @@ int main(int argc, char** argv)
   HW::Init(system, nullptr);
   INIT_MARK("HW::Init done");
   check(system.GetMemory().GetRAM() != nullptr, "hardware up, guest memory allocated");
+
+  // ── the Portal of Power ──
+  //
+  // This is the point of the whole project: Skylanders reads figures over USB
+  // from a toy portal, and a browser has no USB. Dolphin emulates the portal
+  // (VID 0x1430, PID 0x0150) and knows 517 figure variants, so "every
+  // Skylander available" is a matter of generating the right 1 KB of NFC data
+  // rather than owning the toys.
+  //
+  // A figure is file-backed: Create() writes the encrypted MIFARE image, and
+  // LoadSkylander() places it in a portal slot. MEMFS is a real filesystem as
+  // far as this code is concerned, so the browser creates figures the same way
+  // native does -- no special case.
+  if (want_skylander)
+  {
+    const std::string sky_path = user_dir + "figure.sky";
+    {
+      IOS::HLE::USB::SkylanderFigure figure(sky_path);
+      check(figure.Create(sky_id, sky_var), "Skylander figure data created");
+      figure.Close();
+    }
+    File::IOFile sky_file(sky_path, "r+b");
+    const u8 slot = system.GetSkylanderPortal().LoadSkylander(
+        std::make_unique<IOS::HLE::USB::SkylanderFigure>(std::move(sky_file)));
+    check(slot != 0xFF, "Skylander placed on the portal");
+    std::printf("  skylander id=%u var=0x%04x -> portal slot %u\n", sky_id, sky_var, slot);
+  }
 
   // ── video ──
   // After HW::Init, matching Core.cpp: HW::Init runs at Core.cpp:580 and the
