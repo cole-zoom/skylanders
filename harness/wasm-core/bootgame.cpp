@@ -182,6 +182,23 @@ static bool g_event_log_on = false;
 // only place left to look.
 static u64 g_cur_step = 0;
 
+// Take the Wii network offline, on BOTH targets.
+//
+// /dev/net/ip/top performs real host socket operations. Native leaves a socket
+// op pending; Emscripten's socket emulation answers immediately. That showed
+// up as a divergence at 531 million instructions -- but the deeper problem is
+// that it makes the ORACLE depend on host network state, so native would not
+// even reproduce against itself on a different network.
+//
+// A browser has no raw sockets, so "no Wii network" is also what the real
+// target looks like. Refusing the device symmetrically is both deterministic
+// and honest; refusing it on one target only would be the exact mistake that
+// caused the Wiimote divergence.
+extern "C" int harness_block_device(const char* path)
+{
+  return std::strncmp(path, "/dev/net/", 9) == 0 ? 1 : 0;
+}
+
 extern "C" void harness_ios_reply(unsigned command, unsigned fd, int return_value,
                                   long long cycles, const char* device)
 {
@@ -828,7 +845,12 @@ int main(int argc, char** argv)
   if (g_gx_limit)
   {
     std::printf("  gx cap    %zu bytes of executed command stream\n", g_gx_bytes.size());
-    check(g_gx_bytes.size() >= g_gx_limit, "captured the requested command stream");
+    // A short capture is only a failure if the capture limit was what should
+    // have stopped the run. With a step cap and a generous byte limit -- the
+    // shape used to compare two targets over a FIXED instruction count -- the
+    // steps run out first, and that is the intended outcome, not a failure.
+    check(g_gx_bytes.size() >= g_gx_limit || executed >= steps,
+          "captured the requested stream, or ran out of steps first");
     EmitBase64(g_gx_bytes);
   }
 

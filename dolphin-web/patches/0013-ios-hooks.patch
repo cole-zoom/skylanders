@@ -1,8 +1,46 @@
 diff --git a/Source/Core/Core/IOS/IOS.cpp b/Source/Core/Core/IOS/IOS.cpp
-index f49b82e..665723e 100644
+index f49b82e..bf2b992 100644
 --- a/Source/Core/Core/IOS/IOS.cpp
 +++ b/Source/Core/Core/IOS/IOS.cpp
-@@ -795,6 +795,27 @@ void EmulationKernel::EnqueueIPCRequest(u32 address)
+@@ -660,6 +660,27 @@ std::shared_ptr<Device> EmulationKernel::GetDeviceByFileDescriptor(const u32 fd)
+ }
+ 
+ // Returns the FD for the newly opened device (on success) or an error code.
++
++// Harness instrumentation hook (weak).
++//
++// Lets a differential harness refuse an IOS device by name, as if it were not
++// present. Needed because some devices make the ORACLE nondeterministic:
++// /dev/net/ip/top performs real host socket operations, so native blocks on a
++// pending socket while wasm's Emscripten socket emulation answers instantly.
++// A reference build whose behaviour depends on host network state cannot be a
++// reference.
++//
++// Refusing the device reuses the existing not-present path (IPC_ENOENT), which
++// is a state the game already has to handle.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) int harness_block_device(const char* path)
++{
++  (void)path;
++  return 0;
++}
++
+ std::optional<IPCReply> EmulationKernel::OpenDevice(OpenRequest& request)
+ {
+   const s32 new_fd = GetFreeDeviceID();
+@@ -687,6 +708,9 @@ std::optional<IPCReply> EmulationKernel::OpenDevice(OpenRequest& request)
+     device = GetDeviceByName("/dev/fs");
+   }
+ 
++  if (device && harness_block_device(request.path.c_str()))
++    device = nullptr;
++
+   if (!device)
+   {
+     constexpr std::string_view cios_devices[] = {"/dev/flash", "/dev/mload", "/dev/sdio/sdhc",
+@@ -795,6 +819,27 @@ void EmulationKernel::EnqueueIPCRequest(u32 address)
  }
  
  // Called to send a reply to an IOS syscall
@@ -30,7 +68,7 @@ index f49b82e..665723e 100644
  void EmulationKernel::EnqueueIPCReply(const Request& request, const s32 return_value,
                                        s64 cycles_in_future, CoreTiming::FromThread from)
  {
-@@ -805,6 +826,15 @@ void EmulationKernel::EnqueueIPCReply(const Request& request, const s32 return_v
+@@ -805,6 +850,15 @@ void EmulationKernel::EnqueueIPCReply(const Request& request, const s32 return_v
    memory.Write_U32(request.command, request.address + 8);
    // IOS also overwrites the command type with the reply type.
    memory.Write_U32(IPC_REPLY, request.address);
