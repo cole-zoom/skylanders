@@ -1,0 +1,58 @@
+# Do the Dolphin patches still apply?
+#
+# dolphin/ is not vendored -- it is cloned and patched -- so the patch set can
+# rot without anything in this repo changing: upstream moves, a hunk stops
+# applying, and the next person to set up a checkout finds out.
+#
+# This is split from ci.yml because it needs a Dolphin clone (a minute or two,
+# against seconds for the rest), and scoped by `paths` so it only runs when the
+# patches or the script that applies them change. Everyday PRs do not pay for
+# it.
+#
+# It deliberately does NOT build. nightly.yml does that. The question here is
+# narrower and much cheaper: do the patches still apply at all?
+#
+# The first nightly run failed in 48 seconds because patch 0003 targets SFML,
+# which is a SUBMODULE, and the paths in it are relative to the submodule root.
+# That had never been exercised because the patches had only ever been applied
+# by hand. This job is that lesson made automatic.
+name: patches
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dolphin-web/patches/**'
+      - 'scripts/apply-patches.sh'
+      - '.github/workflows/patches.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'dolphin-web/patches/**'
+      - 'scripts/apply-patches.sh'
+      - '.github/workflows/patches.yml'
+
+jobs:
+  apply:
+    name: patches apply to a fresh Dolphin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: clone Dolphin
+        # Submodules are required, not optional: patch 0003 lands inside
+        # Externals/SFML/SFML, and without them the apply fails with a
+        # confusing "directory does not exist".
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/dolphin-emu/dolphin.git dolphin
+
+      - name: apply
+        run: scripts/apply-patches.sh dolphin
+
+      - name: applying twice is a no-op
+        # The script reports an already-applied patch as skipped rather than
+        # failing, because re-running setup on an existing checkout is routine.
+        # If that ever regresses, a second run is where it shows.
+        run: scripts/apply-patches.sh dolphin
