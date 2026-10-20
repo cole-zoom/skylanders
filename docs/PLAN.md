@@ -314,10 +314,46 @@ the memory arena with the software MMU path, stub the host USB stack, and bring 
 > **Gate** — Boot to the first rendered frame's FIFO write, verified against the oracle. Speed is
 > irrelevant here; correctness is the whole deliverable.
 >
-> **Status: the CPU half is met, the FIFO half is not.** `harness/wasm-core/run-boot.sh` boots
-> `SSPE52` from the real disc over HTTP ranges on both targets and reports
-> `MATCH -- 20000 steps identical`. What is *not* yet shown is reaching the first FIFO write: 20,000
-> instructions is early boot, not a drawn frame.
+> **Status: met.** `harness/wasm-core/run-fifo.sh` boots `SSPE52` from the real disc on both targets
+> and reaches the first graphics FIFO write at the *same instruction*:
+>
+> ```
+> MATCH -- both targets reach the first FIFO write identically
+>   fifo cfg  step 63034350, pc 0x80370150, base=0x0000d780 end=0x0000d760
+>   fifo wr   step 63034359, pc 0x80370174, wp=0x0000d780 (was 0x00000000)
+> ```
+>
+> 63 million instructions of real game boot, landing on the same step index, the same PC and the
+> same Command Processor state. `run-boot.sh` separately compares a full instruction trace over the
+> first 20,000 steps (`MATCH -- 20000 steps identical`).
+
+**Determinism had to be bought, not assumed.** The first attempt at this comparison failed because
+*native disagreed with itself*: the step index of the first FIFO write drifted by a few hundred
+between runs. `SystemTimers.cpp:253` seeds the emulated clock from
+`Common::Timer::GetLocalTimeSinceJan1970()`, so every run starts the guest at a different wall-clock
+time. Invisible at 20,000 instructions, decisive at 63 million. The harness now pins
+`MAIN_CUSTOM_RTC_ENABLE`/`MAIN_CUSTOM_RTC_VALUE`. **A differential harness has to control every
+host-derived input, and wall-clock is one.**
+
+**The first real divergence this found.** With both sides deterministic, wasm reached the FIFO 515
+instructions after native — reproducibly. Localising it needed three passes, because a 63-million-step
+trace is not transportable out of a browser: checkpoints every 100k steps narrowed it to a 100k
+window, a traced window narrowed it to one step, and a register dump named the instruction.
+
+The divergence was at `lwz r24, 204(r3)` — a *load*, with `r3 = 0x80000000`, so it reads the
+low-memory global at `0x800000CC`. `Boot_BS2Emu.cpp:512` writes `IsNTSC(m_region) ? 0 : 1` there
+("Fake the VI Init of the IPL"). `SConfig::m_region` is declared at `ConfigManager.h:53` **with no
+initialiser**, and it is set by `SetPathsAndGameMetadata`, which only `BootManager::BootCore` calls —
+a path the harness skipped by invoking `CBoot::BootUp` directly. So the region was *never set on
+either target*: native read zeroed memory (`NTSC_J` — wrong for a USA disc, but still NTSC, so the
+write came out right by luck) and wasm read reused heap and got `4606276`, which is not a `Region` at
+all. The game read the wrong video standard back 59.7 million instructions later and branched
+differently.
+
+This is the bug class the differential exists to catch — **identical code, identical input, and a
+divergence that exists only because one target's uninitialised memory happens to be zero.** It would
+never have been found by testing either target alone, and it was invisible for the first 59 million
+instructions.
 
 **What the browser boot needed, and what it cost.** Three subsystems had to be configured away
 before `HW::Init` would complete under Emscripten, all for one reason: a `pthread` created from the
