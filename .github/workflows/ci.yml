@@ -15,8 +15,19 @@
 name: ci
 
 on:
+  # Every PR that targets main, and main itself after a merge.
+  #
+  # Both are scoped to main deliberately. Unscoped, a push to a feature branch
+  # with an open PR fires BOTH events and every check runs twice -- which is
+  # what was happening: duplicate entries for each job, doubling the work and
+  # making it ambiguous which run a required-check rule is waiting on.
+  #
+  # Feature branches are still covered, because a PR against main is what
+  # triggers the checks, and merging requires them (branch protection).
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
   decoder:
