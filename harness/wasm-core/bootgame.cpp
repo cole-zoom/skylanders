@@ -606,6 +606,23 @@ int main(int argc, char** argv)
 
   for (u64 i = 0; i < steps; ++i)
   {
+    // Liveness, not logging. The stepping phase produces NO output for
+    // minutes at a time -- a 256 KB capture takes ~4 billion instructions --
+    // so a watchdog based on output alone cannot tell a working run from a
+    // wedged one. Folding the step count into the stage marker gives the
+    // browser-side poller something that advances on its own, which is what
+    // makes a stall timeout safe to apply at all.
+    //
+    // Every 2^22 steps (~4M) so the cost is nothing and the marker still
+    // moves several times a minute under the wasm interpreter.
+    if ((i & 0x3FFFFF) == 0)
+    {
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "stepping %lluM",
+                    static_cast<unsigned long long>(i / 1000000));
+      InitMark(buf);
+    }
+
     if (i >= trace_from && (want_trace || (checkpoint && i % checkpoint == 0)))
       Trace::EmitLine(i, state);
     if (dump_at && i == dump_at)
