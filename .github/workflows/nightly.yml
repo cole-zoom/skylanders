@@ -1,0 +1,84 @@
+# The expensive half of the harness.
+#
+# Separate from ci.yml because these jobs are minutes-to-an-hour, not seconds,
+# and nothing here should sit between a push and a merge.
+#
+# What runs here: the native differential tests that need Dolphin's libraries
+# built but NOT the game disc -- coreboot (Core/PowerPC/IOS/DiscIO bring-up,
+# 67 assertions) and tracetest (instruction-level trace, native vs the expected
+# sequence). Those are the only harness binaries that are disc-free; bootgame
+# and the FIFO capture need a 4.7 GB copyrighted disc that cannot be provided
+# to a hosted runner, so they stay manual.
+#
+# STATUS: unverified. This has not completed a run on a hosted runner yet --
+# the Dolphin build has a long dependency list and the first run is where that
+# gets found out. ci.yml is the workflow that currently gates anything.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  native-differential:
+    name: native differential (no disc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: clone Dolphin
+        # dolphin/ is gitignored here rather than vendored, so CI fetches it
+        # and applies the same patches a local checkout uses.
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/dolphin-emu/dolphin.git dolphin
+
+      - name: apply patches
+        run: |
+          set -euo pipefail
+          for p in dolphin-web/patches/*.patch; do
+            echo "applying $p"
+            git -C dolphin apply --verbose "../$p"
+          done
+
+      - name: build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libasound2-dev libpulse-dev libudev-dev libevdev-dev \
+            libusb-1.0-0-dev libcurl4-openssl-dev libmbedtls-dev \
+            libxi-dev libxrandr-dev libgl1-mesa-dev \
+            libbluetooth-dev libhidapi-dev libsystemd-dev \
+            libminiupnpc-dev libpugixml-dev liblzo2-dev \
+            libzstd-dev libbz2-dev zlib1g-dev libspng-dev
+
+      - name: configure (ENABLE_GENERIC, matching link-native.sh)
+        # ENABLE_GENERIC is not a preference: wasm cannot JIT, so the oracle
+        # has to be the interpreter too or the differential compares two
+        # different execution engines.
+        run: |
+          cmake -S dolphin -B dolphin-web/build-native-generic -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_GENERIC=ON \
+            -DENABLE_QT=OFF -DENABLE_NOGUI=OFF -DENABLE_TESTS=OFF \
+            -DENABLE_AUTOUPDATE=OFF -DENABLE_ANALYTICS=OFF -DENABLE_LTO=OFF \
+            -DUSE_MGBA=OFF -DUSE_RETRO_ACHIEVEMENTS=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF -DENABLE_VULKAN=OFF -DENABLE_SDL=OFF
+
+      - name: build libraries
+        run: ninja -C dolphin-web/build-native-generic Source/Core/Core/libcore.a
+
+      - name: coreboot differential
+        run: |
+          harness/wasm-core/link-native.sh harness/wasm-core/coreboot.cpp /tmp/coreboot
+          /tmp/coreboot
+
+      - name: instruction trace
+        run: |
+          harness/wasm-core/link-native.sh harness/wasm-core/tracetest.cpp /tmp/tracetest
+          /tmp/tracetest > /tmp/trace.txt
+          grep -c '^T ' /tmp/trace.txt
