@@ -37,12 +37,12 @@ jobs:
             https://github.com/dolphin-emu/dolphin.git dolphin
 
       - name: apply patches
-        run: |
-          set -euo pipefail
-          for p in dolphin-web/patches/*.patch; do
-            echo "applying $p"
-            git -C dolphin apply --verbose "../$p"
-          done
+        # Not a plain loop over the patch directory: 0003 patches SFML, which
+        # is a submodule, so its paths are relative to the submodule root. A
+        # top-level loop fails on it, which is exactly how the first nightly
+        # run failed. scripts/apply-patches.sh owns that mapping so CI and a
+        # human checkout cannot diverge.
+        run: scripts/apply-patches.sh dolphin
 
       - name: build dependencies
         run: |

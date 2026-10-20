@@ -107,6 +107,32 @@ extern "C" void harness_gp_bytes(const u8* data, size_t size)
   g_fifo_bytes.insert(g_fifo_bytes.end(), data, data + size);
 }
 
+// The EXECUTED command stream, with display lists expanded.
+//
+// Two different things are worth capturing and they are not the same stream:
+//
+//   gather pipe   what the CPU wrote. Contains CALL_DL pointers and none of
+//                 the geometry they refer to, because a display list's body
+//                 lives in guest memory and never crosses the FIFO. A 256 KB
+//                 capture this way held 400 display lists and ZERO draws.
+//
+//   commands      what the GPU executed, display lists followed. This is the
+//                 same shape Dolphin's FifoRecorder writes to a .dff, so the
+//                 existing decoder reads it unchanged.
+//
+// Keeping both is deliberate: the first is the transport, the second is the
+// content, and the difference between them is exactly how much of this game's
+// geometry is hiding in display lists.
+static std::vector<u8> g_gx_bytes;
+static size_t g_gx_limit = 0;
+
+extern "C" void harness_gx_command(const u8* data, u32 size)
+{
+  if (g_gx_limit == 0 || g_gx_bytes.size() >= g_gx_limit)
+    return;
+  g_gx_bytes.insert(g_gx_bytes.end(), data, data + size);
+}
+
 // base64, so the capture costs 1.33 bytes per byte through the CDP channel
 // instead of 2 for hex. Written out rather than pulled from a library because
 // the harness links no base64 and this is twenty lines.
@@ -211,6 +237,10 @@ int main(int argc, char** argv)
     // count, because the interesting thing is the commands, not the distance.
     else if (std::strncmp(argv[i], "--capture-fifo=", 15) == 0)
       g_fifo_limit = std::strtoull(argv[i] + 15, nullptr, 0);
+    // --capture-gx=N: capture N bytes of EXECUTED command stream, display
+    // lists followed. This is the one that contains geometry.
+    else if (std::strncmp(argv[i], "--capture-gx=", 13) == 0)
+      g_gx_limit = std::strtoull(argv[i] + 13, nullptr, 0);
   }
 
 #if defined(__EMSCRIPTEN__)
@@ -624,6 +654,8 @@ int main(int argc, char** argv)
       break;
     if (g_fifo_limit && g_fifo_bytes.size() >= g_fifo_limit)
       break;
+    if (g_gx_limit && g_gx_bytes.size() >= g_gx_limit)
+      break;
   }
 
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
@@ -653,7 +685,7 @@ int main(int argc, char** argv)
 
   // Both --until-fifo and --capture-fifo stop early ON PURPOSE, so the step
   // count is not the success condition for them -- staying on valid code is.
-  const bool early_stop_ok = stop_at_fifo || g_fifo_limit;
+  const bool early_stop_ok = stop_at_fifo || g_fifo_limit || g_gx_limit;
   check(early_stop_ok ? state.pc != 0 : executed == steps,
         early_stop_ok ? "ran until the stop condition without falling off"
                       : "ran the full step count without falling off");
@@ -669,9 +701,15 @@ int main(int argc, char** argv)
 
   if (g_fifo_limit)
   {
-    std::printf("  fifo cap  %zu bytes of GX command stream\n", g_fifo_bytes.size());
-    check(g_fifo_bytes.size() >= g_fifo_limit, "captured the requested command stream");
+    std::printf("  fifo cap  %zu bytes of gather-pipe stream\n", g_fifo_bytes.size());
+    check(g_fifo_bytes.size() >= g_fifo_limit, "captured the requested gather-pipe stream");
     EmitBase64(g_fifo_bytes);
+  }
+  if (g_gx_limit)
+  {
+    std::printf("  gx cap    %zu bytes of executed command stream\n", g_gx_bytes.size());
+    check(g_gx_bytes.size() >= g_gx_limit, "captured the requested command stream");
+    EmitBase64(g_gx_bytes);
   }
 
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);

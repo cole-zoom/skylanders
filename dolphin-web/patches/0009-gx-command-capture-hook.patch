@@ -1,0 +1,42 @@
+diff --git a/Source/Core/VideoCommon/OpcodeDecoding.cpp b/Source/Core/VideoCommon/OpcodeDecoding.cpp
+index fc6f896..cf1dcdf 100644
+--- a/Source/Core/VideoCommon/OpcodeDecoding.cpp
++++ b/Source/Core/VideoCommon/OpcodeDecoding.cpp
+@@ -32,6 +32,28 @@
+ 
+ namespace OpcodeDecoder
+ {
++
++// Harness capture hook (weak).
++//
++// Called for every GX command in EXECUTION order. Because OnDisplayList
++// re-enters Run() with this same callback, the commands inside a display list
++// arrive here too -- which is the whole point: a display list's body lives in
++// guest memory, not in the FIFO, so a capture taken at the gather pipe
++// contains a CALL_DL pointer and none of the geometry it refers to.
++//
++// GX_CMD_CALL_DL itself is skipped for the same reason Dolphin's own
++// FifoRecorder skips it (see OnCommand below): the body is already arriving
++// command by command, so keeping the call as well would make the stream
++// self-referential and double-count.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_gx_command(const u8* data, u32 size)
++{
++  (void)data;
++  (void)size;
++}
++
+ bool g_record_fifo_data = false;
+ 
+ template <bool is_preprocess>
+@@ -235,6 +257,8 @@ public:
+       {
+         Core::System::GetInstance().GetFifoRecorder().WriteGPCommand(data, size);
+       }
++      if (static_cast<Opcode>(data[0]) != Opcode::GX_CMD_CALL_DL)
++        harness_gx_command(data, size);
+     }
+   }
+ 
