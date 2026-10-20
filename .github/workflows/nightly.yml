@@ -59,7 +59,13 @@ jobs:
         # harness and libcore disagree about a type that crosses between them
         # -- an ODR violation that links cleanly and misbehaves at runtime.
         # Installing it here makes CI match the development machine.
-        run: brew install cmake ninja pkg-config fmt
+        #
+        # The rest of the list is link-native.sh's -l flags, minus what the
+        # macOS SDK already provides (bz2, curl, iconv, resolv). Discovering
+        # them one failed run at a time costs ten minutes of Dolphin build per
+        # missing library, so they go in together.
+        run: |
+          brew install cmake ninja pkg-config fmt ffmpeg lzo zstd lz4 xz xxhash libusb
 
       - name: configure (ENABLE_GENERIC, matching link-native.sh)
         # ENABLE_GENERIC is not a preference: wasm cannot JIT, so the oracle
