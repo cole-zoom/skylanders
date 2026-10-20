@@ -1,0 +1,39 @@
+diff --git a/Source/Core/Core/CoreTiming.cpp b/Source/Core/Core/CoreTiming.cpp
+index 1fa39d7..9b108da 100644
+--- a/Source/Core/Core/CoreTiming.cpp
++++ b/Source/Core/Core/CoreTiming.cpp
+@@ -34,6 +34,25 @@
+ 
+ namespace CoreTiming
+ {
++// Harness instrumentation hook (weak).
++//
++// Reports every event dispatch as (name, scheduled tick, current tick). Used
++// to answer a question CPU-state differentials cannot: when native and wasm
++// hold IDENTICAL guest registers but one has taken an interrupt and the other
++// has not, the difference is not in what was computed, it is in WHEN a
++// scheduled event fired. That is invisible to a register trace and obvious
++// here.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_core_event(const char* name, long long scheduled,
++                                                         long long now)
++{
++  (void)name;
++  (void)scheduled;
++  (void)now;
++}
++
+ static constexpr int MAX_SLICE_LENGTH = 20000;
+ 
+ static void EmptyTimedCallback(Core::System& system, u64 userdata, s64 cyclesLate)
+@@ -366,6 +385,8 @@ void CoreTimingManager::Advance()
+     Event evt = m_event_queue.front();
+     std::ranges::pop_heap(m_event_queue, std::ranges::greater{});
+     m_event_queue.pop_back();
++    harness_core_event(evt.type->name->c_str(), static_cast<long long>(evt.time),
++                       static_cast<long long>(m_globals.global_timer));
+     evt.type->callback(m_system, evt.userdata, m_globals.global_timer - evt.time);
+   }
+ 
