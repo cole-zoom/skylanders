@@ -55,6 +55,16 @@ struct StateLayout
   uint32_t ram_mask = 0x01FFFFFF;     // offset within MEM1 (24 MB, mirrored)
   uint32_t guard_mask = 0xFE000000;   // the bits that identify the region
   uint32_t guard_value = 0x80000000;  // ... and what they must equal
+
+  // The condition register is NOT stored as PowerPC's four bits. Dolphin
+  // keeps eight 64-bit fields in an encoding chosen so that common tests are
+  // cheap, built from a 16-entry lookup table. Compiled code shares guest
+  // state with the interpreter, so it has to produce that same encoding --
+  // and the least error-prone way is to use the very same table rather than
+  // re-deriving it.
+  uint32_t cr_offset = 0;        // offsetof(PowerPCState, cr)
+  uint32_t xer_so_ov_offset = 0; // offsetof(PowerPCState, xer_so_ov)
+  uint32_t cr_table_base = 0;    // host address of ConditionRegister::s_crTable
 };
 
 namespace detail
@@ -209,6 +219,83 @@ inline void EmitLoadBE32(Bytes& b, uint32_t ea_local)
       b.push_back(kI32Or);
   }
 }
+
+// Emit a comparison of local 1 against local 2 into cr.fields[crf].
+//
+// PowerPC's four condition bits are LT=8, GT=4, EQ=2, SO=1, and the SO bit
+// comes from XER rather than the comparison -- dropping it is a silent
+// correctness bug, so it is read from guest state here.
+//
+// The resulting 4-bit value indexes Dolphin's s_crTable, whose entries are
+// the 64-bit internal encoding. Using the table rather than recomputing the
+// encoding means this cannot drift from the interpreter.
+inline void EmitCompareToCR(Bytes& b, const StateLayout& l, uint32_t crf, bool is_signed)
+{
+  // Address for the i64 store comes first: the value is built on top of it.
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+
+  // (a < b) << 3
+  b.push_back(kLocalGet);
+  PutU32(b, 1);
+  b.push_back(kLocalGet);
+  PutU32(b, 2);
+  b.push_back(is_signed ? kI32LtS : kI32LtU);
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32Shl);
+
+  // | (a > b) << 2
+  b.push_back(kLocalGet);
+  PutU32(b, 1);
+  b.push_back(kLocalGet);
+  PutU32(b, 2);
+  b.push_back(is_signed ? kI32GtS : kI32GtU);
+  b.push_back(kI32Const);
+  PutI32(b, 2);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Or);
+
+  // | (a == b) << 1
+  b.push_back(kLocalGet);
+  PutU32(b, 1);
+  b.push_back(kLocalGet);
+  PutU32(b, 2);
+  b.push_back(kI32Eq);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Or);
+
+  // | XER[SO], which lives as (SO << 1) | OV in a byte of guest state.
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load8U);
+  PutU32(b, 0);
+  PutU32(b, l.xer_so_ov_offset);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32ShrU);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32And);
+  b.push_back(kI32Or);
+
+  // s_crTable[flags] -- eight bytes per entry.
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.cr_table_base));
+  b.push_back(kI32Add);
+  b.push_back(kI64Load);
+  PutU32(b, 3);  // alignment 2^3
+  PutU32(b, 0);
+
+  b.push_back(kI64Store);
+  PutU32(b, 3);
+  PutU32(b, l.cr_offset + crf * 8);
+}
 }  // namespace detail
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
@@ -297,6 +384,24 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       if (Rc(ins))
         break;
       const uint32_t xo = XO(ins);
+
+      // cmp (XO 0) and cmpl (XO 32) are compares, not arithmetic.
+      if (xo == 0 || xo == 32)
+      {
+        const bool is_signed = (xo == 0);
+        const uint32_t crf = (RS(ins) >> 2) & 7;
+        LoadGpr(body, layout, RA(ins));
+        body.push_back(kLocalSet);
+        PutU32(body, 1);
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kLocalSet);
+        PutU32(body, 2);
+        EmitCompareToCR(body, layout, crf, is_signed);
+        used_locals = used_locals < 3 ? 3 : used_locals;
+        handled = true;
+        break;
+      }
+
       uint8_t wasm_op = 0;
       bool swap = false;  // subf computes rB - rA, the reverse of the field order
       switch (xo)
@@ -333,6 +438,27 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       }
       body.push_back(wasm_op);
       EndStoreGpr(body, layout, writes_rd ? RS(ins) : RA(ins));
+      handled = true;
+      break;
+    }
+
+    case 11:  // cmpi  crfD, rA, SIMM   (signed)
+    case 10:  // cmpli crfD, rA, UIMM   (unsigned)
+    {
+      const bool is_signed = (op == 11);
+      const uint32_t crf = (RS(ins) >> 2) & 7;
+      LoadGpr(body, layout, RA(ins));
+      body.push_back(kLocalSet);
+      PutU32(body, 1);
+      body.push_back(kI32Const);
+      if (is_signed)
+        PutI32(body, SIMM(ins));
+      else
+        PutI32(body, static_cast<int32_t>(UIMM(ins)));
+      body.push_back(kLocalSet);
+      PutU32(body, 2);
+      EmitCompareToCR(body, layout, crf, is_signed);
+      used_locals = used_locals < 3 ? 3 : used_locals;
       handled = true;
       break;
     }
