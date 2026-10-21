@@ -162,13 +162,26 @@ int main()
     check(r.end_pc == 0x8000100C, "end pc follows the last instruction");
     check(!r.module.empty(), "a module is produced");
 
-    // A branch is not supported, so the block must END there rather than
-    // translating past it -- compiling a branch as a no-op would produce code
-    // that silently falls through.
-    const uint32_t with_branch[] = {0x38600005, 0x48000010, 0x38830007};
-    auto b = ppc2wasm::CompileBlock(with_branch, 0x80001000, 3, L);
+    // Floating point is not translated, so the block must END there rather
+    // than skipping it -- translating past an instruction would produce code
+    // that silently computes the wrong thing.
+    const uint32_t with_float[] = {0x38600005, 0xFC21002A, 0x38830007};  // fadd in the middle
+    auto b = ppc2wasm::CompileBlock(with_float, 0x80001000, 3, L);
     check(b.instructions == 1, "a block stops at the first unsupported instruction");
     check(b.end_pc == 0x80001004, "end pc points AT the unsupported instruction");
+
+    // A branch IS translated, and terminates the block: control leaves, so
+    // whatever follows belongs to a different block.
+    const uint32_t with_branch[] = {0x38600005, 0x48000010, 0x38830007};
+    auto br = ppc2wasm::CompileBlock(with_branch, 0x80001000, 3, L);
+    check(br.instructions == 2, "a branch is translated and ends the block");
+    check(br.end_pc == 0x80001008, "end pc is past the branch, not at it");
+
+    // A conditional branch that also decrements CTR is not modelled.
+    // Treating it as a plain conditional would skip the decrement and spin.
+    const uint32_t ctr_branch[] = {0x4200FFFC};  // bdnz
+    auto cb = ppc2wasm::CompileBlock(ctr_branch, 0x80001000, 1, L);
+    check(cb.instructions == 0, "a CTR-decrementing branch stops the block");
 
     // The dot forms set the condition register, which is not modelled. They
     // must stop the block, not be treated as their non-dot twins.
@@ -198,7 +211,7 @@ int main()
     auto cp = ppc2wasm::CompileBlock(cmps, 0x80001000, 2, L);
     check(cp.instructions == 2, "immediate and register compares both compile");
 
-    const uint32_t nothing[] = {0x48000010};
+    const uint32_t nothing[] = {0xFC21002A};  // fadd, not translated
     auto n = ppc2wasm::CompileBlock(nothing, 0x80001000, 1, L);
     check(n.module.empty(), "a block that compiles nothing produces no module");
   }

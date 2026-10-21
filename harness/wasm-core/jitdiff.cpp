@@ -124,6 +124,7 @@ int main()
   layout.xer_so_ov_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_so_ov));
   // The interpreter's own table, by address. Recomputing the encoding here
   // would be a second source of truth for something that must match exactly.
+  layout.spr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, spr));
   layout.cr_table_base =
       static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data()));
   std::printf("  gpr offset in PowerPCState: %u\n", layout.gpr_offset);
@@ -175,6 +176,26 @@ int main()
       {"cmpw into cr3", {0x3860'0007, 0x3880'0007, 0x7D83'2000}},
       {"cmplw register unsigned", {0x3860'FFFF, 0x3880'0002, 0x7C03'2040}},
 
+      // ── branches ──
+      // The block must return the TARGET, not the fall-through, so the
+      // interpreter does not have to re-execute the branch.
+      {"unconditional branch forward", {0x3860'0001, 0x4800'0010}},
+      {"unconditional branch backward", {0x3860'0001, 0x4BFF'FFFC}},
+      // bl must also leave the return address in the link register.
+      {"bl sets the link register", {0x3860'0001, 0x4800'0011}},
+      // beq cr0 taken: compare equal, then branch if EQ.
+      {"beq taken", {0x3860'0005, 0x2C03'0005, 0x4182'0008}},
+      // beq not taken: the block falls through to the next PC.
+      {"beq not taken", {0x3860'0009, 0x2C03'0005, 0x4182'0008}},
+      // bne is the same instruction testing the bit as FALSE.
+      {"bne taken", {0x3860'0009, 0x2C03'0005, 0x4082'0008}},
+      {"bne not taken", {0x3860'0005, 0x2C03'0005, 0x4082'0008}},
+      // blt / bgt exercise the other two condition bits, which are extracted
+      // from the 64-bit encoding differently from EQ.
+      {"blt taken", {0x3860'0001, 0x2C03'0005, 0x4180'0008}},
+      {"bgt taken", {0x3860'0009, 0x2C03'0005, 0x4181'0008}},
+      {"bgt not taken when equal", {0x3860'0005, 0x2C03'0005, 0x4181'0008}},
+
       // ── the guard ──
       // MEM2 lives at 0x90000000 and a compiled block may not touch it, so
       // the block must refuse instruction 2 and hand back its PC.
@@ -195,6 +216,7 @@ int main()
       state.gpr[i] = 0;
     for (int i = 0; i < 8; ++i)
       state.cr.fields[i] = 0;
+    state.spr[SPR_LR] = 0;
     state.pc = state.npc = BASE;
     for (size_t i = 0; i < c.code.size(); ++i)
       ppc.SingleStep();
@@ -203,6 +225,7 @@ int main()
     std::memcpy(expect, state.gpr, sizeof(expect));
     u64 expect_cr[8];
     std::memcpy(expect_cr, state.cr.fields, sizeof(expect_cr));
+    const u32 expect_lr = state.spr[SPR_LR];
     const u32 expect_pc = state.pc;
 
     // ── recompiled ──
@@ -228,6 +251,7 @@ int main()
       state.gpr[i] = 0;
     for (int i = 0; i < 8; ++i)
       state.cr.fields[i] = 0;
+    state.spr[SPR_LR] = 0;
     state.pc = state.npc = BASE;
 
     BlockFn f = reinterpret_cast<BlockFn>(idx);
@@ -256,6 +280,9 @@ int main()
           first_bad = i;
       }
     }
+    const bool lr_same = (state.spr[SPR_LR] == expect_lr);
+    if (!lr_same)
+      same = false;
     int bad_cr = -1;
     for (int i = 0; i < 8; ++i)
     {
@@ -280,6 +307,8 @@ int main()
         std::printf("      cr%d interpreter=%016llx recompiled=%016llx\n", bad_cr,
                     static_cast<unsigned long long>(expect_cr[bad_cr]),
                     static_cast<unsigned long long>(state.cr.fields[bad_cr]));
+      if (!lr_same)
+        std::printf("      lr  interpreter=%08x recompiled=%08x\n", expect_lr, state.spr[SPR_LR]);
       if (got_pc != expect_pc)
         std::printf("      pc  interpreter=%08x recompiled=%08x\n", expect_pc, got_pc);
     }
