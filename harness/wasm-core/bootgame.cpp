@@ -346,6 +346,75 @@ static void check(bool ok, const char* what)
     ++g_failures;
 }
 
+// ── framebuffer capture ──
+//
+// The XFB is YUYV 4:2:2 in GUEST memory: the buffer the Video Interface scans
+// out. Reading it needs no cooperation from the video backend, which matters
+// because headless has no presentation path at all.
+//
+// 640x480 is this title's NTSC framebuffer. No VI register is consulted, so
+// another video mode would come out skewed with no warning.
+static constexpr u32 XFB_W = 640, XFB_H = 480;
+
+static std::vector<u8> ReadXfbYuv(Core::System& system, u32 xfb)
+{
+  std::vector<u8> yuv(static_cast<size_t>(XFB_W) * XFB_H * 2);
+  auto& mem = system.GetMemory();
+  for (size_t off = 0; off < yuv.size(); off += 4)
+  {
+    const u32 word = mem.Read_U32(xfb + static_cast<u32>(off));
+    yuv[off + 0] = static_cast<u8>(word >> 24);
+    yuv[off + 1] = static_cast<u8>(word >> 16);
+    yuv[off + 2] = static_cast<u8>(word >> 8);
+    yuv[off + 3] = static_cast<u8>(word);
+  }
+  return yuv;
+}
+
+static std::vector<u8> YuvToRgb(const std::vector<u8>& yuv)
+{
+  std::vector<u8> rgb(static_cast<size_t>(XFB_W) * XFB_H * 3);
+  auto clamp8 = [](double x) { return static_cast<u8>(x < 0 ? 0 : (x > 255 ? 255 : x)); };
+  for (size_t i = 0, p = 0; i < yuv.size(); i += 4, p += 6)
+  {
+    const double y0 = yuv[i], u = yuv[i + 1] - 128.0, y1 = yuv[i + 2], v = yuv[i + 3] - 128.0;
+    rgb[p + 0] = clamp8(y0 + 1.371 * v);
+    rgb[p + 1] = clamp8(y0 - 0.698 * v - 0.336 * u);
+    rgb[p + 2] = clamp8(y0 + 1.732 * u);
+    rgb[p + 3] = clamp8(y1 + 1.371 * v);
+    rgb[p + 4] = clamp8(y1 - 0.698 * v - 0.336 * u);
+    rgb[p + 5] = clamp8(y1 + 1.732 * u);
+  }
+  return rgb;
+}
+
+// A fingerprint, not an image.
+//
+// A full frame is 900 KB, which cannot be emitted thousands of times out of a
+// browser. A hash per frame is eight bytes and answers the question that
+// actually matters across two targets -- WHICH frame first differs -- after
+// which one full frame can be dumped natively and looked at.
+static u64 HashFrame(const std::vector<u8>& bytes)
+{
+  u64 h = 0xcbf29ce484222325ULL;
+  for (const u8 b : bytes)
+  {
+    h ^= b;
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
+static void WritePpm(const std::string& path, const std::vector<u8>& rgb)
+{
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f)
+    return;
+  std::fprintf(f, "P6\n%u %u\n255\n", XFB_W, XFB_H);
+  std::fwrite(rgb.data(), 1, rgb.size(), f);
+  std::fclose(f);
+}
+
 int main(int argc, char** argv)
 {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -369,6 +438,7 @@ int main(int argc, char** argv)
   u32 watch_addr = 0;
   bool want_render = false;
   std::string xfb_path;
+  u64 frame_every = 0;
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--trace") == 0)
@@ -424,6 +494,11 @@ int main(int argc, char** argv)
     // --dump-xfb=PATH: decode the external framebuffer to a PPM.
     else if (std::strncmp(argv[i], "--dump-xfb=", 11) == 0)
       xfb_path = argv[i] + 11;
+    // --frame-every=N: fingerprint the framebuffer every N instructions, and
+    // natively also write each one as PREFIX-NNNN.ppm. The fingerprints are
+    // what cross the browser boundary; the images are for looking at.
+    else if (std::strncmp(argv[i], "--frame-every=", 14) == 0)
+      frame_every = std::strtoull(argv[i] + 14, nullptr, 0);
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -885,6 +960,7 @@ int main(int argc, char** argv)
   std::printf("\n  stepping %llu instructions...\n", static_cast<unsigned long long>(steps));
   u64 executed = 0;
   u32 watch_last = 0;
+  u64 frame_index = 0;
   const u32 first_pc = state.pc;
   u32 min_pc = state.pc, max_pc = state.pc;
 
@@ -953,6 +1029,29 @@ int main(int argc, char** argv)
 
     if (i >= trace_from && (want_trace || (checkpoint && i % checkpoint == 0)))
       Trace::EmitLine(i, state);
+    if (frame_every && i && (i % frame_every) == 0)
+    {
+      const u32 xfb = system.GetVideoInterface().GetXFBAddressTop();
+      if (xfb)
+      {
+        const auto yuv = ReadXfbYuv(system, xfb);
+        std::printf("X frame=%llu step=%llu addr=%08x hash=%016llx\n",
+                    static_cast<unsigned long long>(frame_index),
+                    static_cast<unsigned long long>(i), xfb,
+                    static_cast<unsigned long long>(HashFrame(yuv)));
+#if !defined(__EMSCRIPTEN__)
+        if (!xfb_path.empty())
+        {
+          char name[512];
+          std::snprintf(name, sizeof(name), "%s-%04llu.ppm", xfb_path.c_str(),
+                        static_cast<unsigned long long>(frame_index));
+          WritePpm(name, YuvToRgb(yuv));
+        }
+#endif
+        ++frame_index;
+      }
+    }
+
     if (watch_addr)
     {
       const u32 now = system.GetMemory().Read_U32(watch_addr);
