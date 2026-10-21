@@ -196,6 +196,24 @@ int main()
       {"bgt taken", {0x3860'0009, 0x2C03'0005, 0x4181'0008}},
       {"bgt not taken when equal", {0x3860'0005, 0x2C03'0005, 0x4181'0008}},
 
+      // ── returns, stack frames and SPR moves ──
+      // mtspr LR then blr: the canonical function return.
+      {"mtspr LR then blr returns to it",
+       {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x4E80'0020}},
+      // mfspr reads it back into a register.
+      {"mfspr reads the link register",
+       {0x3C60'8000, 0x7C68'03A6, 0x7C88'02A6}},
+      // CTR is the other register this allows.
+      {"mtspr / mfspr on CTR", {0x3860'1234, 0x7C69'03A6, 0x7C89'02A6}},
+      // stwu is how a stack frame is pushed: store, then update the base.
+      {"stwu stores and updates the base",
+       {0x3C60'8000, 0x6063'6000, 0x3880'4321, 0x9483'FFF0}},
+      // A conditional return, which must read LR before writing it.
+      {"beqlr taken", {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0005,
+                       0x2C04'0005, 0x4D82'0020}},
+      {"beqlr not taken", {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0009,
+                           0x2C04'0005, 0x4D82'0020}},
+
       // ── the guard ──
       // MEM2 lives at 0x90000000 and a compiled block may not touch it, so
       // the block must refuse instruction 2 and hand back its PC.

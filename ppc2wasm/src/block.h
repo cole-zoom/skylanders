@@ -67,6 +67,7 @@ struct StateLayout
   uint32_t cr_table_base = 0;    // host address of ConditionRegister::s_crTable
   uint32_t spr_offset = 0;       // offsetof(PowerPCState, spr)
   uint32_t lr_index = 8;         // SPR_LR
+  uint32_t ctr_index = 9;        // SPR_CTR
 };
 
 namespace detail
@@ -492,6 +493,42 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         break;
       }
 
+      // mfspr / mtspr, restricted to the link and count registers.
+      //
+      // Other SPRs have side effects -- writing the decrementer reschedules
+      // an interrupt, writing a BAT changes address translation -- and a
+      // compiled block that moved those around without telling the rest of
+      // the emulator would be wrong in ways no register comparison catches.
+      if (xo == 339 || xo == 467)
+      {
+        // The SPR field is SPLIT and the halves are swapped, which is the
+        // classic way to decode this one wrong.
+        const uint32_t spr = ((ins >> 16) & 0x1F) | (((ins >> 11) & 0x1F) << 5);
+        if (spr != layout.lr_index && spr != layout.ctr_index)
+          break;
+        if (xo == 339)  // mfspr rD, SPR
+        {
+          BeginStoreGpr(body);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.spr_offset + spr * 4);
+          EndStoreGpr(body, layout, RS(ins));
+        }
+        else  // mtspr SPR, rS
+        {
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          LoadGpr(body, layout, RS(ins));
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.spr_offset + spr * 4);
+        }
+        handled = true;
+        break;
+      }
+
       uint8_t wasm_op = 0;
       bool swap = false;  // subf computes rB - rA, the reverse of the field order
       switch (xo)
@@ -619,6 +656,105 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       }
       handled = true;
       ends_block = true;
+      break;
+    }
+
+    case 19:  // bclr -- the return instruction
+    {
+      if (XO(ins) != 16)
+        break;
+      const uint32_t bo = RS(ins);
+      const uint32_t bi = RA(ins);
+      if ((bo & 0x04) == 0)
+        break;  // CTR-decrementing form, not modelled
+
+      const uint32_t this_pc = start_pc + n * 4;
+      const bool link = (ins & 1) != 0;
+
+      // Read the link register BEFORE any write to it: bclrl both branches
+      // to the old LR and replaces it, and doing those in the wrong order
+      // makes a call return to itself.
+      body.push_back(kLocalGet);
+      PutU32(body, 0);
+      body.push_back(kI32Load);
+      PutU32(body, 2);
+      PutU32(body, layout.spr_offset + layout.lr_index * 4);
+      // The low two bits are not part of the address.
+      body.push_back(kI32Const);
+      PutI32(body, -4);
+      body.push_back(kI32And);
+      body.push_back(kLocalSet);
+      PutU32(body, 1);
+
+      if (link)
+        EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
+
+      if (bo & 0x10)
+      {
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kReturn);
+      }
+      else
+      {
+        EmitCRBit(body, layout, bi);
+        body.push_back(kI32Const);
+        PutI32(body, (bo & 0x08) ? 1 : 0);
+        body.push_back(kI32Eq);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kReturn);
+        body.push_back(kEnd);
+      }
+      used_locals = used_locals < 2 ? 2 : used_locals;
+      handled = true;
+      ends_block = true;
+      break;
+    }
+
+    case 37:  // stwu rS, d(rA) -- store and write the address back
+    {
+      // rA == 0 is an invalid form: there would be no register to update.
+      if (RA(ins) == 0)
+        break;
+      const uint32_t this_pc = start_pc + n * 4;
+      EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
+      EmitGuard(body, layout, 1, this_pc);
+      // Keep the GUEST address: it is what gets written back, not the host
+      // address the store uses.
+      body.push_back(kLocalGet);
+      PutU32(body, 1);
+      body.push_back(kLocalSet);
+      PutU32(body, 3);
+      EmitToHostAddress(body, layout, 1);
+      LoadGpr(body, layout, RS(ins));
+      body.push_back(kLocalSet);
+      PutU32(body, 2);
+      for (int byte = 0; byte < 4; ++byte)
+      {
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        const int shift = 24 - byte * 8;
+        if (shift)
+        {
+          body.push_back(kI32Const);
+          PutI32(body, shift);
+          body.push_back(kI32ShrU);
+        }
+        body.push_back(kI32Store8);
+        PutU32(body, 0);
+        PutU32(body, static_cast<uint32_t>(byte));
+      }
+      BeginStoreGpr(body);
+      body.push_back(kLocalGet);
+      PutU32(body, 3);
+      EndStoreGpr(body, layout, RA(ins));
+      used_locals = used_locals < 4 ? 4 : used_locals;
+      handled = true;
       break;
     }
 
