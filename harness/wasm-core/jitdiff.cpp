@@ -44,7 +44,9 @@ EM_JS(int, InstallModule, (const uint8_t* ptr, int len), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, { env: { memory: wasmMemory } });
+    const inst = new WebAssembly.Instance(mod, {
+      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
+    });
     const idx = wasmTable.length;
     wasmTable.grow(1);
     wasmTable.set(idx, inst.exports.f);
@@ -111,6 +113,13 @@ int main()
   state.msr.IR = 1;
   state.msr.DR = 1;
 
+  // An empty link table: every lookup misses, so a linked block behaves like
+  // an unlinked one and the same expectations hold. What this checks is that
+  // the epilogue itself -- downcount handling, the wrapping block, branches
+  // exiting via br rather than return -- does not change what a block
+  // computes.
+  std::vector<u32> link_table(2 * 4096, 0);
+
   ppc2wasm::StateLayout layout;
   layout.gpr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr));
   layout.memory_pages = static_cast<u32>(MemoryPages());
@@ -125,6 +134,10 @@ int main()
   // The interpreter's own table, by address. Recomputing the encoding here
   // would be a second source of truth for something that must match exactly.
   layout.spr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, spr));
+  layout.downcount_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount));
+  layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
+  layout.link_mask = 4095;
+  layout.enable_linking = true;
   layout.cr_table_base =
       static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data()));
   std::printf("  gpr offset in PowerPCState: %u\n", layout.gpr_offset);
@@ -270,6 +283,7 @@ int main()
     for (int i = 0; i < 8; ++i)
       state.cr.fields[i] = 0;
     state.spr[SPR_LR] = 0;
+    state.downcount = 1000;
     state.pc = state.npc = BASE;
 
     BlockFn f = reinterpret_cast<BlockFn>(idx);

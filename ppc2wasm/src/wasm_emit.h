@@ -87,7 +87,10 @@ enum : uint8_t
   kIf = 0x04,
   kElse = 0x05,
   kEnd = 0x0B,
+  kBr = 0x0C,
   kReturn = 0x0F,
+  kReturnCallIndirect = 0x13,
+  kLocalTee = 0x22,
   kVoid = 0x40,  // block type: no result
   kLocalGet = 0x20,
   kLocalSet = 0x21,
@@ -112,6 +115,7 @@ enum : uint8_t
   kI32LtU = 0x49,
   kI32GtS = 0x4A,
   kI32GtU = 0x4B,
+  kI32LeS = 0x4C,
 
   kI64Load = 0x29,
   kI64Store = 0x37,
@@ -127,6 +131,11 @@ enum : uint8_t
 class ModuleBuilder
 {
 public:
+  // Import the host's indirect function table, so emitted code can
+  // return_call_indirect into another compiled block. Without this a block
+  // can only return to the dispatcher.
+  void ImportTable() { m_import_table = true; }
+
   void ImportMemory(uint32_t initial_pages, uint32_t max_pages, bool shared)
   {
     m_import_memory = true;
@@ -168,18 +177,31 @@ public:
       PutSection(out, 1, p);
     }
 
-    // Import section: linear memory, when the block touches guest state.
-    if (m_import_memory)
+    // Import section: linear memory, and the function table when the block
+    // links onward.
+    if (m_import_memory || m_import_table)
     {
       Bytes p;
-      PutU32(p, 1);
-      PutName(p, "env");
-      PutName(p, "memory");
-      p.push_back(0x02);  // memory
-      // limits flags: bit0 = has max, bit1 = shared
-      p.push_back(static_cast<uint8_t>((m_mem_shared ? 0x02 : 0x00) | 0x01));
-      PutU32(p, m_mem_initial);
-      PutU32(p, m_mem_max);
+      PutU32(p, (m_import_memory ? 1u : 0u) + (m_import_table ? 1u : 0u));
+      if (m_import_memory)
+      {
+        PutName(p, "env");
+        PutName(p, "memory");
+        p.push_back(0x02);  // memory
+        // limits flags: bit0 = has max, bit1 = shared
+        p.push_back(static_cast<uint8_t>((m_mem_shared ? 0x02 : 0x00) | 0x01));
+        PutU32(p, m_mem_initial);
+        PutU32(p, m_mem_max);
+      }
+      if (m_import_table)
+      {
+        PutName(p, "env");
+        PutName(p, "__indirect_function_table");
+        p.push_back(0x01);  // table
+        p.push_back(0x70);  // funcref
+        p.push_back(0x00);  // limits: minimum only
+        PutU32(p, 0);
+      }
       PutSection(out, 2, p);
     }
 
@@ -229,6 +251,7 @@ public:
 
 private:
   bool m_import_memory = false;
+  bool m_import_table = false;
   uint32_t m_mem_initial = 0, m_mem_max = 0;
   bool m_mem_shared = false;
   std::vector<uint8_t> m_params, m_results;

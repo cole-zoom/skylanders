@@ -105,12 +105,24 @@ EM_JS(int, JitInstall, (const uint8_t* ptr, int len), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, { env: { memory: wasmMemory } });
+    // A linked block imports the function table so it can tail-call its
+    // successor. Omitting it fails instantiation with a link error, which
+    // this catch turns into a silent fallback -- every block interpreted,
+    // and the only symptom a run that is SLOWER than no JIT at all.
+    const inst = new WebAssembly.Instance(mod, {
+      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
+    });
     const idx = wasmTable.length;
     wasmTable.grow(1);
     wasmTable.set(idx, inst.exports.f);
     return idx;
   } catch (e) {
+    // Report once. A JIT that silently compiles nothing looks like a slow
+    // JIT rather than a broken one.
+    if (!Module.__jitReported) {
+      Module.__jitReported = 1;
+      out('  jit install failed: ' + e);
+    }
     return -1;
   }
 });
@@ -462,6 +474,7 @@ int main(int argc, char** argv)
   u32 watch_addr = 0;
   bool want_coverage = false;
   bool want_jit = false;
+  bool want_link = false;
   bool want_render = false;
   std::string xfb_path;
   u64 frame_every = 0;
@@ -535,6 +548,13 @@ int main(int argc, char** argv)
     // whatever will not compile.
     else if (std::strcmp(argv[i], "--jit") == 0)
       want_jit = true;
+    // --jit-link: let blocks tail-call their successor instead of returning.
+    // OFF by default: measured, it currently costs more than it saves,
+    // because most blocks end at an instruction that cannot be compiled
+    // rather than at a branch, and the PC after such a block is by
+    // construction one no block starts at.
+    else if (std::strcmp(argv[i], "--jit-link") == 0)
+      want_link = true;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -1030,6 +1050,24 @@ int main(int argc, char** argv)
   jit_layout.ram_base =
       static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetRAM()));
   jit_layout.memory_pages = static_cast<u32>(JitMemoryPages());
+  jit_layout.downcount_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount));
+
+  // ── the link table ──
+  //
+  // A direct-mapped cache from guest PC to table index, read by emitted code
+  // so a block can jump to its successor without returning here. Entries are
+  // {pc, index}; a slot collision is a miss, which is correct and cheap,
+  // because the emitted code compares the stored PC before jumping.
+  constexpr u32 kLinkEntries = 1u << 16;
+  std::vector<u32> link_table(kLinkEntries * 2, 0);
+  jit_layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
+  jit_layout.link_mask = kLinkEntries - 1;
+  jit_layout.enable_linking = want_link;
+
+  // How many guest instructions a chain may run before handing control back
+  // so the emulated clock can advance. Short enough that scheduled events are
+  // not noticeably late, long enough that dispatch is amortised.
+  constexpr int kSlice = 1024;
   const u32 jit_state_ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(&state));
   auto& jit_timing = system.GetCoreTiming();
 
@@ -1062,6 +1100,13 @@ int main(int argc, char** argv)
         e.index = JitInstall(r.module.data(), static_cast<int>(r.module.size()));
         e.instructions = r.instructions;
       }
+      if (e.index >= 0)
+      {
+        // Publish it so other blocks can jump here directly.
+        const u32 slot = (pc >> 2) & jit_layout.link_mask;
+        link_table[slot * 2 + 0] = pc;
+        link_table[slot * 2 + 1] = static_cast<u32>(e.index);
+      }
       it = jit_cache.emplace(pc, e).first;
     }
     if (it->second.index < 0)
@@ -1073,47 +1118,68 @@ int main(int argc, char** argv)
 
     using BlockFn = u32 (*)(u32);
     BlockFn f = reinterpret_cast<BlockFn>(it->second.index);
+
+    // How far the call got is measured differently depending on whether
+    // blocks link.
+    //
+    // A LINKED block decrements the downcount itself and may tail-call
+    // several successors, so what returns is the end of a chain and the only
+    // record of its length is what the budget lost. An UNLINKED block never
+    // touches the downcount, so reading it would always say zero -- which is
+    // exactly what happened: every block fell back to the interpreter and
+    // the JIT reported 0% while quietly costing a compile per block.
+    // Only a linked chain needs a budget. Writing the downcount for an
+    // unlinked block perturbs the emulated clock for no reason -- and
+    // measurably changed what the game did, which is the sort of thing a
+    // dispatcher must never do by accident.
+    if (want_link)
+      state.downcount = kSlice;
     const u32 ret = f(jit_state_ptr);
 
-    u32 ran;
-    if (ret & 1u)
-    {
-      // A bail: only the instructions before the refused one ran.
-      const u32 bail = ret & ~1u;
-      ran = (bail - pc) / 4;
-      state.pc = state.npc = bail;
+    const bool bailed = (ret & 1u) != 0;
+    const u32 next_pc = ret & ~1u;
+    state.pc = state.npc = next_pc;
+    if (bailed)
       ++jit_bails;
-      if (ran == 0)
-      {
-        // Refused on its very first instruction -- interpret that one so the
-        // guest always makes progress, or this is an infinite loop.
-        ++jit_interp;
-        ppc.SingleStep();
-        return 1;
-      }
+
+    int consumed;
+    if (want_link)
+    {
+      consumed = kSlice - state.downcount;
     }
     else
     {
-      ran = it->second.instructions;
-      state.pc = state.npc = ret;
+      // One block, so the PC says how much of it ran: a bail lands inside the
+      // block, anything else is the whole of it.
+      consumed = bailed ? static_cast<int>((next_pc - pc) / 4)
+                        : static_cast<int>(it->second.instructions);
+    }
+    if (consumed < 0)
+      consumed = 0;
+
+    if (consumed == 0)
+    {
+      // The chain refused before executing anything -- interpret one
+      // instruction so the guest always makes progress.
+      ++jit_interp;
+      ppc.SingleStep();
+      return 1;
     }
 
-    // The emulated clock does not advance by itself inside a block. Without
-    // this, no scheduled event ever fires: no vertical retrace, no IPC reply,
+    // Advance the emulated clock by what the chain actually ran. Without
+    // this nothing scheduled ever fires: no vertical retrace, no IPC reply,
     // and the game waits forever on a flag an interrupt was meant to set.
     //
-    // Events that would have fired mid-block fire at the block boundary
-    // instead, so timing is quantised to block length. That is a real
-    // behavioural difference from the interpreter, not an implementation
-    // detail -- it is why a JIT run is not expected to be instruction-exact
-    // against an interpreted one.
-    jit_timing.GetGlobals().slice_length = static_cast<int>(ran);
+    // Events that would have fired mid-chain fire at its end, so the slice
+    // size sets timing granularity. That is a real behavioural difference
+    // from the interpreter, not an implementation detail.
+    jit_timing.GetGlobals().slice_length = consumed;
     state.downcount = 0;
     jit_timing.Advance();
 
     ++jit_blocks;
-    jit_insts += ran;
-    return ran;
+    jit_insts += static_cast<u64>(consumed);
+    return static_cast<u32>(consumed);
 #else
     ppc.SingleStep();
     return 1;
@@ -1314,6 +1380,19 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(jit_blocks));
     std::printf("  jit       %llu instructions in compiled code (%.1f%% of executed)\n",
                 static_cast<unsigned long long>(jit_insts), covered);
+    {
+      // How much of the link table is live, and how long chains actually run.
+      // A chain that averages one block is not linking, and the difference
+      // between "published" and "hit" is the whole mechanism.
+      u64 live = 0;
+      for (u32 i = 0; i < kLinkEntries; ++i)
+        if (link_table[i * 2 + 1] != 0)
+          ++live;
+      std::printf("  jit       link table %llu/%u slots live, %.2f instructions per chain\n",
+                  static_cast<unsigned long long>(live), kLinkEntries,
+                  jit_blocks ? static_cast<double>(jit_insts) / static_cast<double>(jit_blocks)
+                             : 0.0);
+    }
     std::printf("  jit       %llu interpreted singly, %llu block bails\n",
                 static_cast<unsigned long long>(jit_interp),
                 static_cast<unsigned long long>(jit_bails));
