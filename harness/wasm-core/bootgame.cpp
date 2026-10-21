@@ -54,6 +54,7 @@
 #include "Core/DSPEmulator.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/HW.h"
+#include "Core/HW/VideoInterface.h"
 #include "Core/HW/Memmap.h"
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
@@ -366,6 +367,8 @@ int main(int argc, char** argv)
   u64 trace_from = 0;
   u64 dump_at = 0;
   u32 watch_addr = 0;
+  bool want_render = false;
+  std::string xfb_path;
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--trace") == 0)
@@ -414,6 +417,13 @@ int main(int argc, char** argv)
     // --watch=ADDR: report every change to the u32 at ADDR, with the PC that
     // was executing. A spin loop reveals WHAT it polls but not WHO satisfies
     // it; this closes that gap without a full memory trace.
+    // --render: use the Software backend instead of Null, so EFB copies
+    // actually produce pixels in the XFB.
+    else if (std::strcmp(argv[i], "--render") == 0)
+      want_render = true;
+    // --dump-xfb=PATH: decode the external framebuffer to a PPM.
+    else if (std::strncmp(argv[i], "--dump-xfb=", 11) == 0)
+      xfb_path = argv[i] + 11;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -609,7 +619,13 @@ int main(int argc, char** argv)
   //     and consumes the FIFO, but rasterises nothing -- which is exactly the
   //     Phase 1 shape in docs/PLAN.md: correctness of the command stream, no
   //     pixels.
-  Config::SetCurrent(Config::MAIN_GFX_BACKEND, std::string("Null"));
+  //
+  // "Software Renderer" rasterises on the CPU, which is slow but needs no GPU
+  // and no window -- the only way to get actual pixels out of a headless run,
+  // and the only way to answer what is on screen. Null remains the default
+  // because every differential baseline so far was measured with it.
+  Config::SetCurrent(Config::MAIN_GFX_BACKEND,
+                     std::string(want_render ? "Software Renderer" : "Null"));
 
   // 1d. Pin the emulated clock. SystemTimers.cpp:253 seeds the RTC from
   //     Common::Timer::GetLocalTimeSinceJan1970() unless a custom RTC is set,
@@ -1055,6 +1071,87 @@ int main(int argc, char** argv)
     check(g_gx_bytes.size() >= g_gx_limit || executed >= steps,
           "captured the requested stream, or ran out of steps first");
     EmitBase64(g_gx_bytes);
+  }
+
+  // ── the frame ──
+  //
+  // The XFB is what the Video Interface scans out: a YUYV 4:2:2 buffer in
+  // GUEST memory, written there by the EFB copies the game issues. Reading it
+  // needs no cooperation from the video backend at all -- but it is only
+  // populated if something actually rasterised, which is why this wants
+  // --render.
+  if (!xfb_path.empty())
+  {
+    auto& vi = system.GetVideoInterface();
+    const u32 xfb = vi.GetXFBAddressTop();
+    std::printf("  xfb addr  0x%08x\n", xfb);
+    if (xfb == 0)
+    {
+      check(false, "VI has an XFB address");
+    }
+    else
+    {
+      // 640x480 is the standard NTSC framebuffer this title uses. The stride
+      // is two bytes per pixel: YUYV packs two pixels into four bytes.
+      constexpr u32 W = 640, H = 480;
+      std::vector<u8> yuv(static_cast<size_t>(W) * H * 2);
+      auto& mem = system.GetMemory();
+      for (size_t off = 0; off < yuv.size(); off += 4)
+      {
+        const u32 word = mem.Read_U32(xfb + static_cast<u32>(off));
+        yuv[off + 0] = static_cast<u8>(word >> 24);
+        yuv[off + 1] = static_cast<u8>(word >> 16);
+        yuv[off + 2] = static_cast<u8>(word >> 8);
+        yuv[off + 3] = static_cast<u8>(word);
+      }
+
+      std::vector<u8> rgb(static_cast<size_t>(W) * H * 3);
+      for (size_t i = 0, p = 0; i < yuv.size(); i += 4, p += 6)
+      {
+        const double y0 = yuv[i], u = yuv[i + 1] - 128.0, y1 = yuv[i + 2], v = yuv[i + 3] - 128.0;
+        auto clamp8 = [](double x) {
+          return static_cast<u8>(x < 0 ? 0 : (x > 255 ? 255 : x));
+        };
+        rgb[p + 0] = clamp8(y0 + 1.371 * v);
+        rgb[p + 1] = clamp8(y0 - 0.698 * v - 0.336 * u);
+        rgb[p + 2] = clamp8(y0 + 1.732 * u);
+        rgb[p + 3] = clamp8(y1 + 1.371 * v);
+        rgb[p + 4] = clamp8(y1 - 0.698 * v - 0.336 * u);
+        rgb[p + 5] = clamp8(y1 + 1.732 * u);
+      }
+
+      // PPM, because it is six lines of code and every tool reads it. A
+      // browser has no filesystem worth writing to, so wasm prints base64 and
+      // the caller reassembles -- the same channel the GX capture uses.
+#if defined(__EMSCRIPTEN__)
+      std::printf("  xfb %u x %u, emitting as base64\n", W, H);
+      std::vector<u8> ppm;
+      {
+        char hdr[64];
+        const int n = std::snprintf(hdr, sizeof(hdr), "P6\n%u %u\n255\n", W, H);
+        ppm.assign(hdr, hdr + n);
+        ppm.insert(ppm.end(), rgb.begin(), rgb.end());
+      }
+      EmitBase64(ppm);
+#else
+      std::FILE* f = std::fopen(xfb_path.c_str(), "wb");
+      if (f)
+      {
+        std::fprintf(f, "P6\n%u %u\n255\n", W, H);
+        std::fwrite(rgb.data(), 1, rgb.size(), f);
+        std::fclose(f);
+        std::printf("  xfb wrote  %s (%u x %u)\n", xfb_path.c_str(), W, H);
+      }
+#endif
+      // A framebuffer of one flat colour means nothing rasterised.
+      size_t distinct = 0;
+      std::set<u32> colours;
+      for (size_t p = 0; p + 2 < rgb.size() && colours.size() < 64; p += 3)
+        colours.insert((rgb[p] << 16) | (rgb[p + 1] << 8) | rgb[p + 2]);
+      distinct = colours.size();
+      std::printf("  xfb has %zu distinct colours in the first sample\n", distinct);
+      check(distinct > 1, "the framebuffer is not a single flat colour");
+    }
   }
 
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
