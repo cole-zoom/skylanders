@@ -191,6 +191,13 @@ int main()
     auto g = ppc2wasm::CompileBlock(mem2, 0x80001000, 1, L);
     check(g.instructions == 1, "a load compiles regardless of the address it will compute");
 
+    // Compares write the condition register through Dolphin's own lookup
+    // table, so the layout must carry its address; a zero base would emit a
+    // load from address 0 that the browser accepts and that reads garbage.
+    const uint32_t cmps[] = {0x2C030005, 0x7D832000};  // cmpwi r3,5 ; cmpw cr3,r3,r4
+    auto cp = ppc2wasm::CompileBlock(cmps, 0x80001000, 2, L);
+    check(cp.instructions == 2, "immediate and register compares both compile");
+
     const uint32_t nothing[] = {0x48000010};
     auto n = ppc2wasm::CompileBlock(nothing, 0x80001000, 1, L);
     check(n.module.empty(), "a block that compiles nothing produces no module");

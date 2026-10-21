@@ -22,6 +22,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/ConditionRegister.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -119,6 +120,12 @@ int main()
   // copy, or the two engines would agree about registers and disagree about
   // memory.
   layout.ram_base = static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetRAM()));
+  layout.cr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, cr));
+  layout.xer_so_ov_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_so_ov));
+  // The interpreter's own table, by address. Recomputing the encoding here
+  // would be a second source of truth for something that must match exactly.
+  layout.cr_table_base =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data()));
   std::printf("  gpr offset in PowerPCState: %u\n", layout.gpr_offset);
   std::printf("  heap: %u pages   guest RAM at host 0x%08x\n\n", layout.memory_pages,
               layout.ram_base);
@@ -154,6 +161,20 @@ int main()
       {"negative displacement",
        {0x3C60'8000, 0x6063'5000, 0x3880'0099, 0x9083'FFFC, 0x80A3'FFFC}},
 
+      // ── compares ──
+      // cmpwi r3, 5 with r3 held at 1, 5 and 9 covers LT, EQ and GT, which
+      // are three different entries in the encoding table.
+      {"cmpwi less than", {0x3860'0001, 0x2C03'0005}},
+      {"cmpwi equal", {0x3860'0005, 0x2C03'0005}},
+      {"cmpwi greater than", {0x3860'0009, 0x2C03'0005}},
+      // A negative value: signed and unsigned compares must disagree, and
+      // getting that backwards is the classic compare bug.
+      {"cmpwi signed sees a negative as less", {0x3860'FFFF, 0x2C03'0001}},
+      {"cmplwi unsigned sees it as greater", {0x3860'FFFF, 0x2803'0001}},
+      // Register form, into a condition field other than 0.
+      {"cmpw into cr3", {0x3860'0007, 0x3880'0007, 0x7D83'2000}},
+      {"cmplw register unsigned", {0x3860'FFFF, 0x3880'0002, 0x7C03'2040}},
+
       // ── the guard ──
       // MEM2 lives at 0x90000000 and a compiled block may not touch it, so
       // the block must refuse instruction 2 and hand back its PC.
@@ -166,14 +187,22 @@ int main()
     // ── interpreter ──
     for (u32 i = 0; i < c.code.size(); ++i)
       memory.Write_U32(c.code[i], BASE + i * 4);
+    // Both engines must start from the SAME state, condition register
+    // included. Resetting it only before the recompiled run left stale fields
+    // from earlier cases in the interpreter's starting state, and the
+    // comparison then failed on a field neither program had touched.
     for (int i = 0; i < 32; ++i)
       state.gpr[i] = 0;
+    for (int i = 0; i < 8; ++i)
+      state.cr.fields[i] = 0;
     state.pc = state.npc = BASE;
     for (size_t i = 0; i < c.code.size(); ++i)
       ppc.SingleStep();
 
     u32 expect[32];
     std::memcpy(expect, state.gpr, sizeof(expect));
+    u64 expect_cr[8];
+    std::memcpy(expect_cr, state.cr.fields, sizeof(expect_cr));
     const u32 expect_pc = state.pc;
 
     // ── recompiled ──
@@ -197,6 +226,8 @@ int main()
 
     for (int i = 0; i < 32; ++i)
       state.gpr[i] = 0;
+    for (int i = 0; i < 8; ++i)
+      state.cr.fields[i] = 0;
     state.pc = state.npc = BASE;
 
     BlockFn f = reinterpret_cast<BlockFn>(idx);
@@ -225,6 +256,16 @@ int main()
           first_bad = i;
       }
     }
+    int bad_cr = -1;
+    for (int i = 0; i < 8; ++i)
+    {
+      if (state.cr.fields[i] != expect_cr[i])
+      {
+        same = false;
+        if (bad_cr < 0)
+          bad_cr = i;
+      }
+    }
 
     char label[128];
     std::snprintf(label, sizeof(label), "%s (%u instructions, %zu bytes)", c.name, r.instructions,
@@ -235,6 +276,10 @@ int main()
       if (first_bad >= 0)
         std::printf("      r%-2d interpreter=%08x recompiled=%08x\n", first_bad, expect[first_bad],
                     state.gpr[first_bad]);
+      if (bad_cr >= 0)
+        std::printf("      cr%d interpreter=%016llx recompiled=%016llx\n", bad_cr,
+                    static_cast<unsigned long long>(expect_cr[bad_cr]),
+                    static_cast<unsigned long long>(state.cr.fields[bad_cr]));
       if (got_pc != expect_pc)
         std::printf("      pc  interpreter=%08x recompiled=%08x\n", expect_pc, got_pc);
     }

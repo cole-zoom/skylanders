@@ -108,6 +108,13 @@ enum : uint8_t
   kI32Rotl = 0x77,
   kI32Eq = 0x46,
   kI32Ne = 0x47,
+  kI32LtS = 0x48,
+  kI32LtU = 0x49,
+  kI32GtS = 0x4A,
+  kI32GtU = 0x4B,
+
+  kI64Load = 0x29,
+  kI64Store = 0x37,
   kI32Rotr = 0x78,
 };
 
