@@ -42,6 +42,22 @@ jobs:
         working-directory: harness/src
         run: python3 test_decode.py
 
+  encoder:
+    name: wasm encoder tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: build and run
+        # Pure C++ with no dependencies -- no Dolphin, no disc, no Emscripten.
+        # The encoder produces the bytes a browser will try to compile, and a
+        # mis-encoded LEB128 length is rejected outright while a mis-SIGNED
+        # i32.const validates and computes the wrong number. The second kind
+        # is why this is tested against the spec's own vectors rather than
+        # against itself.
+        run: |
+          g++ -std=c++23 -O1 harness/wasm-core/jittest.cpp -o /tmp/jittest
+          /tmp/jittest
+
   hygiene:
     name: repo hygiene
     runs-on: ubuntu-latest
