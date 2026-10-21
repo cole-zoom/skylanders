@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <algorithm>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -67,6 +69,7 @@
 #include "UICommon/UICommon.h"
 
 #include "bytesources.h"
+#include "../../ppc2wasm/src/block.h"
 #include "rangeblob.h"
 #include "trace.h"
 
@@ -436,6 +439,7 @@ int main(int argc, char** argv)
   u64 trace_from = 0;
   u64 dump_at = 0;
   u32 watch_addr = 0;
+  bool want_coverage = false;
   bool want_render = false;
   std::string xfb_path;
   u64 frame_every = 0;
@@ -499,6 +503,12 @@ int main(int argc, char** argv)
     // what cross the browser boundary; the images are for looking at.
     else if (std::strncmp(argv[i], "--frame-every=", 14) == 0)
       frame_every = std::strtoull(argv[i] + 14, nullptr, 0);
+    // --jit-coverage: tally the opcodes the game actually executes and report
+    // which of them ppc2wasm can translate. The instruction list in the
+    // recompiler says what it CAN do; this says what the game NEEDS, and the
+    // gap between those is what to build next.
+    else if (std::strcmp(argv[i], "--jit-coverage") == 0)
+      want_coverage = true;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -961,6 +971,9 @@ int main(int argc, char** argv)
   u64 executed = 0;
   u32 watch_last = 0;
   u64 frame_index = 0;
+  std::map<u32, std::pair<u64, u32>> cov_counts;
+  u64 cov_total = 0;
+  Memory::MemoryManager* mem_for_cov = &system.GetMemory();
   const u32 first_pc = state.pc;
   u32 min_pc = state.pc, max_pc = state.pc;
 
@@ -1050,6 +1063,26 @@ int main(int argc, char** argv)
 #endif
         ++frame_index;
       }
+    }
+
+    if (want_coverage)
+    {
+      // Key by primary opcode, and for the extended-opcode space by its XO
+      // too -- "opcode 31" spans everything from add to the cache hints, so a
+      // tally that lumps them together says nothing useful.
+      const u32 ins = mem_for_cov->Read_U32(state.pc);
+      const u32 primary = ins >> 26;
+      const u32 key = (primary == 31 || primary == 19 || primary == 63)
+                          ? (primary << 16) | ((ins >> 1) & 0x3FF)
+                          : (primary << 16);
+      auto& slot = cov_counts[key];
+      ++slot.first;
+      // Keep a REAL encoding, not a reconstructed one. Whether an instruction
+      // translates can depend on fields outside the opcode -- a bc with BO
+      // bit 2 clear is a CTR form and refused, so a synthetic BO=0 probe
+      // reports every conditional branch as unsupported.
+      slot.second = ins;
+      ++cov_total;
     }
 
     if (watch_addr)
@@ -1250,6 +1283,46 @@ int main(int argc, char** argv)
       distinct = colours.size();
       std::printf("  xfb has %zu distinct colours in the first sample\n", distinct);
       check(distinct > 1, "the framebuffer is not a single flat colour");
+    }
+  }
+
+  if (want_coverage && cov_total)
+  {
+    // Ask the real decoder, not a hand-maintained list: compile a
+    // single-instruction block and see whether it took.
+    ppc2wasm::StateLayout probe;
+    probe.gpr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr));
+    probe.memory_pages = 1;
+
+    struct Row { u64 count; u32 key; u32 example; };
+    std::vector<Row> ranked;
+    for (const auto& [key, v] : cov_counts)
+      ranked.push_back({v.first, key, v.second});
+    std::sort(ranked.begin(), ranked.end(),
+              [](const Row& a, const Row& b) { return a.count > b.count; });
+
+    u64 supported = 0;
+    for (const Row& r : ranked)
+    {
+      if (ppc2wasm::CompileBlock(&r.example, 0x8000'0000, 1, probe).instructions == 1)
+        supported += r.count;
+    }
+
+    std::printf("\n  ── ppc2wasm coverage over %llu executed instructions ──\n",
+                static_cast<unsigned long long>(cov_total));
+    std::printf("  translatable today: %.1f%%\n\n",
+                100.0 * static_cast<double>(supported) / static_cast<double>(cov_total));
+    std::printf("  %-10s %-8s %12s  %6s  %s\n", "opcode", "xo", "count", "share", "status");
+    int shown = 0;
+    for (const Row& r : ranked)
+    {
+      if (shown++ >= 24)
+        break;
+      const bool ok = ppc2wasm::CompileBlock(&r.example, 0x8000'0000, 1, probe).instructions == 1;
+      std::printf("  %-10u %-8u %12llu  %5.2f%%  %s\n", r.key >> 16, r.key & 0xFFFF,
+                  static_cast<unsigned long long>(r.count),
+                  100.0 * static_cast<double>(r.count) / static_cast<double>(cov_total),
+                  ok ? "translated" : "NOT translated");
     }
   }
 
