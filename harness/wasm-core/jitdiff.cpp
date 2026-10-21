@@ -277,7 +277,8 @@ int main()
 
     if (c.expect_bail_at >= 0)
     {
-      const u32 want_pc = BASE + static_cast<u32>(c.expect_bail_at) * 4;
+      // A bail is marked by the low bit, which a PC never has.
+      const u32 want_pc = (BASE + static_cast<u32>(c.expect_bail_at) * 4) | 1u;
       const bool bailed = (got_pc == want_pc);
       char lbl[128];
       std::snprintf(lbl, sizeof(lbl), "%s (returned %08x)", c.name, got_pc);
