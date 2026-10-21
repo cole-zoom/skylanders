@@ -176,6 +176,21 @@ int main()
     auto d = ppc2wasm::CompileBlock(rc_form, 0x80001000, 1, L);
     check(d.instructions == 0, "an Rc (dot) form stops the block");
 
+    // Memory operands compile, and a block that needs scratch locals must
+    // actually declare them -- a body that uses local 1 without declaring it
+    // is rejected by the browser, which is the good case; the bad case is
+    // declaring too few and having an index mean something else.
+    const uint32_t loads[] = {0x80830000, 0x90830004};  // lwz r4,0(r3); stw r4,4(r3)
+    auto m = ppc2wasm::CompileBlock(loads, 0x80001000, 2, L);
+    check(m.instructions == 2, "a load and a store compile");
+    check(m.module.size() > 150, "the memory block is substantially larger than a register one");
+
+    // The guard means an unsupported REGION is a runtime decision, not a
+    // compile-time one: the instruction still compiles.
+    const uint32_t mem2[] = {0x80830000};
+    auto g = ppc2wasm::CompileBlock(mem2, 0x80001000, 1, L);
+    check(g.instructions == 1, "a load compiles regardless of the address it will compute");
+
     const uint32_t nothing[] = {0x48000010};
     auto n = ppc2wasm::CompileBlock(nothing, 0x80001000, 1, L);
     check(n.module.empty(), "a block that compiles nothing produces no module");

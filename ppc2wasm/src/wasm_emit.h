@@ -83,12 +83,19 @@ enum : uint8_t
   kI32 = 0x7F,
   kFuncType = 0x60,
 
+  kBlock = 0x02,
+  kIf = 0x04,
+  kElse = 0x05,
   kEnd = 0x0B,
+  kReturn = 0x0F,
+  kVoid = 0x40,  // block type: no result
   kLocalGet = 0x20,
   kLocalSet = 0x21,
   kI32Const = 0x41,
   kI32Load = 0x28,
+  kI32Load8U = 0x2D,
   kI32Store = 0x36,
+  kI32Store8 = 0x3A,
   kI32Add = 0x6A,
   kI32Sub = 0x6B,
   kI32Mul = 0x6C,
@@ -99,6 +106,8 @@ enum : uint8_t
   kI32ShrS = 0x75,
   kI32ShrU = 0x76,
   kI32Rotl = 0x77,
+  kI32Eq = 0x46,
+  kI32Ne = 0x47,
   kI32Rotr = 0x78,
 };
 
@@ -120,13 +129,18 @@ public:
   }
 
   // params/results describe the single exported function.
+  // i32_locals are scratch slots ABOVE the parameters: with one parameter,
+  // local 0 is that parameter and the first scratch local is 1. Address
+  // computations need somewhere to keep the effective address, since wasm's
+  // stack cannot be indexed twice without recomputing.
   void SetFunction(const std::vector<uint8_t>& params, const std::vector<uint8_t>& results,
-                   const Bytes& body, const std::string& export_name)
+                   const Bytes& body, const std::string& export_name, uint32_t i32_locals = 0)
   {
     m_params = params;
     m_results = results;
     m_body = body;
     m_export = export_name;
+    m_locals = i32_locals;
   }
 
   Bytes Build() const
@@ -183,7 +197,16 @@ public:
     // Code section: no locals beyond parameters.
     {
       Bytes body;
-      PutU32(body, 0);  // local declaration count
+      if (m_locals)
+      {
+        PutU32(body, 1);        // one local-type group
+        PutU32(body, m_locals); // how many
+        body.push_back(kI32);
+      }
+      else
+      {
+        PutU32(body, 0);
+      }
       PutBytes(body, m_body);
       body.push_back(kEnd);
 
@@ -204,5 +227,6 @@ private:
   std::vector<uint8_t> m_params, m_results;
   Bytes m_body;
   std::string m_export = "f";
+  uint32_t m_locals = 0;
 };
 }  // namespace ppc2wasm

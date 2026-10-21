@@ -46,6 +46,15 @@ struct StateLayout
   // instantiation fails with a link error rather than a useful message.
   uint32_t memory_pages = 0;
   bool memory_shared = true;
+
+  // Where guest RAM lives in the host heap, and how a guest address maps into
+  // it. Dolphin keeps guest memory in GUEST byte order, so a 32-bit load has
+  // to be reassembled from bytes -- WebAssembly is little-endian and has no
+  // byte-swap instruction.
+  uint32_t ram_base = 0;              // host address of guest 0x80000000
+  uint32_t ram_mask = 0x01FFFFFF;     // offset within MEM1 (24 MB, mirrored)
+  uint32_t guard_mask = 0xFE000000;   // the bits that identify the region
+  uint32_t guard_value = 0x80000000;  // ... and what they must equal
 };
 
 namespace detail
@@ -115,6 +124,91 @@ inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
   PutU32(b, 2);
   PutU32(b, l.gpr_offset + n * 4);
 }
+
+// Emit: if ((ea & guard_mask) != guard_value) return bail_pc;
+//
+// A compiled block may only touch MEM1. Anything else -- MEM2, MMIO, an
+// unmapped address -- has semantics this code does not implement, so the
+// block BAILS: it returns the PC of the offending instruction and the
+// interpreter re-executes it.
+//
+// Bailing before the instruction's effects are applied is what makes this
+// safe. Everything earlier in the block is already committed to guest state,
+// and resuming at this PC re-runs exactly the instruction that was refused.
+inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_t bail_pc)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, ea_local);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.guard_mask));
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.guard_value));
+  b.push_back(kI32Ne);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(bail_pc));
+  b.push_back(kReturn);
+  b.push_back(kEnd);
+}
+
+// ea_local holds a guest address; replace it with the host address.
+inline void EmitToHostAddress(Bytes& b, const StateLayout& l, uint32_t ea_local)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, ea_local);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.ram_mask));
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.ram_base));
+  b.push_back(kI32Add);
+  b.push_back(kLocalSet);
+  PutU32(b, ea_local);
+}
+
+// Compute the effective address of a d(rA) operand into ea_local.
+inline void EmitEffectiveAddress(Bytes& b, const StateLayout& l, uint32_t ra, int32_t disp,
+                                 uint32_t ea_local)
+{
+  LoadGprOrZero(b, l, ra);
+  if (disp)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, disp);
+    b.push_back(kI32Add);
+  }
+  b.push_back(kLocalSet);
+  PutU32(b, ea_local);
+}
+
+// Push a big-endian u32 read from the host address in ea_local.
+//
+// Four byte loads rather than one word load plus a swap: WebAssembly has no
+// byte-swap instruction, so the alternative is a shift-and-or chain of
+// similar length that also assumes the address is 4-byte aligned. PowerPC
+// permits unaligned loads.
+inline void EmitLoadBE32(Bytes& b, uint32_t ea_local)
+{
+  for (int byte = 0; byte < 4; ++byte)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Load8U);
+    PutU32(b, 0);  // alignment 2^0
+    PutU32(b, static_cast<uint32_t>(byte));
+    const int shift = 24 - byte * 8;
+    if (shift)
+    {
+      b.push_back(kI32Const);
+      PutI32(b, shift);
+      b.push_back(kI32Shl);
+    }
+    if (byte)
+      b.push_back(kI32Or);
+  }
+}
 }  // namespace detail
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
@@ -125,6 +219,10 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   using namespace detail;
   Bytes body;
   uint32_t n = 0;
+  // Scratch locals above the state parameter: 1 = effective/host address,
+  // 2 = the value being stored. Declared only if used, so a block of pure
+  // register arithmetic still emits none.
+  uint32_t used_locals = 0;
   const char* stopped = "instruction limit";
 
   for (; n < max_insts; ++n)
@@ -239,6 +337,79 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       break;
     }
 
+    case 32:  // lwz rD, d(rA)
+    case 34:  // lbz rD, d(rA)
+    {
+      const uint32_t this_pc = start_pc + n * 4;
+      EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
+      EmitGuard(body, layout, 1, this_pc);
+      EmitToHostAddress(body, layout, 1);
+      BeginStoreGpr(body);
+      if (op == 32)
+      {
+        EmitLoadBE32(body, 1);
+      }
+      else
+      {
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kI32Load8U);
+        PutU32(body, 0);
+        PutU32(body, 0);
+      }
+      EndStoreGpr(body, layout, RS(ins));
+      used_locals = 2;
+      handled = true;
+      break;
+    }
+
+    case 36:  // stw rS, d(rA)
+    case 38:  // stb rS, d(rA)
+    {
+      const uint32_t this_pc = start_pc + n * 4;
+      EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
+      EmitGuard(body, layout, 1, this_pc);
+      EmitToHostAddress(body, layout, 1);
+      // Keep the value in a local: a byte-order store reads it four times,
+      // and the wasm stack cannot be indexed.
+      LoadGpr(body, layout, RS(ins));
+      body.push_back(kLocalSet);
+      PutU32(body, 2);
+      if (op == 36)
+      {
+        for (int byte = 0; byte < 4; ++byte)
+        {
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          const int shift = 24 - byte * 8;
+          if (shift)
+          {
+            body.push_back(kI32Const);
+            PutI32(body, shift);
+            body.push_back(kI32ShrU);
+          }
+          body.push_back(kI32Store8);
+          PutU32(body, 0);
+          PutU32(body, static_cast<uint32_t>(byte));
+        }
+      }
+      else
+      {
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        body.push_back(kI32Store8);
+        PutU32(body, 0);
+        PutU32(body, 0);
+      }
+      used_locals = 3;
+      handled = true;
+      break;
+    }
+
     default:
       break;
     }
@@ -263,7 +434,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
 
   ModuleBuilder mb;
   mb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
-  mb.SetFunction({kI32}, {kI32}, body, "f");
+  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals);
   r.module = mb.Build();
   return r;
 }
