@@ -197,13 +197,43 @@ static bool g_event_log_on = false;
 // makes it usable in a differential: both targets press at exactly the same
 // instruction. Anything driven by wall-clock would make the two runs
 // incomparable, which is the mistake that took the network offline.
-static bool g_press_a = false;
+// The button currently held, as a (group, control) pair the override matches
+// against. Empty means nothing is pressed.
+static const char* g_press_group = "";
+static const char* g_press_control = "";
+
+// The sequence to cycle through, one entry per press window.
+static std::vector<std::pair<const char*, const char*>> g_input_sequence;
 
 // One emulated second is about 729 million instructions (the Wii CPU clock,
 // and this harness advances one tick per instruction). Press for ~0.2s every
 // ~2s: long enough to register, with gaps long enough for a menu to act on it.
 static constexpr u64 PRESS_PERIOD = 1458000000ull;  // ~2.0s
 static constexpr u64 PRESS_LENGTH = 150000000ull;   // ~0.2s
+
+// Names from WiimoteEmu.h and ControllerEmu.h. A D-pad direction and a face
+// button live in different GROUPS, which is why both halves are carried.
+static bool LookupButton(const std::string& name,
+                         std::pair<const char*, const char*>* out)
+{
+  static const struct { const char* name; const char* group; const char* control; } kMap[] = {
+      {"A", "Buttons", "A"},       {"B", "Buttons", "B"},
+      {"1", "Buttons", "1"},       {"2", "Buttons", "2"},
+      {"+", "Buttons", "+"},       {"-", "Buttons", "-"},
+      {"Home", "Buttons", "Home"}, {"Up", "D-Pad", "Up"},
+      {"Down", "D-Pad", "Down"},   {"Left", "D-Pad", "Left"},
+      {"Right", "D-Pad", "Right"},
+  };
+  for (const auto& e : kMap)
+  {
+    if (name == e.name)
+    {
+      *out = {e.group, e.control};
+      return true;
+    }
+  }
+  return false;
+}
 // The step the CPU loop is on, so an event can be tied to an instruction
 // count. Ticks and steps are NOT the same clock: CoreTiming advances by
 // slice_length - downcount, and the apploader runs before stepping begins, so
@@ -329,11 +359,13 @@ int main(int argc, char** argv)
   bool stop_at_fifo = false;
   bool want_events = false;
   bool want_input = false;
+  std::string input_seq = "A";
   bool want_skylander = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
   u64 trace_from = 0;
   u64 dump_at = 0;
+  u32 watch_addr = 0;
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--trace") == 0)
@@ -344,8 +376,14 @@ int main(int argc, char** argv)
       want_events = true;
     // --input: drive the A button on a fixed, instruction-count schedule.
     // Opt-in so that every existing differential baseline keeps its meaning.
-    else if (std::strcmp(argv[i], "--input") == 0)
+    // --input[=SEQ]: cycle a comma-separated button sequence, one entry per
+    // press window. Defaults to "A" so every existing baseline keeps meaning.
+    else if (std::strncmp(argv[i], "--input", 7) == 0)
+    {
       want_input = true;
+      if (argv[i][7] == '=')
+        input_seq = argv[i] + 8;
+    }
     // --skylander[=ID:VAR]: create a figure and place it on the portal.
     // Defaults to Whirlwind (0, 0x0000), one of the figures that shipped with
     // Spyro's Adventure, so the id/var pair is known-good for this disc.
@@ -373,6 +411,11 @@ int main(int argc, char** argv)
     // and this says which register and which opcode.
     else if (std::strncmp(argv[i], "--dump-at=", 10) == 0)
       dump_at = std::strtoull(argv[i] + 10, nullptr, 0);
+    // --watch=ADDR: report every change to the u32 at ADDR, with the PC that
+    // was executing. A spin loop reveals WHAT it polls but not WHO satisfies
+    // it; this closes that gap without a full memory trace.
+    else if (std::strncmp(argv[i], "--watch=", 8) == 0)
+      watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
     // base64. Implies running until the stream is full rather than to a step
     // count, because the interesting thing is the commands, not the distance.
@@ -491,6 +534,21 @@ int main(int argc, char** argv)
 
   if (want_input)
   {
+    for (size_t pos = 0; pos <= input_seq.size();)
+    {
+      const size_t comma = input_seq.find(',', pos);
+      const std::string name = input_seq.substr(pos, comma - pos);
+      std::pair<const char*, const char*> entry;
+      if (!name.empty() && LookupButton(name, &entry))
+        g_input_sequence.push_back(entry);
+      else if (!name.empty())
+        std::printf("  unknown button '%s' ignored\n", name.c_str());
+      if (comma == std::string::npos)
+        break;
+      pos = comma + 1;
+    }
+    check(!g_input_sequence.empty(), "input sequence parsed");
+
     // The override is consulted wherever the emulated Wiimote would read a
     // real device, so no Dolphin patch is needed and no actual input backend
     // has to exist -- which matters in a browser, where there is none.
@@ -501,11 +559,16 @@ int main(int argc, char** argv)
         controller->SetInputOverrideFunction(
             [](std::string_view group, std::string_view control,
                ControlState state) -> std::optional<ControlState> {
-              if (group == "Buttons" && control == "A")
-                return g_press_a ? 1.0 : 0.0;
-              return std::nullopt;
+              // Only the groups this harness drives are overridden. Returning
+              // nullopt elsewhere leaves motion, IR and extensions to their
+              // normal (neutral) handling rather than forcing them to zero.
+              if (group != "Buttons" && group != "D-Pad")
+                return std::nullopt;
+              const bool held = group == g_press_group && control == g_press_control;
+              return held ? 1.0 : 0.0;
             });
-        check(true, "synthetic input installed (A on a fixed schedule)");
+        std::printf("  input sequence: %s (%zu entries)\n", input_seq.c_str(),
+                    g_input_sequence.size());
       }
     }
   }
@@ -805,6 +868,7 @@ int main(int argc, char** argv)
   INIT_MARK("stepping");
   std::printf("\n  stepping %llu instructions...\n", static_cast<unsigned long long>(steps));
   u64 executed = 0;
+  u32 watch_last = 0;
   const u32 first_pc = state.pc;
   u32 min_pc = state.pc, max_pc = state.pc;
 
@@ -854,13 +918,36 @@ int main(int argc, char** argv)
     // logging on from the first step, which --from cannot express: a window
     // starting at zero is indistinguishable from "no window".
     g_cur_step = i;
-    if (want_input)
-      g_press_a = (i % PRESS_PERIOD) < PRESS_LENGTH;
+    if (want_input && !g_input_sequence.empty())
+    {
+      if ((i % PRESS_PERIOD) < PRESS_LENGTH)
+      {
+        const auto& e = g_input_sequence[(i / PRESS_PERIOD) % g_input_sequence.size()];
+        g_press_group = e.first;
+        g_press_control = e.second;
+      }
+      else
+      {
+        g_press_group = "";
+        g_press_control = "";
+      }
+    }
     if (i >= trace_from && (want_events || trace_from))
       g_event_log_on = true;
 
     if (i >= trace_from && (want_trace || (checkpoint && i % checkpoint == 0)))
       Trace::EmitLine(i, state);
+    if (watch_addr)
+    {
+      const u32 now = system.GetMemory().Read_U32(watch_addr);
+      if (now != watch_last)
+      {
+        std::printf("W step=%llu addr=%08x %08x -> %08x pc=%08x\n",
+                    static_cast<unsigned long long>(i), watch_addr, watch_last, now, state.pc);
+        watch_last = now;
+      }
+    }
+
     if (dump_at && i == dump_at)
     {
       Trace::EmitFullState(i, state);
