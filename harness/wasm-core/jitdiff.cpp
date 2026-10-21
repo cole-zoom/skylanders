@@ -22,6 +22,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -64,6 +65,9 @@ struct Case
 {
   const char* name;
   std::vector<u32> code;
+  // When set, the block is expected to refuse this instruction index and
+  // return its PC instead of running it.
+  int expect_bail_at = -1;
 };
 
 int main()
@@ -83,12 +87,41 @@ int main()
   ppc.Init(PowerPC::CPUCore::Interpreter);
   auto& state = ppc.GetPPCState();
 
+  // Address translation, so the INTERPRETER can perform data accesses at all.
+  // Without this a guest store raises a DSI exception and reads come back
+  // zero -- which looks exactly like a recompiler bug, and did: the emitted
+  // code was returning the right values while the oracle returned nothing.
+  //
+  // Values copied from CBoot::SetupBAT (private, hence duplicated):
+  //   DBAT0/IBAT0: 0x80000000 -> physical 0x00000000 (MEM1)
+  //   DBAT4/IBAT4: 0x90000000 -> physical 0x10000000 (MEM2)
+  state.spr[SPR_IBAT0U] = 0x8000'1fff;
+  state.spr[SPR_IBAT0L] = 0x0000'0002;
+  state.spr[SPR_DBAT0U] = 0x8000'1fff;
+  state.spr[SPR_DBAT0L] = 0x0000'0002;
+  state.spr[SPR_IBAT4U] = 0x9000'1fff;
+  state.spr[SPR_IBAT4L] = 0x1000'0002;
+  state.spr[SPR_DBAT4U] = 0x9000'1fff;
+  state.spr[SPR_DBAT4L] = 0x1000'0002;
+  HID4(state).SBE = 1;
+  auto& mmu = system.GetMMU();
+  mmu.DBATUpdated();
+  mmu.IBATUpdated();
+  state.msr.IR = 1;
+  state.msr.DR = 1;
+
   ppc2wasm::StateLayout layout;
   layout.gpr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr));
   layout.memory_pages = static_cast<u32>(MemoryPages());
   layout.memory_shared = true;
+  // Guest RAM's host address. The emitted code adds the masked guest offset
+  // to this, so it has to be the same buffer the interpreter uses -- not a
+  // copy, or the two engines would agree about registers and disagree about
+  // memory.
+  layout.ram_base = static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetRAM()));
   std::printf("  gpr offset in PowerPCState: %u\n", layout.gpr_offset);
-  std::printf("  heap: %u pages\n\n", layout.memory_pages);
+  std::printf("  heap: %u pages   guest RAM at host 0x%08x\n\n", layout.memory_pages,
+              layout.ram_base);
 
   const std::vector<Case> cases = {
       {"addi / add", {0x3860'0005, 0x3883'0007, 0x7CA3'2214}},
@@ -99,6 +132,33 @@ int main()
       {"rlwinm rotate and mask", {0x3860'1234, 0x5464'103A, 0x5465'4000}},
       {"subf", {0x3860'0014, 0x3880'0005, 0x7CA3'2050}},
       {"r0 means literal zero in addi", {0x3860'0042, 0x3803'0001}},
+
+      // ── memory ──
+      // lis r3, 0x8000 ; ori r3, r3, 0x2000 ; addi r4, r0, 0x1234 ;
+      // stw r4, 0(r3) ; lwz r5, 0(r3)
+      {"stw then lwz round-trips a word",
+       {0x3C60'8000, 0x6063'2000, 0x3880'1234, 0x9083'0000, 0x80A3'0000}},
+      // Same, but read back into a different register so a store that did
+      // nothing would be visible.
+      {"lwz reads what stw wrote",
+       {0x3C60'8000, 0x6063'2000, 0x3880'5678, 0x9083'0000, 0x80A3'0000}},
+      // Byte order: store a word, read its first byte. On a big-endian guest
+      // that byte is the MOST significant one, which is the whole reason the
+      // emitted load reassembles from bytes.
+      {"lbz sees the big-endian high byte",
+       {0x3C60'8000, 0x6063'3000, 0x3C80'ABCD, 0x9083'0000, 0x88A3'0000}},
+      {"stb writes a single byte",
+       {0x3C60'8000, 0x6063'4000, 0x3880'0042, 0x9883'0000, 0x88A3'0000}},
+      // Negative displacement, which is a signed field and a classic decode
+      // slip.
+      {"negative displacement",
+       {0x3C60'8000, 0x6063'5000, 0x3880'0099, 0x9083'FFFC, 0x80A3'FFFC}},
+
+      // ── the guard ──
+      // MEM2 lives at 0x90000000 and a compiled block may not touch it, so
+      // the block must refuse instruction 2 and hand back its PC.
+      {"an address outside MEM1 bails to the interpreter",
+       {0x3C60'9000, 0x3880'0001, 0x8083'0000}, 2},
   };
 
   for (const Case& c : cases)
@@ -141,6 +201,18 @@ int main()
 
     BlockFn f = reinterpret_cast<BlockFn>(idx);
     const u32 got_pc = f(static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+
+    if (c.expect_bail_at >= 0)
+    {
+      const u32 want_pc = BASE + static_cast<u32>(c.expect_bail_at) * 4;
+      const bool bailed = (got_pc == want_pc);
+      char lbl[128];
+      std::snprintf(lbl, sizeof(lbl), "%s (returned %08x)", c.name, got_pc);
+      check(bailed, lbl);
+      if (!bailed)
+        std::printf("      wanted the block to stop at %08x\n", want_pc);
+      continue;
+    }
 
     bool same = (got_pc == expect_pc);
     int first_bad = -1;
