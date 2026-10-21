@@ -65,6 +65,8 @@ struct StateLayout
   uint32_t cr_offset = 0;        // offsetof(PowerPCState, cr)
   uint32_t xer_so_ov_offset = 0; // offsetof(PowerPCState, xer_so_ov)
   uint32_t cr_table_base = 0;    // host address of ConditionRegister::s_crTable
+  uint32_t spr_offset = 0;       // offsetof(PowerPCState, spr)
+  uint32_t lr_index = 8;         // SPR_LR
 };
 
 namespace detail
@@ -296,6 +298,90 @@ inline void EmitCompareToCR(Bytes& b, const StateLayout& l, uint32_t crf, bool i
   PutU32(b, 3);
   PutU32(b, l.cr_offset + crf * 8);
 }
+
+// Push 1 or 0 for condition register bit `bit` (0..31).
+//
+// Within a field the bits are LT, GT, EQ, SO, and each is extracted
+// differently because Dolphin's 64-bit encoding is not a packed nibble:
+//
+//   LT  bit 62        -> bit 30 of the high word
+//   GT  (s64)v > 0    -> sign clear AND the value non-zero
+//   EQ  low 32 == 0
+//   SO  bit 59        -> bit 27 of the high word
+//
+// The halves are loaded as two i32s rather than one i64, which keeps the
+// emitter free of 64-bit arithmetic for what is otherwise a bit test.
+inline void EmitCRBit(Bytes& b, const StateLayout& l, uint32_t bit)
+{
+  const uint32_t field = bit >> 2;
+  const uint32_t which = bit & 3;
+  const uint32_t lo = l.cr_offset + field * 8;
+  const uint32_t hi = lo + 4;
+
+  auto load_at = [&](uint32_t off) {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, off);
+  };
+
+  switch (which)
+  {
+  case 0:  // LT
+    load_at(hi);
+    b.push_back(kI32Const);
+    PutI32(b, 30);
+    b.push_back(kI32ShrU);
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32And);
+    break;
+  case 1:  // GT -- (s64)value > 0, so sign clear and value non-zero
+    load_at(hi);
+    b.push_back(kI32Const);
+    PutI32(b, 31);
+    b.push_back(kI32ShrU);
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32Xor);
+    load_at(hi);
+    load_at(lo);
+    b.push_back(kI32Or);
+    b.push_back(kI32Const);
+    PutI32(b, 0);
+    b.push_back(kI32Ne);
+    b.push_back(kI32And);
+    break;
+  case 2:  // EQ -- the low word is zero
+    load_at(lo);
+    b.push_back(kI32Const);
+    PutI32(b, 0);
+    b.push_back(kI32Eq);
+    break;
+  default:  // SO
+    load_at(hi);
+    b.push_back(kI32Const);
+    PutI32(b, 27);
+    b.push_back(kI32ShrU);
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32And);
+    break;
+  }
+}
+
+// Store a value into an SPR (used for the link register).
+inline void EmitSetSpr(Bytes& b, const StateLayout& l, uint32_t index, uint32_t value)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(value));
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, l.spr_offset + index * 4);
+}
 }  // namespace detail
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
@@ -317,6 +403,10 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     const uint32_t ins = code[n];
     const uint32_t op = Opcode(ins);
     bool handled = false;
+    // A branch is translated and then TERMINATES the block: control leaves
+    // here, so anything after it in the instruction stream belongs to a
+    // different block.
+    bool ends_block = false;
 
     switch (op)
     {
@@ -463,6 +553,75 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       break;
     }
 
+    case 18:  // b / ba / bl / bla
+    {
+      const uint32_t this_pc = start_pc + n * 4;
+      // LI is a signed 24-bit word displacement, stored shifted left by two.
+      int32_t li = static_cast<int32_t>(ins & 0x03FFFFFC);
+      if (li & 0x02000000)
+        li -= 0x04000000;  // sign extend from 26 bits
+      const bool absolute = (ins & 2) != 0;
+      const bool link = (ins & 1) != 0;
+      const uint32_t target = absolute ? static_cast<uint32_t>(li) : this_pc + li;
+      if (link)
+        EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
+      body.push_back(kI32Const);
+      PutI32(body, static_cast<int32_t>(target));
+      body.push_back(kReturn);
+      handled = true;
+      ends_block = true;
+      break;
+    }
+
+    case 16:  // bc / bca / bcl / bcla
+    {
+      const uint32_t bo = RS(ins);
+      const uint32_t bi = RA(ins);
+      // BO bit 2 clear means the branch also decrements CTR, which is not
+      // modelled. Treating it as a plain conditional would skip the
+      // decrement and loop forever.
+      if ((bo & 0x04) == 0)
+        break;
+
+      const uint32_t this_pc = start_pc + n * 4;
+      int32_t bd = static_cast<int32_t>(ins & 0x0000FFFC);
+      if (bd & 0x8000)
+        bd -= 0x10000;  // sign extend from 16 bits
+      const bool absolute = (ins & 2) != 0;
+      const bool link = (ins & 1) != 0;
+      const uint32_t target = absolute ? static_cast<uint32_t>(bd) : this_pc + bd;
+
+      if (link)
+        EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
+
+      if (bo & 0x10)
+      {
+        // Branch always -- the condition is ignored.
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(target));
+        body.push_back(kReturn);
+      }
+      else
+      {
+        // Taken when the tested bit equals BO bit 3.
+        EmitCRBit(body, layout, bi);
+        body.push_back(kI32Const);
+        PutI32(body, (bo & 0x08) ? 1 : 0);
+        body.push_back(kI32Eq);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(target));
+        body.push_back(kReturn);
+        body.push_back(kEnd);
+        // Falling through leaves the block's trailing end_pc as the result,
+        // which is this instruction's PC plus four.
+      }
+      handled = true;
+      ends_block = true;
+      break;
+    }
+
     case 32:  // lwz rD, d(rA)
     case 34:  // lbz rD, d(rA)
     {
@@ -543,6 +702,12 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     if (!handled)
     {
       stopped = "unsupported instruction";
+      break;
+    }
+    if (ends_block)
+    {
+      ++n;
+      stopped = "branch";
       break;
     }
   }
