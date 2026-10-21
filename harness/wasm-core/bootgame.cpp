@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <set>
 #include <string>
@@ -96,6 +97,26 @@ volatile char g_harness_stage[96] = "start";
 EMSCRIPTEN_KEEPALIVE const char* harness_stage() { return (const char*)g_harness_stage; }
 #endif
 }
+
+#if defined(__EMSCRIPTEN__)
+// Install a compiled block and return its table index, which under Emscripten
+// IS a callable function pointer.
+EM_JS(int, JitInstall, (const uint8_t* ptr, int len), {
+  try {
+    const bytes = HEAPU8.slice(ptr, ptr + len);
+    const mod = new WebAssembly.Module(bytes);
+    const inst = new WebAssembly.Instance(mod, { env: { memory: wasmMemory } });
+    const idx = wasmTable.length;
+    wasmTable.grow(1);
+    wasmTable.set(idx, inst.exports.f);
+    return idx;
+  } catch (e) {
+    return -1;
+  }
+});
+EM_JS(int, JitMemoryPages, (), { return wasmMemory.buffer.byteLength >>> 16; });
+EM_JS(double, JitNow, (), { return performance.now(); });
+#endif
 
 // ── GX command stream capture ──
 //
@@ -440,6 +461,7 @@ int main(int argc, char** argv)
   u64 dump_at = 0;
   u32 watch_addr = 0;
   bool want_coverage = false;
+  bool want_jit = false;
   bool want_render = false;
   std::string xfb_path;
   u64 frame_every = 0;
@@ -509,6 +531,10 @@ int main(int argc, char** argv)
     // gap between those is what to build next.
     else if (std::strcmp(argv[i], "--jit-coverage") == 0)
       want_coverage = true;
+    // --jit: execute through compiled blocks where possible, interpreting
+    // whatever will not compile.
+    else if (std::strcmp(argv[i], "--jit") == 0)
+      want_jit = true;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -968,6 +994,9 @@ int main(int argc, char** argv)
   // ── execute ──
   INIT_MARK("stepping");
   std::printf("\n  stepping %llu instructions...\n", static_cast<unsigned long long>(steps));
+#if defined(__EMSCRIPTEN__)
+  const double step_t0 = JitNow();
+#endif
   u64 executed = 0;
   u32 watch_last = 0;
   u64 frame_index = 0;
@@ -976,6 +1005,120 @@ int main(int argc, char** argv)
   Memory::MemoryManager* mem_for_cov = &system.GetMemory();
   const u32 first_pc = state.pc;
   u32 min_pc = state.pc, max_pc = state.pc;
+
+  // ── the block cache ──
+  //
+  // One compiled block per guest PC, compiled the first time that PC is
+  // reached. Entries with a negative index are PCs where nothing worth
+  // compiling starts, and are remembered so the compiler is not re-run on
+  // every visit to the same spot.
+  struct JitEntry
+  {
+    int index = -1;       // table index, which is a callable function pointer
+    u32 instructions = 0;
+  };
+  std::unordered_map<u32, JitEntry> jit_cache;
+  u64 jit_blocks = 0, jit_insts = 0, jit_interp = 0, jit_bails = 0;
+#if defined(__EMSCRIPTEN__)
+  ppc2wasm::StateLayout jit_layout;
+  jit_layout.gpr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr));
+  jit_layout.cr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, cr));
+  jit_layout.xer_so_ov_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_so_ov));
+  jit_layout.spr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, spr));
+  jit_layout.cr_table_base =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data()));
+  jit_layout.ram_base =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetRAM()));
+  jit_layout.memory_pages = static_cast<u32>(JitMemoryPages());
+  const u32 jit_state_ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(&state));
+  auto& jit_timing = system.GetCoreTiming();
+
+  // Blocks shorter than this are not worth a module: compilation and
+  // installation cost more than interpreting four instructions.
+  constexpr u32 kMinBlock = 4;
+  constexpr u32 kMaxBlock = 64;
+#endif
+
+  // Run one step, through a compiled block when there is one. Returns how
+  // many guest instructions were executed.
+  auto step_once = [&]() -> u32 {
+#if defined(__EMSCRIPTEN__)
+    if (!want_jit)
+    {
+      ppc.SingleStep();
+      return 1;
+    }
+    const u32 pc = state.pc;
+    auto it = jit_cache.find(pc);
+    if (it == jit_cache.end())
+    {
+      u32 code[kMaxBlock];
+      for (u32 k = 0; k < kMaxBlock; ++k)
+        code[k] = system.GetMemory().Read_U32(pc + k * 4);
+      auto r = ppc2wasm::CompileBlock(code, pc, kMaxBlock, jit_layout);
+      JitEntry e;
+      if (r.instructions >= kMinBlock && !r.module.empty())
+      {
+        e.index = JitInstall(r.module.data(), static_cast<int>(r.module.size()));
+        e.instructions = r.instructions;
+      }
+      it = jit_cache.emplace(pc, e).first;
+    }
+    if (it->second.index < 0)
+    {
+      ++jit_interp;
+      ppc.SingleStep();
+      return 1;
+    }
+
+    using BlockFn = u32 (*)(u32);
+    BlockFn f = reinterpret_cast<BlockFn>(it->second.index);
+    const u32 ret = f(jit_state_ptr);
+
+    u32 ran;
+    if (ret & 1u)
+    {
+      // A bail: only the instructions before the refused one ran.
+      const u32 bail = ret & ~1u;
+      ran = (bail - pc) / 4;
+      state.pc = state.npc = bail;
+      ++jit_bails;
+      if (ran == 0)
+      {
+        // Refused on its very first instruction -- interpret that one so the
+        // guest always makes progress, or this is an infinite loop.
+        ++jit_interp;
+        ppc.SingleStep();
+        return 1;
+      }
+    }
+    else
+    {
+      ran = it->second.instructions;
+      state.pc = state.npc = ret;
+    }
+
+    // The emulated clock does not advance by itself inside a block. Without
+    // this, no scheduled event ever fires: no vertical retrace, no IPC reply,
+    // and the game waits forever on a flag an interrupt was meant to set.
+    //
+    // Events that would have fired mid-block fire at the block boundary
+    // instead, so timing is quantised to block length. That is a real
+    // behavioural difference from the interpreter, not an implementation
+    // detail -- it is why a JIT run is not expected to be instruction-exact
+    // against an interpreted one.
+    jit_timing.GetGlobals().slice_length = static_cast<int>(ran);
+    state.downcount = 0;
+    jit_timing.Advance();
+
+    ++jit_blocks;
+    jit_insts += ran;
+    return ran;
+#else
+    ppc.SingleStep();
+    return 1;
+#endif
+  };
 
   // ── FIFO milestones ──
   // The Phase 1 gate is the first rendered frame's FIFO write, so the run has
@@ -1116,8 +1259,9 @@ int main(int argc, char** argv)
                       static_cast<unsigned long long>(state.ps[r].PS1AsU64()));
       }
     }
-    ppc.SingleStep();
-    ++executed;
+    const u32 ran_now = step_once();
+    i += ran_now - 1;  // the for-loop's own ++i accounts for the first
+    executed += ran_now;
     min_pc = std::min(min_pc, state.pc);
     max_pc = std::max(max_pc, state.pc);
 
@@ -1146,9 +1290,35 @@ int main(int argc, char** argv)
       break;
   }
 
+#if defined(__EMSCRIPTEN__)
+  {
+    // Wall time for the stepping phase only. This is the number the whole
+    // recompiler exists to move, and it is reported whether or not --jit is
+    // on so the two runs are directly comparable.
+    const double ms = JitNow() - step_t0;
+    std::printf("  speed     %.0f ms, %.1f MIPS  (%s)\n", ms,
+                executed / (ms / 1000.0) / 1e6, want_jit ? "jit" : "interpreter");
+  }
+#endif
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
   std::printf("  pc range  0x%08x .. 0x%08x (started 0x%08x, now 0x%08x)\n", min_pc, max_pc,
               first_pc, state.pc);
+#if defined(__EMSCRIPTEN__)
+  if (want_jit)
+  {
+    const double covered = executed ? 100.0 * static_cast<double>(jit_insts) /
+                                          static_cast<double>(executed)
+                                    : 0.0;
+    std::printf("  jit       %llu blocks cached, %llu compiled-block entries\n",
+                static_cast<unsigned long long>(jit_cache.size()),
+                static_cast<unsigned long long>(jit_blocks));
+    std::printf("  jit       %llu instructions in compiled code (%.1f%% of executed)\n",
+                static_cast<unsigned long long>(jit_insts), covered);
+    std::printf("  jit       %llu interpreted singly, %llu block bails\n",
+                static_cast<unsigned long long>(jit_interp),
+                static_cast<unsigned long long>(jit_bails));
+  }
+#endif
   std::printf("  disc      %llu requests, %.2f MB fetched\n",
               static_cast<unsigned long long>(stats->requests),
               stats->bytes / (1024.0 * 1024.0));

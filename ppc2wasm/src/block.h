@@ -138,7 +138,7 @@ inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
   PutU32(b, l.gpr_offset + n * 4);
 }
 
-// Emit: if ((ea & guard_mask) != guard_value) return bail_pc;
+// Emit: if ((ea & guard_mask) != guard_value) return bail_pc | 1;
 //
 // A compiled block may only touch MEM1. Anything else -- MEM2, MMIO, an
 // unmapped address -- has semantics this code does not implement, so the
@@ -148,6 +148,13 @@ inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
 // Bailing before the instruction's effects are applied is what makes this
 // safe. Everything earlier in the block is already committed to guest state,
 // and resuming at this PC re-runs exactly the instruction that was refused.
+//
+// The returned PC has its low bit SET to mark it as a bail. PowerPC
+// instructions are four-byte aligned so the bit is otherwise unused, and the
+// dispatcher needs the distinction: a bail means only part of the block ran,
+// and the emulated clock must be advanced by that part rather than by the
+// whole. Without the marker, a block whose branch happens to target its own
+// first instruction is indistinguishable from one that refused immediately.
 inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_t bail_pc)
 {
   b.push_back(kLocalGet);
@@ -161,7 +168,7 @@ inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_
   b.push_back(kIf);
   b.push_back(kVoid);
   b.push_back(kI32Const);
-  PutI32(b, static_cast<int32_t>(bail_pc));
+  PutI32(b, static_cast<int32_t>(bail_pc | 1u));
   b.push_back(kReturn);
   b.push_back(kEnd);
 }
