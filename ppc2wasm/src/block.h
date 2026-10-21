@@ -68,6 +68,21 @@ struct StateLayout
   uint32_t spr_offset = 0;       // offsetof(PowerPCState, spr)
   uint32_t lr_index = 8;         // SPR_LR
   uint32_t ctr_index = 9;        // SPR_CTR
+
+  // ── block linking ──
+  //
+  // When enabled, a block does not return to the dispatcher: it decrements
+  // the guest downcount, looks the next PC up in a table the dispatcher
+  // maintains, and tail-calls straight into the next block. A chain ends
+  // when the downcount expires or the lookup misses.
+  //
+  // Linking is OFF by default so that the per-instruction differential keeps
+  // compiling blocks that simply return -- the thing it checks is the guest
+  // state a block produces, not how control leaves it.
+  bool enable_linking = false;
+  uint32_t downcount_offset = 0;  // offsetof(PowerPCState, downcount)
+  uint32_t link_base = 0;         // host address of the link table
+  uint32_t link_mask = 0;         // entry count - 1, entries are {pc, index}
 };
 
 namespace detail
@@ -155,7 +170,8 @@ inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
 // and the emulated clock must be advanced by that part rather than by the
 // whole. Without the marker, a block whose branch happens to target its own
 // first instruction is indistinguishable from one that refused immediately.
-inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_t bail_pc)
+inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_t bail_pc,
+                      uint32_t insts_before)
 {
   b.push_back(kLocalGet);
   PutU32(b, ea_local);
@@ -167,6 +183,26 @@ inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_
   b.push_back(kI32Ne);
   b.push_back(kIf);
   b.push_back(kVoid);
+  // A bail skips the shared epilogue, so it has to account for its own
+  // partial execution. Without this the dispatcher cannot tell how far a
+  // CHAIN got: it sees only the final PC, and the blocks that ran before the
+  // refusal are invisible.
+  if (l.enable_linking && insts_before)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.downcount_offset);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(insts_before));
+    b.push_back(kI32Sub);
+    b.push_back(kI32Store);
+    PutU32(b, 2);
+    PutU32(b, l.downcount_offset);
+  }
   b.push_back(kI32Const);
   PutI32(b, static_cast<int32_t>(bail_pc | 1u));
   b.push_back(kReturn);
@@ -390,6 +426,118 @@ inline void EmitSetSpr(Bytes& b, const StateLayout& l, uint32_t index, uint32_t 
   PutU32(b, 2);
   PutU32(b, l.spr_offset + index * 4);
 }
+
+// The shared block epilogue, used only when linking is enabled.
+//
+// local 4 holds the PC to continue at. The block has already applied all its
+// effects; what remains is deciding whether to keep running compiled code.
+//
+// The downcount is guest state the interpreter also uses, so decrementing it
+// here keeps one clock rather than two. When it expires the chain returns to
+// the dispatcher, which advances CoreTiming by however much was consumed --
+// that is the only point at which scheduled events can fire, so chain length
+// directly sets timing granularity.
+// Leave the block with the PC already on the stack.
+//
+// Without linking that is simply a return. With linking the value is parked
+// in local 4 and control branches to the shared epilogue, so every exit --
+// fall-through, taken branch, return instruction -- goes through the same
+// downcount and lookup logic exactly once.
+inline void EmitGoTo(Bytes& b, const StateLayout& l, uint32_t br_depth)
+{
+  if (!l.enable_linking)
+  {
+    b.push_back(kReturn);
+    return;
+  }
+  b.push_back(kLocalSet);
+  PutU32(b, 4);
+  b.push_back(kBr);
+  PutU32(b, br_depth);
+}
+
+inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
+{
+  // downcount -= insts, keeping the new value
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.downcount_offset);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(insts));
+  b.push_back(kI32Sub);
+  b.push_back(kLocalTee);
+  PutU32(b, 5);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, l.downcount_offset);
+
+  // Out of budget: hand back to the dispatcher.
+  b.push_back(kLocalGet);
+  PutU32(b, 5);
+  b.push_back(kI32Const);
+  PutI32(b, 0);
+  b.push_back(kI32LeS);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  b.push_back(kLocalGet);
+  PutU32(b, 4);
+  b.push_back(kReturn);
+  b.push_back(kEnd);
+
+  // slot = link_base + ((next_pc >> 2) & mask) * 8
+  b.push_back(kLocalGet);
+  PutU32(b, 4);
+  b.push_back(kI32Const);
+  PutI32(b, 2);
+  b.push_back(kI32ShrU);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.link_mask));
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.link_base));
+  b.push_back(kI32Add);
+  b.push_back(kLocalSet);
+  PutU32(b, 6);
+
+  // The stored PC is checked, not assumed: the table is a direct-mapped
+  // cache and two PCs can land in the same slot. A miss is correct and
+  // cheap; a wrong hit would execute another block's code.
+  b.push_back(kLocalGet);
+  PutU32(b, 6);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 4);
+  b.push_back(kI32Eq);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);  // the next block takes the same state pointer
+  b.push_back(kLocalGet);
+  PutU32(b, 6);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, 4);
+  // A tail call, not a call: a linked chain is a sequence of jumps and costs
+  // no stack, so chain length is bounded by the downcount rather than by how
+  // deep the host stack can go.
+  b.push_back(kReturnCallIndirect);
+  PutU32(b, 0);  // type index
+  PutU32(b, 0);  // table index
+  b.push_back(kEnd);
+
+  // Lookup missed: the dispatcher will compile or find it.
+  b.push_back(kLocalGet);
+  PutU32(b, 4);
+}
 }  // namespace detail
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
@@ -611,7 +759,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
       body.push_back(kI32Const);
       PutI32(body, static_cast<int32_t>(target));
-      body.push_back(kReturn);
+      EmitGoTo(body, layout, 0);
       handled = true;
       ends_block = true;
       break;
@@ -643,7 +791,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         // Branch always -- the condition is ignored.
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(target));
-        body.push_back(kReturn);
+        EmitGoTo(body, layout, 0);
       }
       else
       {
@@ -656,7 +804,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kVoid);
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(target));
-        body.push_back(kReturn);
+        EmitGoTo(body, layout, 1);  // 0 is the if, 1 the enclosing block
         body.push_back(kEnd);
         // Falling through leaves the block's trailing end_pc as the result,
         // which is this instruction's PC plus four.
@@ -700,7 +848,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       {
         body.push_back(kLocalGet);
         PutU32(body, 1);
-        body.push_back(kReturn);
+        EmitGoTo(body, layout, 0);
       }
       else
       {
@@ -712,7 +860,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kVoid);
         body.push_back(kLocalGet);
         PutU32(body, 1);
-        body.push_back(kReturn);
+        EmitGoTo(body, layout, 1);
         body.push_back(kEnd);
       }
       used_locals = used_locals < 2 ? 2 : used_locals;
@@ -728,7 +876,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         break;
       const uint32_t this_pc = start_pc + n * 4;
       EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
-      EmitGuard(body, layout, 1, this_pc);
+      EmitGuard(body, layout, 1, this_pc, n);
       // Keep the GUEST address: it is what gets written back, not the host
       // address the store uses.
       body.push_back(kLocalGet);
@@ -770,7 +918,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     {
       const uint32_t this_pc = start_pc + n * 4;
       EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
-      EmitGuard(body, layout, 1, this_pc);
+      EmitGuard(body, layout, 1, this_pc, n);
       EmitToHostAddress(body, layout, 1);
       BeginStoreGpr(body);
       if (op == 32)
@@ -796,7 +944,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     {
       const uint32_t this_pc = start_pc + n * 4;
       EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
-      EmitGuard(body, layout, 1, this_pc);
+      EmitGuard(body, layout, 1, this_pc, n);
       EmitToHostAddress(body, layout, 1);
       // Keep the value in a local: a byte-order store reads it four times,
       // and the wasm stack cannot be indexed.
@@ -862,12 +1010,35 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   if (n == 0)
     return r;  // nothing compiled; module stays empty
 
-  // The block's result is the PC to resume at.
-  body.push_back(kI32Const);
-  PutI32(body, static_cast<int32_t>(r.end_pc));
+  if (layout.enable_linking)
+  {
+    // Wrap everything so a branch can leave the instruction stream without
+    // leaving the function, then run the shared epilogue exactly once.
+    Bytes wrapped;
+    wrapped.push_back(kBlock);
+    wrapped.push_back(kVoid);
+    PutBytes(wrapped, body);
+    // Fall-through case: continue at the instruction after the block.
+    wrapped.push_back(kI32Const);
+    PutI32(wrapped, static_cast<int32_t>(r.end_pc));
+    wrapped.push_back(kLocalSet);
+    PutU32(wrapped, 4);
+    wrapped.push_back(kEnd);
+    EmitLinkEpilogue(wrapped, layout, n);
+    body = std::move(wrapped);
+    used_locals = used_locals < 6 ? 6 : used_locals;
+  }
+  else
+  {
+    // The block's result is the PC to resume at.
+    body.push_back(kI32Const);
+    PutI32(body, static_cast<int32_t>(r.end_pc));
+  }
 
   ModuleBuilder mb;
   mb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
+  if (layout.enable_linking)
+    mb.ImportTable();
   mb.SetFunction({kI32}, {kI32}, body, "f", used_locals);
   r.module = mb.Build();
   return r;

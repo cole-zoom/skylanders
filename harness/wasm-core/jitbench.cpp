@@ -29,7 +29,9 @@ EM_JS(int, InstallModule, (const uint8_t* ptr, int len), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, { env: { memory: wasmMemory } });
+    const inst = new WebAssembly.Instance(mod, {
+      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
+    });
     const idx = wasmTable.length;
     wasmTable.grow(1);
     wasmTable.set(idx, inst.exports.f);
