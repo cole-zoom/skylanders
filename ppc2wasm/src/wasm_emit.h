@@ -98,6 +98,8 @@ enum : uint8_t
   kI32Shl = 0x74,
   kI32ShrS = 0x75,
   kI32ShrU = 0x76,
+  kI32Rotl = 0x77,
+  kI32Rotr = 0x78,
 };
 
 // Builds a module exporting one function, optionally importing linear memory

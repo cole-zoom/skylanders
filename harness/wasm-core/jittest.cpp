@@ -23,6 +23,7 @@
 #include <cstring>
 #include <vector>
 
+#include "../../ppc2wasm/src/block.h"
 #include "../../ppc2wasm/src/wasm_emit.h"
 
 #if defined(__EMSCRIPTEN__)
@@ -137,6 +138,49 @@ int main()
       }
     }
   }
+  // ── the block compiler's decode half ──
+  //
+  // Emission is only checkable by running it, which needs a browser
+  // (harness/wasm-core/jitdiff.cpp). What CAN be checked anywhere is the
+  // decoding: the mask PowerPC builds from MB..ME, and where a block stops.
+  std::printf("\n");
+  using ppc2wasm::detail::Mask;
+  check(Mask(0, 31) == 0xFFFFFFFFu, "mask 0..31 is every bit");
+  check(Mask(0, 0) == 0x80000000u, "mask 0..0 is the MOST significant bit");
+  check(Mask(31, 31) == 0x00000001u, "mask 31..31 is the least significant bit");
+  check(Mask(16, 31) == 0x0000FFFFu, "mask 16..31 is the low half");
+  check(Mask(0, 15) == 0xFFFF0000u, "mask 0..15 is the high half");
+  // MB > ME is legal and WRAPS -- it selects the complement of the gap, not
+  // an empty set. Reading it as empty silently drops bits.
+  check(Mask(28, 3) == 0xF000000Fu, "mask 28..3 wraps around");
+
+  {
+    ppc2wasm::StateLayout L{.gpr_offset = 20, .memory_pages = 4096, .memory_shared = true};
+    const uint32_t three[] = {0x38600005, 0x38830007, 0x7CA32214};
+    auto r = ppc2wasm::CompileBlock(three, 0x80001000, 3, L);
+    check(r.instructions == 3, "three integer instructions compile");
+    check(r.end_pc == 0x8000100C, "end pc follows the last instruction");
+    check(!r.module.empty(), "a module is produced");
+
+    // A branch is not supported, so the block must END there rather than
+    // translating past it -- compiling a branch as a no-op would produce code
+    // that silently falls through.
+    const uint32_t with_branch[] = {0x38600005, 0x48000010, 0x38830007};
+    auto b = ppc2wasm::CompileBlock(with_branch, 0x80001000, 3, L);
+    check(b.instructions == 1, "a block stops at the first unsupported instruction");
+    check(b.end_pc == 0x80001004, "end pc points AT the unsupported instruction");
+
+    // The dot forms set the condition register, which is not modelled. They
+    // must stop the block, not be treated as their non-dot twins.
+    const uint32_t rc_form[] = {0x7C632215};  // add. r3, r3, r4
+    auto d = ppc2wasm::CompileBlock(rc_form, 0x80001000, 1, L);
+    check(d.instructions == 0, "an Rc (dot) form stops the block");
+
+    const uint32_t nothing[] = {0x48000010};
+    auto n = ppc2wasm::CompileBlock(nothing, 0x80001000, 1, L);
+    check(n.module.empty(), "a block that compiles nothing produces no module");
+  }
+
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
   return g_failures ? 1 : 0;
 #else
