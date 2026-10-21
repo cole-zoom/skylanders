@@ -1,0 +1,82 @@
+diff --git a/Source/Core/VideoBackends/Software/SWGfx.cpp b/Source/Core/VideoBackends/Software/SWGfx.cpp
+index 7004c50..1db7b4f 100644
+--- a/Source/Core/VideoBackends/Software/SWGfx.cpp
++++ b/Source/Core/VideoBackends/Software/SWGfx.cpp
+@@ -61,6 +61,9 @@ bool SWGfx::BindBackbuffer(const ClearColor& clear_color)
+   if (!g_presenter->SurfaceResizedTestAndClear())
+     return true;
+ 
++  if (!m_window->HasContext())
++    return true;
++
+   GLContext* context = m_window->GetContext();
+   context->Update();
+   g_presenter->SetBackbuffer(context->GetBackBufferWidth(), context->GetBackBufferHeight());
+@@ -137,6 +140,11 @@ void SWGfx::SetScissorRect(const MathUtil::Rectangle<int>& rc)
+ 
+ SurfaceInfo SWGfx::GetSurfaceInfo() const
+ {
++  // A fixed surface when there is no context to ask. The value only drives
++  // presentation scaling, which a headless run does not do.
++  if (!m_window->HasContext())
++    return {640, 480, 1.0f, AbstractTextureFormat::RGBA8};
++
+   GLContext* context = m_window->GetContext();
+   return {std::max(context->GetBackBufferWidth(), 1u), std::max(context->GetBackBufferHeight(), 1u),
+           1.0f, AbstractTextureFormat::RGBA8};
+diff --git a/Source/Core/VideoBackends/Software/SWOGLWindow.cpp b/Source/Core/VideoBackends/Software/SWOGLWindow.cpp
+index a002e3e..b687c6b 100644
+--- a/Source/Core/VideoBackends/Software/SWOGLWindow.cpp
++++ b/Source/Core/VideoBackends/Software/SWOGLWindow.cpp
+@@ -29,11 +29,18 @@ std::unique_ptr<SWOGLWindow> SWOGLWindow::Create(const WindowSystemInfo& wsi)
+ 
+ bool SWOGLWindow::IsHeadless() const
+ {
+-  return m_gl_context->IsHeadless();
++  return !m_gl_context || m_gl_context->IsHeadless();
+ }
+ 
+ bool SWOGLWindow::Initialize(const WindowSystemInfo& wsi)
+ {
++  // No window, no context, no presentation -- but still a working
++  // rasteriser. Without this the Software backend cannot initialise at all in
++  // a headless run, which is the only kind a differential harness or a browser
++  // worker can do.
++  if (wsi.type == WindowSystemType::Headless)
++    return true;
++
+   m_gl_context = GLContext::Create(wsi);
+   if (!m_gl_context)
+     return false;
+@@ -87,6 +94,10 @@ bool SWOGLWindow::Initialize(const WindowSystemInfo& wsi)
+ void SWOGLWindow::ShowImage(const AbstractTexture* image,
+                             const MathUtil::Rectangle<int>& xfb_region)
+ {
++  // Nothing to present to.
++  if (!m_gl_context)
++    return;
++
+   const SW::SWTexture* sw_image = static_cast<const SW::SWTexture*>(image);
+   m_gl_context->Update();  // just updates the render window position and the backbuffer size
+ 
+diff --git a/Source/Core/VideoBackends/Software/SWOGLWindow.h b/Source/Core/VideoBackends/Software/SWOGLWindow.h
+index 965f7f4..baafe2a 100644
+--- a/Source/Core/VideoBackends/Software/SWOGLWindow.h
++++ b/Source/Core/VideoBackends/Software/SWOGLWindow.h
+@@ -18,6 +18,16 @@ public:
+   ~SWOGLWindow();
+ 
+   GLContext* GetContext() const { return m_gl_context.get(); }
++
++  // True when the window was created without a GL context at all.
++  //
++  // The software rasteriser is pure CPU -- Clipper, Rasterizer and the EFB
++  // interface never touch GL. The context exists only to PRESENT the finished
++  // image. A headless run has nowhere to present to, and a browser worker has
++  // no GL context available at all, so the backend is made to work without
++  // one: it still rasterises, still performs EFB copies into the XFB in guest
++  // memory, and simply does not display the result.
++  bool HasContext() const { return m_gl_context != nullptr; }
+   bool IsHeadless() const;
+ 
+   // Image to show, will be swapped immediately
