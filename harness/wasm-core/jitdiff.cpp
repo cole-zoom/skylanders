@@ -766,7 +766,7 @@ int main()
     int block_fail = 0, blocks_run = 0;
     for (int trial = 0; trial < 1500 && block_fail < 4; ++trial)
     {
-      const u32 len = 2 + (rnd() % 10);
+      const u32 len = 2 + (rnd() % 40);
       std::vector<u32> prog;
       for (u32 k = 0; k < len; ++k)
       {
@@ -939,7 +939,7 @@ int main()
         ++block_fail;
         std::printf("  block of %u (%u ran%s):", static_cast<u32>(prog.size()), ran,
                     bailed ? ", bailed" : "");
-        for (u32 k = 0; k < prog.size() && k < 6; ++k)
+        for (u32 k = 0; k < prog.size() && k < 40; ++k)
           std::printf(" %08x", prog[k]);
         std::printf("\n");
         if (bad >= 0)
