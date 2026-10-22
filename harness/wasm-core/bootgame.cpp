@@ -1172,9 +1172,19 @@ int main(int argc, char** argv)
   std::vector<u32> link_table(kLinkEntries * 2, 0);
   jit_layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
   jit_layout.link_mask = kLinkEntries - 1;
-  // hits, attempts, budget exits, misses
+  // hits, attempts, budget exits, misses -- OFF unless --jit-stats.
+  //
+  // Each counter is six wasm instructions including a load and a store,
+  // and the epilogue bumps two of them on the path every chain step takes.
+  // Twelve instructions per block entry, at 261 million block entries, to
+  // count something nobody reads during a timing run.
+  //
+  // The numbers are worth having and they are not worth having by
+  // default, which is the same conclusion the per-dispatch counters
+  // reached. --jit-stats turns both on together.
   u32 link_stats[4] = {0, 0, 0, 0};
-  jit_layout.link_stats_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(link_stats));
+  if (want_jit_stats)
+    jit_layout.link_stats_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(link_stats));
   // Of the exits that missed, how many had a compiled successor anyway? That
   // separates a publishing or lookup fault from a successor that genuinely
   // was not compiled yet.
