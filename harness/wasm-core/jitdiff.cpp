@@ -722,6 +722,414 @@ int main()
     check(block_fail == 0, lbl);
   }
 
+  // ── randomised CHAIN differential ──
+  //
+  // Everything above compiles with linking ENABLED against an EMPTY link
+  // table, so every lookup misses and no block ever tail-calls another. What
+  // that checks is that the epilogue does not change what a single block
+  // computes. It never executes a chain -- and linking is the default now,
+  // doing 95% of the work in a real boot. Until this existed, the only
+  // evidence that chains run correctly was that the boot completed.
+  //
+  // So: lay several blocks out back to back, publish each in the link table
+  // exactly as the dispatcher does, and enter the first. Control then leaves
+  // wasm only when the budget runs out, a lookup misses, a guard refuses or
+  // MSR is written -- the same four exits the emulator sees.
+  //
+  // How far the chain got is read from the DOWNCOUNT, not from the returned
+  // PC. Every exit accounts for itself there -- the epilogue once per block,
+  // a bail for the part of a block that ran, mtmsr for itself -- so the
+  // budget delta is the one number that covers all four. The returned PC
+  // cannot: it says where the chain stopped, not how many blocks it crossed.
+  {
+    std::printf("\n  randomised chain differential\n");
+
+    // Clear of the code the earlier sections wrote, and of their scratch.
+    constexpr u32 kChainBase = 0x8000'2000;
+    constexpr u32 kScratch = 0x8002'0000;
+    // Wide enough to cover every address the generator can produce: a base
+    // register up to 47 words into the window plus the largest displacement
+    // it emits. A digest that stopped short would read as agreement on the
+    // stores that landed past its end.
+    constexpr u32 kScratchWords = 512;
+
+    // The link counters the epilogue bumps. These are the evidence that this
+    // test did what it claims: a chain differential whose lookups all missed
+    // would pass in exactly the same silence as one that worked.
+    u32 chain_stats[4] = {0, 0, 0, 0};
+    layout.link_stats_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(chain_stats));
+
+    // Instructions that never END a block, so a block's length is decided
+    // here rather than by what the generator happened to draw. Blocks of a
+    // known, fixed length are what make a branch target computable: the
+    // chain only links if the target is a block ENTRY, and a generator that
+    // did not know where entries were would almost never produce one.
+    struct Gen { u32 primary; u32 xo; };
+    static const Gen mid[] = {
+        {14, 0}, {15, 0}, {7, 0},  {24, 0}, {26, 0}, {21, 0},
+        {11, 0}, {10, 0},
+        {32, 0}, {34, 0}, {40, 0}, {36, 0}, {38, 0}, {44, 0},
+        {31, 266}, {31, 40}, {31, 444}, {31, 28}, {31, 316},
+        {31, 24}, {31, 536}, {31, 954}, {31, 922}, {31, 104},
+        {31, 26}, {31, 60}, {31, 124}, {31, 235},
+        {31, 23}, {31, 151}, {31, 87}, {31, 215}, {31, 83},
+    };
+
+    u32 seed = 0x5EED'C4A1;
+    auto rnd = [&seed]() {
+      seed ^= seed << 13;
+      seed ^= seed >> 17;
+      seed ^= seed << 5;
+      return seed;
+    };
+
+    auto digest = [&]() {
+      u64 h = 0xcbf29ce484222325ULL;
+      for (u32 w = 0; w < kScratchWords; ++w)
+      {
+        const u32 v = memory.Read_U32(kScratch + w * 4);
+        for (int by = 0; by < 4; ++by)
+        {
+          h ^= (v >> (by * 8)) & 0xFF;
+          h *= 0x100000001b3ULL;
+        }
+      }
+      return h;
+    };
+
+    // Registers are given ROLES, and the generator respects them:
+    //
+    //   r1        the machine state value an mtmsr may safely write
+    //   r2-r15    results -- the only registers any instruction WRITES
+    //   r16-r22   small non-negative indices for the indexed forms
+    //   r23       a base in MEM2, which the guard must always refuse
+    //   r24-r31   bases inside the scratch window
+    //
+    // The first version drew every field at random, as the block
+    // differential does, and measured as a far weaker test than it looked:
+    // two chains in three died on the MEM1 guard before reaching a single
+    // lookup, and 300 chains produced four link misses between them.
+    //
+    // The reason is worth writing down, because it is an easy decode slip to
+    // repeat. In PowerPC the destination is NOT always the rD field: ori,
+    // xori, rlwinm and all the logical forms of opcode 31 write rA, the
+    // field the other instructions use as a SOURCE. Drawing rA at random
+    // therefore clobbered the very registers that were keeping addresses
+    // inside MEM1. Writes are confined to r2-r15 here for that reason.
+    //
+    // r23 keeps bails present rather than banishing them: a chain that
+    // refuses partway through has to account for the blocks that already
+    // ran, and that accounting is only reachable with a guard that fires.
+    // One base in sixteen is that case, deliberately, instead of by
+    // accident at a rate nobody chose.
+    auto is_mem = [](const Gen& g) {
+      if (g.primary == 31)
+        return g.xo == 23 || g.xo == 151 || g.xo == 87 || g.xo == 215;
+      return g.primary == 32 || g.primary == 34 || g.primary == 40 || g.primary == 36 ||
+             g.primary == 38 || g.primary == 44;
+    };
+
+    auto gen_mid = [&]() {
+      const Gen& g = mid[rnd() % (sizeof(mid) / sizeof(mid[0]))];
+      const bool mem = is_mem(g);
+      const u32 a = mem ? (rnd() % 16 == 0 ? 23u : 24 + rnd() % 8) : (2 + rnd() % 14);
+      const u32 b = mem ? (16 + rnd() % 7) : (rnd() % 31 + 1);
+      const u32 d = 2 + rnd() % 14;
+      if (g.primary == 31)
+        return (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
+      return (g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0);
+    };
+
+    int fails = 0, chains_run = 0, chains_linked = 0, longest = 0;
+    int exit_bail = 0, exit_msr = 0;
+    u64 total_tail_calls = 0;
+
+    for (int trial = 0; trial < 300 && fails < 4; ++trial)
+    {
+      const u32 K = 2 + rnd() % 4;         // instructions per block
+      const u32 nblocks = 2 + rnd() % 5;   // blocks laid end to end
+
+      // The LAST instruction of each block is what decides where the chain
+      // goes next. Every form here targets a block entry, because a target
+      // that is not an entry is a lookup miss -- correct, but it ends the
+      // chain and tests nothing new.
+      std::vector<u32> prog(K * nblocks);
+      for (u32 i = 0; i < nblocks; ++i)
+      {
+        for (u32 k = 0; k + 1 < K; ++k)
+          prog[i * K + k] = gen_mid();
+
+        const u32 this_pc = kChainBase + (i * K + K - 1) * 4;
+        const u32 target = kChainBase + (rnd() % nblocks) * K * 4;
+        const u32 disp = target - this_pc;
+        u32 term;
+        switch (rnd() % 9)
+        {
+        case 0:
+        case 1:
+          term = gen_mid();  // falls through into the next block
+          break;
+        case 2:
+          term = (18u << 26) | (disp & 0x03FF'FFFC);  // b
+          break;
+        case 3:
+          // bl, which also leaves the NEXT block's entry in the link
+          // register -- so a later blr lands on an entry too, and the chain
+          // follows a call and its return the way real code does.
+          term = (18u << 26) | (disp & 0x03FF'FFFC) | 1u;
+          break;
+        case 4:
+          term = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | (disp & 0xFFFC);
+          break;
+        case 5:
+          // The same branch testing the bit as FALSE, so both edges of a
+          // conditional appear: one goes to the target, the other falls
+          // through, and both must be link targets.
+          term = (16u << 26) | (4u << 21) | ((rnd() % 4) << 16) | (disp & 0xFFFC);
+          break;
+        case 6:
+          term = 0x4E80'0020;  // blr
+          break;
+        case 7:
+          term = 0x4E80'0420;  // bcctr
+          break;
+        default:
+          // mtmsr r1 ends the chain with the MSR marker. The emulator's
+          // dispatcher has to unwind a chain from that exit, and it is the
+          // one exit that is neither a bail nor a budget expiry.
+          term = (31u << 26) | (1u << 21) | (146u << 1);
+          break;
+        }
+        prog[i * K + K - 1] = term;
+      }
+
+      u32 init_gpr[32];
+      for (int i = 0; i < 32; ++i)
+        init_gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : rnd();
+      for (int i = 16; i < 23; ++i)
+        init_gpr[i] = (rnd() % 64) * 4;  // indices
+      init_gpr[23] = 0x9000'0000 + (rnd() % 64) * 4;  // MEM2: always refused
+      for (int i = 24; i < 32; ++i)
+        init_gpr[i] = kScratch + (rnd() % 48) * 4;  // bases
+      init_gpr[1] = (state.msr.Hex & ~0x8000u) | ((rnd() & 1) ? 0x8000u : 0u);
+      // LR and CTR start at block entries, so blr and bcctr are chain steps
+      // rather than immediate misses.
+      const u32 init_lr = kChainBase + (rnd() % nblocks) * K * 4;
+      const u32 init_ctr = kChainBase + (rnd() % nblocks) * K * 4;
+
+      for (u32 w = 0; w < kScratchWords; ++w)
+        memory.Write_U32(rnd(), kScratch + w * 4);
+      std::vector<u32> init_mem(kScratchWords);
+      for (u32 w = 0; w < kScratchWords; ++w)
+        init_mem[w] = memory.Read_U32(kScratch + w * 4);
+
+      // Small, so a chain that loops back on itself stops quickly -- and so
+      // the budget exit is reached often rather than as a rarity.
+      const u32 budget = 6 + rnd() % 60;
+      const u32 init_msr = state.msr.Hex;
+
+      auto reset = [&]() {
+        state.msr.Hex = init_msr;
+        ppc.MSRUpdated();
+        for (int i = 0; i < 32; ++i)
+          state.gpr[i] = init_gpr[i];
+        for (int i = 0; i < 8; ++i)
+          state.cr.fields[i] = 0;
+        state.spr[SPR_LR] = init_lr;
+        state.spr[SPR_CTR] = init_ctr;
+        state.downcount = static_cast<int>(budget);
+        state.pc = state.npc = kChainBase;
+        for (u32 w = 0; w < kScratchWords; ++w)
+          memory.Write_U32(init_mem[w], kScratch + w * 4);
+        // The CODE is restored too, not just registers and scratch. A random
+        // register used as a store base can land on the program, and then
+        // the second engine would be running a different one from the first
+        // -- a divergence that is entirely the harness's.
+        for (size_t k = 0; k < prog.size(); ++k)
+          memory.Write_U32(prog[k], kChainBase + static_cast<u32>(k) * 4);
+      };
+
+      reset();
+
+      // Compile every block before publishing any of them. A half-filled
+      // table would let a chain jump to a block this trial never installed.
+      std::vector<int> index(nblocks, -1);
+      bool all_compiled = true;
+      for (u32 i = 0; i < nblocks && all_compiled; ++i)
+      {
+        auto rb = ppc2wasm::CompileBlock(&prog[i * K], kChainBase + i * K * 4, K, layout);
+        if (rb.instructions != K || rb.module.empty())
+          all_compiled = false;
+        else
+          index[i] = InstallModule(rb.module.data(), static_cast<int>(rb.module.size()));
+        if (index[i] < 0)
+          all_compiled = false;
+      }
+      if (!all_compiled)
+        continue;
+
+      for (u32 i = 0; i < nblocks; ++i)
+      {
+        const u32 pc = kChainBase + i * K * 4;
+        const u32 slot = (pc >> 2) & layout.link_mask;
+        link_table[slot * 2 + 0] = pc;
+        link_table[slot * 2 + 1] = static_cast<u32>(index[i]);
+      }
+
+      // Poison the slot a chain reaches by running off the end, with an
+      // entry for a DIFFERENT pc pointing at block 0.
+      //
+      // Without this every miss in this test is a miss against an empty
+      // slot, and "the stored PC is checked, not assumed" stays an
+      // untested claim. The table is direct-mapped, so the case that
+      // actually occurs in the emulator is an OCCUPIED slot belonging to
+      // someone else -- and the consequence of accepting it is not a slow
+      // chain but a jump into another block's code.
+      //
+      // It matters now rather than later: the next optimisation the handoff
+      // ranks is associativity or a better hash for exactly this table, and
+      // this is the invariant that work must not break.
+      const u32 past_end = kChainBase + nblocks * K * 4;
+      const u32 decoy = (past_end >> 2) & layout.link_mask;
+      link_table[decoy * 2 + 0] = past_end + 4;  // not the pc that will be looked up
+      link_table[decoy * 2 + 1] = static_cast<u32>(index[0]);
+
+      const u32 hits_before = chain_stats[0];
+
+      // Enter the chain. Not RunBlock: the budget has to be read before
+      // anything else touches guest state, because the MSR fix-up runs the
+      // interpreter's exception path and that is free to write it.
+      const u32 ret = reinterpret_cast<BlockFn>(index[0])(
+          static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+      const int ran = static_cast<int>(budget) - state.downcount;
+      const bool bailed = (ret & 1u) != 0;
+      const bool msr_changed = (ret & 2u) != 0;
+      state.pc = state.npc = ret & ~3u;
+      if (msr_changed)
+      {
+        ppc.MSRUpdated();
+        ppc.CheckExceptions();
+        state.pc = state.npc;
+      }
+
+      const u32 tail_calls = chain_stats[0] - hits_before;
+      u32 jit_gpr[32];
+      std::memcpy(jit_gpr, state.gpr, sizeof(jit_gpr));
+      u64 jit_cr[8];
+      std::memcpy(jit_cr, state.cr.fields, sizeof(jit_cr));
+      const u32 jit_lr = state.spr[SPR_LR];
+      const u32 jit_ctr = state.spr[SPR_CTR];
+      const u32 jit_pc = state.pc;
+      const u64 jit_mem = digest();
+
+      // Unpublish before the interpreter runs. The table is shared with
+      // every other trial, and a stale entry pointing at a retired module is
+      // how a chain ends up executing code from a program that no longer
+      // exists.
+      for (u32 i = 0; i < nblocks; ++i)
+      {
+        const u32 slot = ((kChainBase + i * K * 4) >> 2) & layout.link_mask;
+        link_table[slot * 2 + 0] = 0;
+        link_table[slot * 2 + 1] = 0;
+      }
+      link_table[decoy * 2 + 0] = 0;
+      link_table[decoy * 2 + 1] = 0;
+
+      ++chains_run;
+      exit_bail += bailed ? 1 : 0;
+      exit_msr += msr_changed ? 1 : 0;
+      total_tail_calls += tail_calls;
+      if (tail_calls > 0)
+        ++chains_linked;
+      if (static_cast<int>(tail_calls) + 1 > longest)
+        longest = static_cast<int>(tail_calls) + 1;
+
+      // The budget is a SOFT limit: the epilogue subtracts a block's length
+      // and only then tests, so the block that exhausts it has already run
+      // in full and the chain overshoots by up to one block. That is the
+      // emulator's behaviour too -- the dispatcher advances CoreTiming by
+      // whatever the chain actually consumed, not by the slice it offered.
+      // What would be a real defect is the budget moving backwards, or an
+      // overshoot larger than one block, which would mean an exit path
+      // accounts for itself wrongly.
+      if (ran < 0 || ran > static_cast<int>(budget + K))
+      {
+        ++fails;
+        std::printf("  chain of %u x %u: budget %u, downcount %d after\n", nblocks, K, budget,
+                    state.downcount);
+        continue;
+      }
+
+      reset();
+      for (int k = 0; k < ran; ++k)
+        ppc.SingleStep();
+      const u64 int_mem = digest();
+
+      bool ok = (jit_mem == int_mem) && (jit_pc == state.pc);
+      int bad = -1;
+      for (int i = 0; i < 32; ++i)
+        if (state.gpr[i] != jit_gpr[i])
+        {
+          ok = false;
+          if (bad < 0)
+            bad = i;
+        }
+      int bad_cr = -1;
+      for (int i = 0; i < 8; ++i)
+        if (state.cr.fields[i] != jit_cr[i])
+        {
+          ok = false;
+          if (bad_cr < 0)
+            bad_cr = i;
+        }
+      if (state.spr[SPR_LR] != jit_lr || state.spr[SPR_CTR] != jit_ctr)
+        ok = false;
+
+      if (!ok)
+      {
+        ++fails;
+        std::printf("  chain %u blocks x %u insts, %u tail calls, %d ran%s%s:\n", nblocks, K,
+                    tail_calls, ran, bailed ? ", bailed" : "", msr_changed ? ", msr" : "");
+        for (size_t k = 0; k < prog.size() && k < 12; ++k)
+          std::printf("      [%08x] %08x\n", kChainBase + static_cast<u32>(k) * 4, prog[k]);
+        if (bad >= 0)
+          std::printf("      r%-2d interpreter=%08x chained=%08x\n", bad, state.gpr[bad],
+                      jit_gpr[bad]);
+        if (bad_cr >= 0)
+          std::printf("      cr%d interpreter=%016llx chained=%016llx\n", bad_cr,
+                      static_cast<unsigned long long>(state.cr.fields[bad_cr]),
+                      static_cast<unsigned long long>(jit_cr[bad_cr]));
+        if (state.spr[SPR_LR] != jit_lr)
+          std::printf("      lr  interpreter=%08x chained=%08x\n", state.spr[SPR_LR], jit_lr);
+        if (state.spr[SPR_CTR] != jit_ctr)
+          std::printf("      ctr interpreter=%08x chained=%08x\n", state.spr[SPR_CTR], jit_ctr);
+        if (jit_pc != state.pc)
+          std::printf("      pc  interpreter=%08x chained=%08x\n", state.pc, jit_pc);
+        if (jit_mem != int_mem)
+          std::printf("      memory digests differ\n");
+      }
+    }
+
+    char lbl[160];
+    std::snprintf(lbl, sizeof(lbl), "randomised chain differential (%d chains, longest %d blocks)",
+                  chains_run, longest);
+    check(fails == 0, lbl);
+    // Without these the test could pass having never linked anything, which
+    // is precisely the hole it exists to close.
+    check(total_tail_calls > 0, "chains actually tail-called into a successor");
+    check(chain_stats[2] > 0, "at least one chain exited on the budget");
+    check(chain_stats[3] > 0, "at least one chain exited on a lookup miss");
+    std::printf("    %d of %d chains linked   tail calls %llu\n", chains_linked, chains_run,
+                static_cast<unsigned long long>(total_tail_calls));
+    std::printf("    hits %u  attempts %u  budget exits %u  misses %u\n", chain_stats[0],
+                chain_stats[1], chain_stats[2], chain_stats[3]);
+    // All four ways out of a chain, counted separately. A test can be green
+    // and still have left one of them unvisited, and the only way to know
+    // which is to count them rather than the passes.
+    std::printf("    exits: budget %u  miss %u  bail %d  msr %d\n", chain_stats[2],
+                chain_stats[3], exit_bail, exit_msr);
+  }
+
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
   std::fflush(stdout);
   return g_failures ? 1 : 0;
