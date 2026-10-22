@@ -76,6 +76,12 @@ Two-way or four-way associativity, or simply a better hash than
 `(pc >> 2) & mask`. Guest code is not uniformly distributed over PCs and the
 low bits are not the interesting ones.
 
+The invariant this must not break is that a slot's stored PC is **checked**,
+not assumed. The chain differential poisons the slot a chain reaches by
+running off the end, with an entry belonging to a different PC; accepting it
+costs not a slow chain but a jump into another block's code. Dropping the
+check leaves both the per-instruction and block differentials green.
+
 ### 4. Support MEM2
 
 The guard accepts only MEM1 (`0x80000000`, mask `0xFE000000`). **MEM2 lives at
@@ -124,11 +130,22 @@ been wrong, and every measurement has been right within one run:
   (~22% of the instruction stream), which no amount of instruction support
   changes.
 
-**Use the differentials.** `harness/wasm-core/jitdiff.cpp` runs three:
-hand-written cases, a randomised per-instruction differential, and a
-randomised **block** differential that compares registers, condition fields and
-a window of guest memory. Build it with `harness/wasm-core/link.sh` and run it
-in a browser.
+**Use the differentials.** `harness/wasm-core/run-jitdiff.sh` builds and runs
+all four in about five seconds: hand-written cases, a randomised
+per-instruction differential, a randomised **block** differential that
+compares registers, condition fields and a window of guest memory, and a
+randomised **chain** differential that publishes a link table and runs blocks
+linked together.
+
+They need Emscripten and the prebuilt libraries in `dolphin-web/build-wasm`,
+which is why CI does not run them. They do not need a browser — node has
+WebAssembly, a shared memory and a growable table, which is the whole of what
+this test uses.
+
+Read the counters the chain differential prints, not just its verdict. They
+say how many chains linked, how long the longest was, and how many took each
+of the four exits. A chain differential whose lookups all missed would pass in
+exactly the same silence as one that worked — see below.
 
 The block differential has caught a real translation bug and, three times, its
 own harness. Expect that: most early failures of a randomised test are the
@@ -190,10 +207,33 @@ to do that, which is not the same as it being safe.
 
 Stated plainly, because it is the largest risk:
 
-- **Linking.** The randomised differentials compile with linking *off*. The
-  only evidence that chains execute correctly is that the boot completes and
-  the PC range looks sane — and linking is now the default, doing 95% of the
-  work. **Closing this is worth doing before optimising further.**
+- ~~**Linking.**~~ Closed. `jitdiff.cpp` now runs a randomised chain
+  differential: blocks laid end to end, published in a link table the way the
+  dispatcher publishes them, entered at the first and compared against the
+  interpreter over registers, condition fields, LR, CTR, PC and a window of
+  guest memory. A typical run links 255 of 300 chains, 1840 tail calls, with
+  the longest chain 32 blocks.
+
+  Two things about it are worth knowing before changing it.
+
+  How far a chain got is read from the **downcount**, not the returned PC.
+  Every exit accounts for itself there — the epilogue once per block, a bail
+  for the part of a block that ran, `mtmsr` for itself — so the budget delta
+  is the one number covering all four. The returned PC says where a chain
+  stopped, not how many blocks it crossed. The budget is a *soft* limit: the
+  epilogue subtracts and only then tests, so a chain overshoots by up to one
+  block, and that is the emulator's behaviour too.
+
+  It asserts on its own **coverage**, not only on agreement. Breaking the
+  epilogue's hash so no chain ever forms leaves every state comparison green —
+  measured, not assumed — and only `chains actually tail-called` catches it.
+  Keep those assertions.
+
+- **Dispatcher-side link management.** The chain differential publishes the
+  table itself. What it does not exercise is the dispatcher's own logic in
+  `bootgame.cpp`: when a block is published, and **retirement** — a block that
+  bails on its first instruction is dropped and its slot cleared, permanently
+  and with no re-entry. That path has no test.
 - Timing quantisation. Chains are 10.73 instructions, so a scheduled event can
   fire that late. Nothing checks it.
 - Anything disc-dependent in CI. CI has no disc and never will; the boot
