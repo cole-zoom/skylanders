@@ -316,6 +316,39 @@ int main()
       {"bnelrl not taken leaves LR alone",
        {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0005, 0x2C04'0005, 0x4C82'0021}},
 
+      // ── CTR-decrementing branches ──
+      // bdnz is the back edge of every counted loop. BO=16 decrements CTR
+      // and branches while it is non-zero; BO=18 branches when it reaches
+      // zero. The decrement happens whether or not the branch is taken,
+      // which is the part that is easy to get wrong and impossible to see
+      // from the PC alone.
+      // li r3,3 ; mtspr CTR,r3 ; bdnz +8   -> CTR 2, taken
+      {"bdnz decrements CTR and branches while non-zero",
+       {0x3860'0003, 0x7C69'03A6, 0x4200'0008}},
+      // li r3,1 ; mtspr CTR,r3 ; bdnz +8   -> CTR 0, falls through
+      {"bdnz falls through when the counter hits zero",
+       {0x3860'0001, 0x7C69'03A6, 0x4200'0008}},
+      // bdz is the same decrement with the opposite test.
+      {"bdz branches when the counter reaches zero",
+       {0x3860'0001, 0x7C69'03A6, 0x4240'0008}},
+      {"bdz falls through while the counter is non-zero",
+       {0x3860'0005, 0x7C69'03A6, 0x4240'0008}},
+      // The decrement wraps rather than saturating, and zero is the case a
+      // saturating implementation would get wrong.
+      {"bdnz from zero wraps to 0xffffffff and branches",
+       {0x3860'0000, 0x7C69'03A6, 0x4200'0008}},
+      // bdnzf/bdnzt also consult a condition bit: both tests must pass.
+      // li r3,3 ; mtspr CTR,r3 ; li r4,5 ; cmpwi r4,5 ; bdnzt eq,+8
+      {"bdnzt needs both the counter and the condition",
+       {0x3860'0003, 0x7C69'03A6, 0x3880'0005, 0x2C04'0005, 0x4160'0008}},
+      {"bdnzt not taken when the condition fails, but still decrements",
+       {0x3860'0003, 0x7C69'03A6, 0x3880'0009, 0x2C04'0005, 0x4160'0008}},
+      // bdnzlr: the counted form of a return.
+      {"bdnzlr decrements and returns through LR",
+       {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0003, 0x7C89'03A6, 0x4E00'0020}},
+      {"bdnzlr falls through when the counter hits zero",
+       {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0001, 0x7C89'03A6, 0x4E00'0020}},
+
       // bcctr is the indirect branch: mtspr CTR then jump to it.
       {"bcctr branches through CTR",
        {0x3C60'8000, 0x6063'2000, 0x7C69'03A6, 0x4E80'0420}},
@@ -642,12 +675,21 @@ int main()
         else if (g.primary == 31)
           ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
         else if (g.primary == 16)
-          // A forward conditional branch with BO bit 2 set, so it is a plain
-          // condition test rather than a CTR form. LK varies, because a
-          // conditional branch-and-link that is NOT taken must leave the
-          // link register alone -- and with LK pinned to zero no randomised
-          // case could ever have noticed that it did not.
-          ins = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | 0x0008 | (rnd() & 1);
+        {
+          // A forward conditional branch, drawn across all six shapes of
+          // BO: branch on a condition bit being true or false, the two
+          // CTR-decrementing forms, and the two that test both. CTR is
+          // seeded near zero below, so the decrement crosses the boundary
+          // that decides the branch rather than always staying far from it.
+          //
+          // LK varies too, because a conditional branch-and-link that is
+          // NOT taken must leave the link register alone -- with LK pinned
+          // to zero no randomised case could ever have noticed that it did
+          // not.
+          static const u32 kBo[] = {12, 4, 16, 18, 0, 8};
+          const u32 bo = kBo[rnd() % 6];
+          ins = (16u << 26) | (bo << 21) | ((rnd() % 4) << 16) | 0x0008 | (rnd() & 1);
+        }
         else
           ins = (g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0);
         prog.push_back(ins);
@@ -685,6 +727,7 @@ int main()
       // the entry guard. Measured in the chain differential, where it had
       // silently cut linked chains from 244 to 104.
       const u32 init_msr = kPristineMsr;
+      const u32 init_ctr = rnd() % 4;
       auto reset = [&]() {
         state.msr.Hex = init_msr;
         ppc.MSRUpdated();
@@ -693,7 +736,11 @@ int main()
         for (int i = 0; i < 8; ++i)
           state.cr.fields[i] = 0;
         state.spr[SPR_LR] = 0;
-        state.spr[SPR_CTR] = 0;
+        // Small, so a bdnz in the program crosses zero rather than counting
+        // down from a number it could never reach. Zero itself is included:
+        // the decrement wraps to 0xffffffff, which a saturating
+        // implementation would get wrong and no larger seed would expose.
+        state.spr[SPR_CTR] = init_ctr;
         state.downcount = 10000;
         state.pc = state.npc = BASE;
         for (u32 w = 0; w < kScratchWords; ++w)
@@ -956,7 +1003,7 @@ int main()
         const u32 target = kChainBase + (rnd() % nblocks) * K * 4;
         const u32 disp = target - this_pc;
         u32 term;
-        switch (rnd() % 9)
+        switch (rnd() % 10)
         {
         case 0:
         case 1:
@@ -988,6 +1035,14 @@ int main()
           break;
         case 7:
           term = 0x4E80'0420;  // bcctr
+          break;
+        case 8:
+          // bdnz / bdz: the back edge of a counted loop, now that it
+          // compiles. CTR starts at a block address here, so bdnz always
+          // branches and bdz never does -- which is the point: a compiled
+          // back edge lets one chain span many iterations, and that is the
+          // behaviour the whole change exists to produce.
+          term = (16u << 26) | (((rnd() & 1) ? 16u : 18u) << 21) | (disp & 0xFFFC);
           break;
         default:
           // mtmsr r1 ends the chain with the MSR marker. The emulator's
