@@ -303,6 +303,19 @@ int main()
       {"stbu updates the base",
        {0x3C60'8000, 0x6063'7400, 0x3880'0055, 0x9C83'0008}},
 
+      // A conditional branch-and-link that is NOT taken must leave the link
+      // register alone. Dolphin writes LR inside the taken path; writing it
+      // unconditionally is invisible to every existing case here, because
+      // none of them sets LK on a conditional branch.
+      // lis r3,0x8000 ; ori r3,r3,0x2000 ; mtspr LR,r3 ; addi r4,r0,9 ;
+      // cmpwi r4,5 ; beql (not taken)
+      {"beql not taken leaves LR alone",
+       {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0009, 0x2C04'0005, 0x4182'0009}},
+      {"beql taken sets LR", {0x3860'0005, 0x2C03'0005, 0x4182'0009}},
+      // The same for the return form: bnelr+ with link, not taken.
+      {"bnelrl not taken leaves LR alone",
+       {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0005, 0x2C04'0005, 0x4C82'0021}},
+
       // bcctr is the indirect branch: mtspr CTR then jump to it.
       {"bcctr branches through CTR",
        {0x3C60'8000, 0x6063'2000, 0x7C69'03A6, 0x4E80'0420}},
@@ -630,8 +643,11 @@ int main()
           ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
         else if (g.primary == 16)
           // A forward conditional branch with BO bit 2 set, so it is a plain
-          // condition test rather than a CTR form.
-          ins = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | 0x0008;
+          // condition test rather than a CTR form. LK varies, because a
+          // conditional branch-and-link that is NOT taken must leave the
+          // link register alone -- and with LK pinned to zero no randomised
+          // case could ever have noticed that it did not.
+          ins = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | 0x0008 | (rnd() & 1);
         else
           ins = (g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0);
         prog.push_back(ins);
@@ -956,16 +972,19 @@ int main()
           term = (18u << 26) | (disp & 0x03FF'FFFC) | 1u;
           break;
         case 4:
-          term = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | (disp & 0xFFFC);
+          // LK varies here too. When a bcl IS taken its link write lands on
+          // the next block's entry, so the chain stays linkable and a later
+          // blr still finds a target.
+          term = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | (disp & 0xFFFC) | (rnd() & 1);
           break;
         case 5:
           // The same branch testing the bit as FALSE, so both edges of a
           // conditional appear: one goes to the target, the other falls
           // through, and both must be link targets.
-          term = (16u << 26) | (4u << 21) | ((rnd() % 4) << 16) | (disp & 0xFFFC);
+          term = (16u << 26) | (4u << 21) | ((rnd() % 4) << 16) | (disp & 0xFFFC) | (rnd() & 1);
           break;
         case 6:
-          term = 0x4E80'0020;  // blr
+          term = 0x4E80'0020 | (rnd() & 1);  // blr / blrl
           break;
         case 7:
           term = 0x4E80'0420;  // bcctr
