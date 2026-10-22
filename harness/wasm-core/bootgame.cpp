@@ -474,7 +474,7 @@ int main(int argc, char** argv)
   u32 watch_addr = 0;
   bool want_coverage = false;
   bool want_jit = false;
-  bool want_link = false;
+  bool want_link = true;
   bool want_render = false;
   std::string xfb_path;
   u64 frame_every = 0;
@@ -548,13 +548,15 @@ int main(int argc, char** argv)
     // whatever will not compile.
     else if (std::strcmp(argv[i], "--jit") == 0)
       want_jit = true;
-    // --jit-link: let blocks tail-call their successor instead of returning.
-    // OFF by default: measured, it currently costs more than it saves,
-    // because most blocks end at an instruction that cannot be compiled
-    // rather than at a branch, and the PC after such a block is by
-    // construction one no block starts at.
-    else if (std::strcmp(argv[i], "--jit-link") == 0)
-      want_link = true;
+    // --jit-no-link: make blocks return to the dispatcher instead of
+    // tail-calling their successor.
+    //
+    // Linking is ON by default now that it pays: 54.0 MIPS against 42.1
+    // without. It did not pay until two other things were true -- every
+    // block gets compiled, so a successor exists to link to, and blocks
+    // that always refuse get retired, so a chain is not routed through one.
+    else if (std::strcmp(argv[i], "--jit-no-link") == 0)
+      want_link = false;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -1067,8 +1069,13 @@ int main(int argc, char** argv)
   std::vector<u32> link_table(kLinkEntries * 2, 0);
   jit_layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
   jit_layout.link_mask = kLinkEntries - 1;
-  u32 link_hits = 0;
-  jit_layout.link_hits_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&link_hits));
+  // hits, attempts, budget exits, misses
+  u32 link_stats[4] = {0, 0, 0, 0};
+  jit_layout.link_stats_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(link_stats));
+  // Of the exits that missed, how many had a compiled successor anyway? That
+  // separates a publishing or lookup fault from a successor that genuinely
+  // was not compiled yet.
+  u64 miss_but_cached = 0, miss_total = 0;
   jit_layout.enable_linking = want_link;
 
   // How many guest instructions a chain may run before handing control back
@@ -1078,9 +1085,15 @@ int main(int argc, char** argv)
   const u32 jit_state_ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(&state));
   auto& jit_timing = system.GetCoreTiming();
 
-  // Blocks shorter than this are not worth a module: compilation and
-  // installation cost more than interpreting four instructions.
-  constexpr u32 kMinBlock = 4;
+  // Every block gets compiled, however short.
+  //
+  // The threshold used to be four, on the reasoning that installing a module
+  // costs more than interpreting a handful of instructions. That is true in
+  // isolation and wrong in aggregate: a block that is not compiled is not a
+  // LINK TARGET either, so every chain reaching it has to stop. Measured,
+  // 99.7% of link misses were successors that had simply never been
+  // compiled -- not collisions, not a stale table, not the budget.
+  constexpr u32 kMinBlock = 1;
   constexpr u32 kMaxBlock = 64;
 #endif
 
@@ -1168,8 +1181,25 @@ int main(int argc, char** argv)
 
     if (consumed == 0)
     {
-      // The chain refused before executing anything -- interpret one
-      // instruction so the guest always makes progress.
+      // The block refused on its very first instruction and did nothing.
+      //
+      // Compiling every block, however short, is what makes a successor
+      // exist to link to -- but it also creates blocks whose first
+      // instruction always refuses, usually a memory access outside MEM1.
+      // Those cost a call and a chain step and never execute anything, and
+      // with linking on they end a chain that was otherwise running.
+      //
+      // Retire it: drop the entry and clear its link slot so chains stop
+      // routing through a block that cannot make progress. The decision is
+      // made from OBSERVED behaviour, which is the only way -- whether an
+      // address lands in MEM1 is not knowable when the block is compiled.
+      it->second.index = -1;
+      const u32 slot = (pc >> 2) & jit_layout.link_mask;
+      if (link_table[slot * 2 + 0] == pc)
+      {
+        link_table[slot * 2 + 0] = 0;
+        link_table[slot * 2 + 1] = 0;
+      }
       ++jit_interp;
       ppc.SingleStep();
       return 1;
@@ -1182,6 +1212,16 @@ int main(int argc, char** argv)
     // Events that would have fired mid-chain fire at its end, so the slice
     // size sets timing granularity. That is a real behavioural difference
     // from the interpreter, not an implementation detail.
+    if (want_link && !bailed && !msr_changed)
+    {
+      // This exit came back to the dispatcher, so the chain stopped here.
+      // Was its successor something we had already compiled?
+      ++miss_total;
+      auto nx = jit_cache.find(next_pc);
+      if (nx != jit_cache.end() && nx->second.index >= 0)
+        ++miss_but_cached;
+    }
+
     if (msr_changed)
     {
       // The block wrote MSR and stopped. Everything the interpreter does
@@ -1426,7 +1466,14 @@ int main(int argc, char** argv)
       for (u32 i = 0; i < kLinkEntries; ++i)
         if (link_table[i * 2 + 1] != 0)
           ++live;
-      std::printf("  jit       link hits %u\n", link_hits);
+      std::printf("  jit       link hits %u, attempts %u, budget exits %u, misses %u\n",
+                  link_stats[0], link_stats[1], link_stats[2], link_stats[3]);
+      std::printf("  jit       of %llu missed exits, %llu had a compiled successor (%.1f%%)\n",
+                  static_cast<unsigned long long>(miss_total),
+                  static_cast<unsigned long long>(miss_but_cached),
+                  miss_total ? 100.0 * static_cast<double>(miss_but_cached) /
+                                   static_cast<double>(miss_total)
+                             : 0.0);
       std::printf("  jit       link table %llu/%u slots live, %.2f instructions per chain\n",
                   static_cast<unsigned long long>(live), kLinkEntries,
                   jit_blocks ? static_cast<double>(jit_insts) / static_cast<double>(jit_blocks)
