@@ -475,6 +475,7 @@ int main(int argc, char** argv)
   bool want_coverage = false;
   bool want_jit = false;
   bool want_link = true;
+  bool want_jit_stats = false;
   int jit_probe = 0;
   bool want_render = false;
   std::string xfb_path;
@@ -556,6 +557,12 @@ int main(int argc, char** argv)
     // without. It did not pay until two other things were true -- every
     // block gets compiled, so a successor exists to link to, and blocks
     // that always refuse get retired, so a chain is not routed through one.
+    else if (std::strcmp(argv[i], "--jit-stats") == 0)
+      // Per-dispatch and per-interpreted-instruction accounting. OFF by
+      // default: it costs about 4% of the run, and the speed line is the
+      // number this project steers by. A measurement that quietly taxes the
+      // thing it measures is worse than no measurement.
+      want_jit_stats = true;
     else if (std::strncmp(argv[i], "--jit-probe=", 12) == 0)
       // 1 = cache lookup, 2 = CoreTiming::Advance, 3 = one indirect call.
       // Each repeats work the dispatcher already does, once more per
@@ -1044,6 +1051,8 @@ int main(int argc, char** argv)
   {
     int index = -1;       // table index, which is a callable function pointer
     u32 instructions = 0;
+    u8 stop = 0;          // 0 branch, 1 unsupported instruction, 2 hit the limit
+    bool retired = false; // compiled, then observed to refuse its first instruction
   };
   std::unordered_map<u32, JitEntry> jit_cache;
   u64 jit_blocks = 0, jit_insts = 0, jit_interp = 0, jit_bails = 0;
@@ -1060,6 +1069,30 @@ int main(int argc, char** argv)
   // A sink the optimiser cannot see through, for probes whose result is
   // otherwise unused.
   volatile u64 jit_probe_sink = 0;
+
+  // ── why blocks are short, and what the interpreter is left holding ──
+  //
+  // Blocks average 2.82 instructions against a branch-density ceiling of
+  // about 4.5, so something other than branches is ending them. Counting
+  // the reason separates "compile more instruction forms" from "compile
+  // across branches", which are different projects.
+  //
+  // Static (per distinct block) and dynamic (per dispatch) are both kept.
+  // A reason that ends thousands of cold blocks and a reason that ends one
+  // block entered ten million times need different answers, and a single
+  // count cannot tell them apart.
+  u64 stop_static[3] = {0, 0, 0}, stop_insts[3] = {0, 0, 0}, stop_dyn[3] = {0, 0, 0};
+  // What the interpreter runs, keyed the way --jit-coverage keys it, split
+  // by WHY it is here. The two causes have different fixes and the totals
+  // alone cannot tell them apart:
+  //
+  //   never compiled  the form is not translated at all
+  //   retired         it compiled, then refused its first instruction every
+  //                   time, so the dispatcher dropped it -- which is what a
+  //                   MEM2 access looks like, and why MEM2 shows up as a
+  //                   small bail count rather than as the cost it is
+  std::map<u32, std::pair<u64, u32>> interp_counts, interp_retired;
+  u64 jit_retired_blocks = 0, interp_from_retired = 0;
 #if defined(__EMSCRIPTEN__)
   ppc2wasm::StateLayout jit_layout;
   jit_layout.gpr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr));
@@ -1160,6 +1193,11 @@ int main(int argc, char** argv)
         ++jit_installs;
         e.instructions = r.instructions;
       }
+      e.stop = (std::strcmp(r.stopped_on, "branch") == 0)                   ? 0
+               : (std::strcmp(r.stopped_on, "unsupported instruction") == 0) ? 1
+                                                                             : 2;
+      ++stop_static[e.stop];
+      stop_insts[e.stop] += r.instructions;
       if (e.index >= 0)
       {
         // Publish it so other blocks can jump here directly.
@@ -1172,9 +1210,28 @@ int main(int argc, char** argv)
     if (it->second.index < 0)
     {
       ++jit_interp;
+      // What the interpreter is left holding. Keyed as --jit-coverage keys
+      // it so the two rankings can be read side by side -- the interesting
+      // comparison is an instruction that is RARE in the stream and common
+      // here, which is what a missing form looks like.
+      if (want_jit_stats)
+      {
+        const u32 ins = system.GetMemory().Read_U32(state.pc);
+        const u32 primary = ins >> 26;
+        const u32 key = (primary == 31 || primary == 19 || primary == 63)
+                            ? (primary << 16) | (((ins >> 1) & 0x3FF) << 1) | (ins & 1)
+                            : (primary << 16);
+        auto& slot = (it->second.retired ? interp_retired : interp_counts)[key];
+        ++slot.first;
+        slot.second = ins;
+        if (it->second.retired)
+          ++interp_from_retired;
+      }
       ppc.SingleStep();
       return 1;
     }
+    if (want_jit_stats)
+      ++stop_dyn[it->second.stop];
 
     using BlockFn = u32 (*)(u32);
     BlockFn f = reinterpret_cast<BlockFn>(it->second.index);
@@ -1234,6 +1291,8 @@ int main(int argc, char** argv)
       // made from OBSERVED behaviour, which is the only way -- whether an
       // address lands in MEM1 is not knowable when the block is compiled.
       it->second.index = -1;
+      it->second.retired = true;
+      ++jit_retired_blocks;
       const u32 slot = (pc >> 2) & jit_layout.link_mask;
       if (link_table[slot * 2 + 0] == pc)
       {
@@ -1565,6 +1624,50 @@ int main(int argc, char** argv)
       std::printf("  jit       %llu block entries, %.2f instructions per entry\n",
                   static_cast<unsigned long long>(entries),
                   entries ? static_cast<double>(jit_insts) / static_cast<double>(entries) : 0.0);
+      if (want_jit_stats)
+      {
+        static const char* kStop[3] = {"branch", "unsupported", "limit"};
+        for (int k = 0; k < 3; ++k)
+          std::printf("  jit       ends on %-12s %7llu blocks (%.2f insts avg), "
+                      "%llu dispatches\n",
+                      kStop[k], static_cast<unsigned long long>(stop_static[k]),
+                      stop_static[k] ? static_cast<double>(stop_insts[k]) /
+                                           static_cast<double>(stop_static[k])
+                                     : 0.0,
+                      static_cast<unsigned long long>(stop_dyn[k]));
+      }
+      if (want_jit_stats)
+      {
+        // The top of what the interpreter runs. 2.1% of the stream costing
+        // 13% of the time is only worth acting on if it concentrates.
+        std::printf("  jit       %llu blocks retired, %llu instructions interpreted "
+                    "through them (%.1f%% of all interpreted)\n",
+                    static_cast<unsigned long long>(jit_retired_blocks),
+                    static_cast<unsigned long long>(interp_from_retired),
+                    jit_interp ? 100.0 * static_cast<double>(interp_from_retired) /
+                                     static_cast<double>(jit_interp)
+                               : 0.0);
+        const char* label[2] = {"never-compiled", "retired      "};
+        std::map<u32, std::pair<u64, u32>>* maps[2] = {&interp_counts, &interp_retired};
+        for (int m = 0; m < 2; ++m)
+        {
+          std::vector<std::pair<u64, u32>> top;
+          for (const auto& kv : *maps[m])
+            top.push_back({kv.second.first, kv.first});
+          std::sort(top.begin(), top.end(), std::greater<>());
+          u64 tot = 0;
+          for (const auto& t : top)
+            tot += t.first;
+          for (size_t k = 0; k < top.size() && k < 8; ++k)
+            std::printf("  jit       %s %zu: primary %2u xo %4u  %10llu  %5.1f%%  (%08x)\n",
+                        label[m], k + 1, top[k].second >> 16, (top[k].second & 0xFFFF) >> 1,
+                        static_cast<unsigned long long>(top[k].first),
+                        tot ? 100.0 * static_cast<double>(top[k].first) /
+                                  static_cast<double>(tot)
+                            : 0.0,
+                        (*maps[m])[top[k].second].second);
+        }
+      }
       std::printf("  jit       link table %llu/%u slots live, %.2f instructions per chain\n",
                   static_cast<unsigned long long>(live), kLinkEntries,
                   jit_blocks ? static_cast<double>(jit_insts) / static_cast<double>(jit_blocks)
