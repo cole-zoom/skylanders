@@ -56,6 +56,11 @@ struct BlockResult
   // must bound them to mapped memory before reading guest code at one.
   uint32_t succ[2] = {0, 0};
   uint32_t nsucc = 0;
+
+  // Whether this block performs any guest memory access, and so depends on
+  // MSR[DR] being set and the BATs being the ones it was compiled under.
+  // The check is the caller's -- see the note in CompileBlock.
+  bool touches_memory = false;
 };
 
 // Offsets into the guest state struct. Passed in rather than hardcoded,
@@ -1667,39 +1672,33 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   if (n == 0)
     return r;  // nothing compiled; module stays empty
 
-  if (touches_memory)
-  {
-    // ── translation guard, once per block ──
-    //
-    // Every memory access this block emits maps a guest address with
-    // ram_base + (ea & mask), which is only the right translation while
-    // MSR[DR] is set and the BATs are the ones the boot installed. A block
-    // compiled under those conditions can be reached later under different
-    // ones -- the cache is keyed by PC, not by machine state.
-    //
-    // Checking once at entry rather than at every access costs one test per
-    // block instead of one per load. The cost of NOT checking is a block
-    // that reads host memory through a translation the guest has turned off,
-    // which is silent and unbounded.
-    Bytes prologue;
-    prologue.push_back(kLocalGet);
-    PutU32(prologue, 0);
-    prologue.push_back(kI32Load);
-    PutU32(prologue, 2);
-    PutU32(prologue, layout.msr_offset);
-    prologue.push_back(kI32Const);
-    PutI32(prologue, 1 << 4);  // MSR[DR]
-    prologue.push_back(kI32And);
-    prologue.push_back(kI32Eqz);
-    prologue.push_back(kIf);
-    prologue.push_back(kVoid);
-    prologue.push_back(kI32Const);
-    PutI32(prologue, static_cast<int32_t>(start_pc | 1u));
-    prologue.push_back(kReturn);
-    prologue.push_back(kEnd);
-    prologue.insert(prologue.end(), body.begin(), body.end());
-    body = std::move(prologue);
-  }
+  r.touches_memory = touches_memory;
+
+  // ── the translation guard is the CALLER's, once per chain ──
+  //
+  // Every memory access this block emits maps a guest address with
+  // ram_base + (ea & mask), which is the right translation only while
+  // MSR[DR] is set and the BATs are the ones the boot installed. A block
+  // compiled under those conditions can be reached later under different
+  // ones, because the cache is keyed by PC and not by machine state.
+  //
+  // That check used to be a prologue on every memory-touching block --
+  // five wasm instructions executed at every entry, and entries are the
+  // largest line in the profile at 261 million of them.
+  //
+  // It does not need to be per block, because MSR cannot change inside a
+  // chain. The only instruction that writes it is mtmsr, which ends its
+  // block AND returns to the dispatcher rather than continuing, precisely
+  // so the interpreter can recompute translation state and take any
+  // interrupt that became deliverable. Compiled code raises no exceptions
+  // of its own, and CoreTiming only advances when a chain returns. So DR
+  // is constant for the whole of a chain, and one check before entering
+  // it is exactly as strong as one check per block inside it.
+  //
+  // The caller must make that check. BlockResult::touches_memory says
+  // which blocks care; a caller that cannot track it per chain should
+  // check DR before entering ANY compiled block, which is what the
+  // dispatcher does.
 
   if (layout.enable_linking)
   {

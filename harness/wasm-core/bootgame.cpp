@@ -1099,6 +1099,7 @@ int main(int argc, char** argv)
   // shape: a handful of large regions and a flood of singletons reads the
   // same as everything being mid-sized, and only one of those has a fix.
   u64 region_hist[7] = {0, 0, 0, 0, 0, 0, 0};
+  u64 succ_edges = 0, succ_sibling = 0;
   // A sink the optimiser cannot see through, for probes whose result is
   // otherwise unused.
   volatile u64 jit_probe_sink = 0;
@@ -1279,6 +1280,8 @@ int main(int argc, char** argv)
       u32 pc;
       u32 instructions;
       u8 stop;
+      u32 succ[2];
+      u32 nsucc;
     };
     std::vector<Pending> pending;
 
@@ -1332,7 +1335,7 @@ int main(int argc, char** argv)
       if (r.instructions >= kMinBlock && !r.body.empty())
       {
         mb.AddFunction(r.body, "f" + std::to_string(pending.size()), r.locals);
-        pending.push_back({bpc, r.instructions, stop});
+        pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc});
         for (u32 i = 0; i < r.nsucc; ++i)
           push(r.succ[i]);
         // The next address in memory after this block, which is past the
@@ -1382,6 +1385,29 @@ int main(int argc, char** argv)
       const size_t n = pending.size();
       const int bucket = n <= 4 ? static_cast<int>(n) - 1 : (n <= 8 ? 4 : (n < 16 ? 5 : 6));
       ++region_hist[bucket];
+    }
+
+    // ── how much direct linking could reach ──
+    //
+    // A statically known successor can be called DIRECTLY, with no hash,
+    // no table load and no PC compare, only when it is a sibling in the
+    // same module. Counting that before building it, because the prize is
+    // bounded by it and regions average under four blocks.
+    //
+    // Static, not dynamic: a tail call never passes through C++, so this
+    // counts successor EDGES rather than executions of them.
+    for (const Pending& pb : pending)
+    {
+      for (u32 i = 0; i < pb.nsucc; ++i)
+      {
+        ++succ_edges;
+        for (const Pending& other : pending)
+          if (other.pc == pb.succ[i])
+          {
+            ++succ_sibling;
+            break;
+          }
+      }
     }
 
     for (size_t k = 0; k < pending.size(); ++k)
@@ -1443,6 +1469,25 @@ int main(int argc, char** argv)
     }
     if (want_jit_stats)
       ++stop_dyn[it->second.stop];
+
+    // The translation guard, once per chain rather than once per block.
+    //
+    // Compiled code maps guest addresses with ram_base + (ea & mask),
+    // which is only right while MSR[DR] is set. That used to be a prologue
+    // on every memory-touching block; MSR cannot change inside a chain --
+    // mtmsr ends its block and returns here -- so one check before
+    // entering is exactly as strong, and it is a C++ branch instead of
+    // five wasm instructions at 261 million block entries.
+    //
+    // Checked for every block, not just the ones that touch memory,
+    // because a chain can tail-call from a block that does not into one
+    // that does, and the dispatcher cannot see where a chain will go.
+    if (!state.msr.DR)
+    {
+      ++jit_interp;
+      ppc.SingleStep();
+      return 1;
+    }
 
     using BlockFn = u32 (*)(u32);
     BlockFn f = reinterpret_cast<BlockFn>(it->second.index);
@@ -1844,6 +1889,12 @@ int main(int argc, char** argv)
           std::printf("  %s=%llu", kLbl[k], static_cast<unsigned long long>(region_hist[k]));
         std::printf("\n");
       }
+      std::printf("  jit       %llu static successor edges, %llu are siblings (%.1f%%)\n",
+                  static_cast<unsigned long long>(succ_edges),
+                  static_cast<unsigned long long>(succ_sibling),
+                  succ_edges ? 100.0 * static_cast<double>(succ_sibling) /
+                                   static_cast<double>(succ_edges)
+                             : 0.0);
       std::printf("  jit       %llu block entries, %.2f instructions per entry\n",
                   static_cast<unsigned long long>(entries),
                   entries ? static_cast<double>(jit_insts) / static_cast<double>(entries) : 0.0);
