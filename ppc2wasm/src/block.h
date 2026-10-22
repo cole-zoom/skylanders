@@ -1201,12 +1201,16 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       const bool link = (ins & 1) != 0;
       const uint32_t target = absolute ? static_cast<uint32_t>(bd) : this_pc + bd;
 
-      if (link)
-        EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-
+      // The link register is written INSIDE the taken path, not before the
+      // test. bcl only sets LR when it branches -- Interpreter::bcx writes
+      // it within "if (counter && condition)" -- and writing it
+      // unconditionally corrupts the return address of whatever call the
+      // not-taken path eventually returns from.
       if (bo & 0x10)
       {
         // Branch always -- the condition is ignored.
+        if (link)
+          EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(target));
         EmitGoTo(body, layout, 0);
@@ -1220,6 +1224,8 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32Eq);
         body.push_back(kIf);
         body.push_back(kVoid);
+        if (link)
+          EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(target));
         EmitGoTo(body, layout, 1);  // 0 is the if, 1 the enclosing block
@@ -1263,11 +1269,13 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       body.push_back(kLocalSet);
       PutU32(body, 1);
 
-      if (link)
-        EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-
+      // As in bc: the link write belongs to the TAKEN path only. The target
+      // was already read into local 1 above, so writing LR here cannot
+      // disturb it -- which is the whole reason the read came first.
       if (bo & 0x10)
       {
+        if (link)
+          EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kLocalGet);
         PutU32(body, 1);
         EmitGoTo(body, layout, 0);
@@ -1280,6 +1288,8 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32Eq);
         body.push_back(kIf);
         body.push_back(kVoid);
+        if (link)
+          EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kLocalGet);
         PutU32(body, 1);
         EmitGoTo(body, layout, 1);
