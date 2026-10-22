@@ -4,44 +4,60 @@ Written for whoever picks this up next. `docs/PLAN.md` is the project; this is
 the state of the recompiler, what the constraint actually is, and the traps
 that have already cost time.
 
+> **This document has been overtaken in places.** It was written at 54 MIPS;
+> the recompiler now does **178.3 MIPS** on the same boot. Its §1 asked for a
+> profile, the profile happened, and it disproved two of the items ranked
+> below. **`docs/PHASE2-PROFILE.md` is the current state and the current
+> ranking — start there.** What is still worth reading here is unchanged:
+> the methodology, the landmines, and what no test covers.
+
 ---
 
 ## Where it stands
 
-Booting *Skylanders: Spyro's Adventure* in Chrome, 200 million instructions:
+Booting *Skylanders: Spyro's Adventure* in Chrome. **Measure at several step
+counts**: module installation is a one-off cost, so a short run reports a
+speed dominated by compiling rather than running.
 
-| | MIPS | compiled |
+| instructions | interpreter | `--jit` |
 |---|---|---|
-| interpreter | 18.0 | — |
-| `--jit` | 42.1 | 94.9% |
-| `--jit` (linking, default) | **54.0** | 94.9% |
+| 200M | 18.3 | 54.7 |
+| 800M | 18.8 | **178.3** |
 
-Full speed is roughly **600 MIPS** — Broadway is 729 MHz at close to 1 IPC. So
-there is about **11×** still to find.
+Full speed is roughly **600 MIPS** — Broadway is 729 MHz at close to 1 IPC —
+so there is about **3.4×** still to find. It was 11× when this was written,
+and a third of that gap turned out to be the 200M window measuring
+compilation.
 
-What works: 98.7% of executed instructions translate; blocks tail-call their
-successors through a link table; the dispatcher falls back to the interpreter
-for anything refused; the boot completes and renders correctly.
+What works: 98.5% of executed instructions run as compiled code; a cache miss
+compiles a whole REGION of blocks into one module; blocks run through
+conditional branches as superblocks and tail-call their successors through a
+link table; the CTR branch forms and the Rc (dot) forms translate; the
+dispatcher falls back to the interpreter for anything refused; the boot
+completes and renders correctly.
 
-What does not exist: floating point, paired singles, MEM2, block invalidation,
-and any profiling of where the 11× actually went.
+What does not exist: floating point, paired singles, MEM2, XER carry, block
+invalidation, and any form of direct (same-module) linking.
 
 ---
 
-## The constraint is no longer codegen
+## The constraint is block ENTRY, and it is measured
 
-This is the most important thing to understand before touching anything.
+This section used to argue that codegen was not the constraint, on the
+strength of a microbenchmark. Half of that was right.
 
 - Spike A measured **hand-written** wasm at 863.9 MIPS (`spikes/jit/FINDINGS.md`).
 - The **emitted** code measured 1538–2811 MIPS in a microbenchmark (PR #42).
 
-The code the compiler produces is already fast enough. At 54 MIPS in the real
-boot, the time is going somewhere else — and at 10.73 instructions per chain,
-200M instructions means roughly **17.7 million dispatcher round-trips**, each
-costing an `unordered_map` lookup, an indirect call, and a `CoreTiming::Advance()`.
+Both numbers are real and both measured LONG blocks. Real guest code does not
+come in long blocks: entries average **3.02 guest instructions**, and every
+one pays a function prologue, the `MSR[DR]` guard and the link epilogue.
+Block entry is **52.8%** of the run — the largest line in the profile from
+the first measurement to now, and the only one that has never moved.
 
-**That has never been profiled.** It is the strongest hypothesis, not a
-measured fact, and the first job is to turn it into one.
+The three costs this section used to name are measured and small: the
+`unordered_map` is 3.4%, `CoreTiming::Advance` 4.4%, the indirect call 4.3%.
+See `docs/PHASE2-PROFILE.md`.
 
 ---
 
@@ -163,7 +179,7 @@ been wrong, and every measurement has been right within one run:
   changes.
 
 **Use the differentials.** `harness/wasm-core/run-jitdiff.sh` builds and runs
-all four in about five seconds: hand-written cases, a randomised
+all four in about fifteen seconds: hand-written cases, a randomised
 per-instruction differential, a randomised **block** differential that
 compares registers, condition fields and a window of guest memory, and a
 randomised **chain** differential that publishes a link table and runs blocks
@@ -231,7 +247,35 @@ is dropped forever, even if every later execution would have succeeded.
 
 **There is no block invalidation at all.** Self-modifying code or DMA into code
 memory would execute stale translations silently. Nothing in this boot appears
-to do that, which is not the same as it being safe.
+to do that, which is not the same as it being safe. **Region compilation made
+this worse**: a block is now compiled when a NEARBY block is first reached,
+not when it is about to run, so the guest has longer to overwrite the code
+first. Speculation is bounded to a megabyte of the seed, which is containment
+and not a fix.
+
+**A guest read outside mapped memory panics.** `CopyFromEmu` calls
+`PanicAlertFmt` rather than returning zero, so anything that reads guest code
+speculatively — the region walk does — must bound the address to MEM1 with
+room for a whole block FIRST.
+
+**The destination register is not always rD.** `ori`, `rlwinm` and every
+logical form of opcode 31 write **rA**, the field the arithmetic forms read as
+a source. This has now caused two separate bugs: a test generator that
+clobbered its own pointer registers, and it is the thing `RcDestination` exists
+to get right.
+
+**CR0 after a dot form is not an `s_crTable` entry.** `Helper_UpdateCR0` builds
+the 64-bit field by hand — sign-extended value, bit 63 forced when zero, SO
+replaced. That is a different 64-bit number from the table entry for the same
+logical flags, and guest state is shared with the interpreter.
+
+**A differential that stops testing still passes.** Three of the four here
+restored their starting machine state by reading live MSR, and all three ran
+`mtmsr`. One taken exception clears `MSR[DR]`, after which either the block
+entry guard refuses everything (silently cutting linked chains from 244 to
+104) or the INTERPRETER can no longer translate a data address and becomes the
+wrong side of the comparison. All three are fixed by pinning one pristine MSR;
+the lesson is that the coverage counters are load-bearing, not decoration.
 
 ---
 
@@ -266,7 +310,16 @@ Stated plainly, because it is the largest risk:
   `bootgame.cpp`: when a block is published, and **retirement** — a block that
   bails on its first instruction is dropped and its slot cleared, permanently
   and with no re-entry. That path has no test.
-- Timing quantisation. Chains are 10.73 instructions, so a scheduled event can
-  fire that late. Nothing checks it.
+- Timing quantisation, and it has got coarser. Chains are **24.0**
+  instructions now, against 10.73 when this was written, so a scheduled event
+  fires that much later. Nothing checks it, and the symptom would not look
+  like a timing problem — it would look like the game hanging on a flag or
+  dropping an input. The boot already reaches the FIFO milestone about a
+  million instructions earlier under the interpreter than under the
+  recompiler.
+- Direct (same-module) linking does not exist yet. When it does, it will need
+  its own coverage in the chain differential before it is trusted — the whole
+  reason that differential exists is that the last linking mechanism shipped
+  without one.
 - Anything disc-dependent in CI. CI has no disc and never will; the boot
   differential, the FIFO milestone and the capture comparison are all manual.
