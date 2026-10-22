@@ -650,8 +650,12 @@ int main()
       return h;
     };
 
+    // Deliberately far larger than any block, so the budget never expires
+    // mid-block and the delta measures only what the block itself ran.
+    constexpr u32 kBudget = 10000;
+
     int block_fail = 0, blocks_run = 0;
-    for (int trial = 0; trial < 400 && block_fail < 4; ++trial)
+    for (int trial = 0; trial < 1500 && block_fail < 4; ++trial)
     {
       const u32 len = 2 + (rnd() % 10);
       std::vector<u32> prog;
@@ -741,7 +745,7 @@ int main()
         // the decrement wraps to 0xffffffff, which a saturating
         // implementation would get wrong and no larger seed would expose.
         state.spr[SPR_CTR] = init_ctr;
-        state.downcount = 10000;
+        state.downcount = static_cast<int>(kBudget);
         state.pc = state.npc = BASE;
         for (u32 w = 0; w < kScratchWords; ++w)
           memory.Write_U32(init_mem[w], kScratch + w * 4);
@@ -765,9 +769,22 @@ int main()
       // difference that is the harness's fault.
       reset();
       const u32 ret = RunBlock(ix, state, ppc);
+      // How far it got comes from the DOWNCOUNT, not the returned PC.
+      //
+      // The PC said how much of a block had run only while a block had
+      // exactly one exit, at its end. A block that continues past a
+      // conditional branch has several, and a taken branch returns a
+      // TARGET -- which, if it lands inside the block's own address range,
+      // reads as an instruction count and is not one. That produced a
+      // register mismatch that looked exactly like a compiler bug.
+      //
+      // Every exit charges the budget for what it ran: the epilogue from
+      // the count the exiting path parked, a bail for the part before it,
+      // mtmsr for itself. The delta covers all of them, which is why the
+      // chain differential has always used it.
+      const int ran_i = static_cast<int>(kBudget) - state.downcount;
       const bool bailed = (ret & 1u) != 0;
       const bool msr_changed = (ret & 2u) != 0;
-      const u32 end_pc = ret & ~3u;
       u32 jit_gpr[32];
       std::memcpy(jit_gpr, state.gpr, sizeof(jit_gpr));
       u64 jit_cr[8];
@@ -775,11 +792,7 @@ int main()
       const u32 jit_lr = state.spr[SPR_LR];
       const u64 jit_mem = digest();
 
-      u32 ran = (bailed || msr_changed) ? (end_pc - BASE) / 4 : rr.instructions;
-      // A taken branch leaves the block, and the whole block ran.
-      if (!bailed && !msr_changed &&
-          (end_pc < BASE || end_pc > BASE + rr.instructions * 4))
-        ran = rr.instructions;
+      const u32 ran = ran_i < 0 ? 0u : static_cast<u32>(ran_i);
 
       reset();
       for (u32 k = 0; k < ran; ++k)
@@ -980,7 +993,7 @@ int main()
     // Table slots reused across trials; nblocks never exceeds six.
     int slots[6] = {-1, -1, -1, -1, -1, -1};
 
-    for (int trial = 0; trial < 300 && fails < 4; ++trial)
+    for (int trial = 0; trial < 800 && fails < 4; ++trial)
     {
       // The stream state at trial entry, so a failure can be re-run. rnd()
       // is consumed a variable number of times per trial, so the state at
