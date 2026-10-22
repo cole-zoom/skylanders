@@ -146,7 +146,11 @@ public:
     m_mem_shared = shared;
   }
 
-  // params/results describe the single exported function.
+  // params/results describe the signature EVERY function in the module
+  // shares. A compiled block is always (i32 state) -> i32, so one type
+  // serves all of them and a direct call between two of them needs no
+  // second signature.
+  //
   // i32_locals are scratch slots ABOVE the parameters: with one parameter,
   // local 0 is that parameter and the first scratch local is 1. Address
   // computations need somewhere to keep the effective address, since wasm's
@@ -156,10 +160,33 @@ public:
   {
     m_params = params;
     m_results = results;
-    m_body = body;
-    m_export = export_name;
-    m_locals = i32_locals;
+    m_funcs.clear();
+    AddFunction(body, export_name, i32_locals);
   }
+
+  // Add one more function to the module, returning its index.
+  //
+  // Several blocks in ONE module is how installation stops dominating a
+  // run: every WebAssembly.Module costs about 22 us to compile and
+  // instantiate almost regardless of its size, so the price is paid per
+  // module and not per block. The index returned is also a wasm function
+  // index, which is what a direct call between two blocks in the same
+  // module needs.
+  uint32_t AddFunction(const Bytes& body, const std::string& export_name,
+                       uint32_t i32_locals = 0)
+  {
+    m_funcs.push_back({body, export_name, i32_locals});
+    return static_cast<uint32_t>(m_funcs.size() - 1);
+  }
+
+  // Signature for a module whose functions are added with AddFunction.
+  void SetSignature(const std::vector<uint8_t>& params, const std::vector<uint8_t>& results)
+  {
+    m_params = params;
+    m_results = results;
+  }
+
+  uint32_t FunctionCount() const { return static_cast<uint32_t>(m_funcs.size()); }
 
   Bytes Build() const
   {
@@ -207,44 +234,55 @@ public:
       PutSection(out, 2, p);
     }
 
-    // Function section: our one function uses type 0.
+    // Function section: every function uses type 0.
+    //
+    // There are no imported FUNCTIONS -- the imports above are a memory and
+    // a table -- so defined function k is also wasm function index k, and a
+    // direct call can name it without an offset.
     {
       Bytes p;
-      PutU32(p, 1);
-      PutU32(p, 0);
+      PutU32(p, static_cast<uint32_t>(m_funcs.size()));
+      for (size_t i = 0; i < m_funcs.size(); ++i)
+        PutU32(p, 0);
       PutSection(out, 3, p);
     }
 
     // Export section.
     {
       Bytes p;
-      PutU32(p, 1);
-      PutName(p, m_export);
-      p.push_back(0x00);  // func
-      PutU32(p, 0);
+      PutU32(p, static_cast<uint32_t>(m_funcs.size()));
+      for (size_t i = 0; i < m_funcs.size(); ++i)
+      {
+        PutName(p, m_funcs[i].export_name);
+        p.push_back(0x00);  // func
+        PutU32(p, static_cast<uint32_t>(i));
+      }
       PutSection(out, 7, p);
     }
 
-    // Code section: no locals beyond parameters.
+    // Code section.
     {
-      Bytes body;
-      if (m_locals)
-      {
-        PutU32(body, 1);        // one local-type group
-        PutU32(body, m_locals); // how many
-        body.push_back(kI32);
-      }
-      else
-      {
-        PutU32(body, 0);
-      }
-      PutBytes(body, m_body);
-      body.push_back(kEnd);
-
       Bytes p;
-      PutU32(p, 1);
-      PutU32(p, static_cast<uint32_t>(body.size()));
-      PutBytes(p, body);
+      PutU32(p, static_cast<uint32_t>(m_funcs.size()));
+      for (const Func& f : m_funcs)
+      {
+        Bytes body;
+        if (f.locals)
+        {
+          PutU32(body, 1);       // one local-type group
+          PutU32(body, f.locals);  // how many
+          body.push_back(kI32);
+        }
+        else
+        {
+          PutU32(body, 0);
+        }
+        PutBytes(body, f.body);
+        body.push_back(kEnd);
+
+        PutU32(p, static_cast<uint32_t>(body.size()));
+        PutBytes(p, body);
+      }
       PutSection(out, 10, p);
     }
 
@@ -252,13 +290,18 @@ public:
   }
 
 private:
+  struct Func
+  {
+    Bytes body;
+    std::string export_name;
+    uint32_t locals = 0;
+  };
+
   bool m_import_memory = false;
   bool m_import_table = false;
   uint32_t m_mem_initial = 0, m_mem_max = 0;
   bool m_mem_shared = false;
   std::vector<uint8_t> m_params, m_results;
-  Bytes m_body;
-  std::string m_export = "f";
-  uint32_t m_locals = 0;
+  std::vector<Func> m_funcs;
 };
 }  // namespace ppc2wasm
