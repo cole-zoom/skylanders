@@ -89,6 +89,12 @@ enum : uint8_t
   kEnd = 0x0B,
   kBr = 0x0C,
   kReturn = 0x0F,
+  kNop = 0x01,
+  kDrop = 0x1A,
+  // A direct tail call, naming a function index rather than looking one up
+  // in a table. Only reachable between functions in the SAME module, which
+  // is what region compilation arranges.
+  kReturnCall = 0x12,
   kReturnCallIndirect = 0x13,
   kLocalTee = 0x22,
   kVoid = 0x40,  // block type: no result

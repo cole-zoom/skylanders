@@ -73,6 +73,31 @@ static int InstallModule(const uint8_t* ptr, int len)
   return InstallModuleAt(ptr, len, -1);
 }
 
+// Install a module holding several blocks, the way the dispatcher does.
+//
+// A chain differential that installs one module per block cannot test a
+// direct call, because a direct call names a function in the SAME module.
+// `reserve` is how many consecutive table slots to claim the first time;
+// after that the same slots are overwritten, so the instances stay
+// collectable.
+EM_JS(int, InstallBatchAt, (const uint8_t* ptr, int len, int nfuncs, int slot, int reserve), {
+  try {
+    const bytes = HEAPU8.slice(ptr, ptr + len);
+    const mod = new WebAssembly.Module(bytes);
+    const inst = new WebAssembly.Instance(mod, {
+      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
+    });
+    let base = slot;
+    if (base < 0) { base = wasmTable.length; wasmTable.grow(reserve); }
+    for (let i = 0; i < nfuncs; i++)
+      wasmTable.set(base + i, inst.exports['f' + i]);
+    return base;
+  } catch (e) {
+    out('  batch install failed: ' + e);
+    return -1;
+  }
+});
+
 EM_JS(int, MemoryPages, (), { return wasmMemory.buffer.byteLength >>> 16; });
 
 using BlockFn = u32 (*)(u32);
@@ -1047,8 +1072,10 @@ int main()
     // ordinary end-of-chain still works. Asserting only the total would let
     // either disappear.
     u64 miss_decoy = 0, miss_empty = 0;
-    // Table slots reused across trials; nblocks never exceeds six.
-    int slots[6] = {-1, -1, -1, -1, -1, -1};
+    // One run of six consecutive table slots, reused by every trial.
+    int chain_slot_base = -1;
+    u64 direct_calls_patched = 0;
+    int direct_chains = 0, indirect_chains = 0;
 
     for (int trial = 0; trial < 800 && fails < 4; ++trial)
     {
@@ -1056,6 +1083,7 @@ int main()
       // is consumed a variable number of times per trial, so the state at
       // trial N is not derivable without replaying every earlier one.
       const u32 trial_seed = seed;
+      const bool direct_trial = (rnd() & 1) != 0;
       const u32 K = 2 + rnd() % 4;         // instructions per block
       const u32 nblocks = 2 + rnd() % 5;   // blocks laid end to end
 
@@ -1196,23 +1224,73 @@ int main()
 
       reset();
 
-      // Compile every block before publishing any of them. A half-filled
-      // table would let a chain jump to a block this trial never installed.
+      // Compile every block before publishing any of them, into ONE
+      // module, exactly as the dispatcher's region compiler does.
+      //
+      // One module is what makes a direct call possible: `return_call`
+      // names a function index, and an index only exists within a module.
+      // Installing a block at a time -- which this used to do -- cannot
+      // reach that path at all.
+      //
+      // allow_direct alternates per trial so both halves stay covered. A
+      // chain with it ON takes direct calls between its blocks and the
+      // table lookup only where a target is outside the module, which is
+      // the end of the chain; a chain with it OFF is the mechanism that
+      // shipped before this and still has to work.
+      layout.allow_direct = direct_trial;
+
       std::vector<int> index(nblocks, -1);
+      std::vector<ppc2wasm::Bytes> bodies(nblocks);
+      std::vector<u32> block_locals(nblocks, 0);
+      std::vector<std::vector<ppc2wasm::DirectFixup>> block_fixups(nblocks);
       bool all_compiled = true;
       for (u32 i = 0; i < nblocks && all_compiled; ++i)
       {
-        auto rb = ppc2wasm::CompileBlock(&prog[i * K], kChainBase + i * K * 4, K, layout);
-        if (rb.instructions != K || rb.module.empty())
-          all_compiled = false;
-        else if ((index[i] = InstallModuleAt(rb.module.data(),
-                                             static_cast<int>(rb.module.size()), slots[i])) < 0)
+        auto rb = ppc2wasm::CompileBlock(&prog[i * K], kChainBase + i * K * 4, K, layout, false);
+        if (rb.instructions != K || rb.body.empty())
           all_compiled = false;
         else
-          slots[i] = index[i];
+        {
+          bodies[i] = std::move(rb.body);
+          block_locals[i] = rb.locals;
+          block_fixups[i] = std::move(rb.fixups);
+        }
       }
       if (!all_compiled)
         continue;
+
+      // Function index i is block i, so a hole naming block i's start PC
+      // resolves to i. Targets outside the chain -- the address past the
+      // end, an LR or CTR value -- stay nops and fall back to the table.
+      auto index_of = [&](u32 target) -> int {
+        for (u32 i = 0; i < nblocks; ++i)
+          if (kChainBase + i * K * 4 == target)
+            return static_cast<int>(i);
+        return -1;
+      };
+      ppc2wasm::ModuleBuilder cmb;
+      cmb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
+      cmb.ImportTable();
+      cmb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
+      u32 trial_direct = 0;
+      for (u32 i = 0; i < nblocks; ++i)
+      {
+        trial_direct += ppc2wasm::PatchDirectCalls(bodies[i], block_fixups[i], index_of);
+        cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i]);
+      }
+      const auto chain_module = cmb.Build();
+      const int base = InstallBatchAt(chain_module.data(), static_cast<int>(chain_module.size()),
+                                      static_cast<int>(nblocks), chain_slot_base, 6);
+      if (base < 0)
+        continue;
+      chain_slot_base = base;
+      for (u32 i = 0; i < nblocks; ++i)
+        index[i] = base + static_cast<int>(i);
+      direct_calls_patched += trial_direct;
+      if (direct_trial)
+        ++direct_chains;
+      else
+        ++indirect_chains;
 
       for (u32 i = 0; i < nblocks; ++i)
       {
@@ -1395,8 +1473,18 @@ int main()
     check(miss_decoy > 0, "a chain rejected an occupied slot holding another pc");
     check(exit_bail > 0, "a chain bailed partway through");
     check(exit_msr > 0, "a chain exited on an mtmsr");
+    // Direct calls are a second linking mechanism and need their own
+    // floor. A chain whose holes all went unfilled behaves exactly like
+    // one compiled without them, and every comparison here would stay
+    // green while the mechanism this section exists to cover never ran.
+    check(direct_calls_patched > 0, "chains made direct same-module calls");
+    check(direct_chains > 0 && indirect_chains > 0,
+          "both the direct and the table-lookup paths were compiled");
     std::printf("    %d of %d chains linked   tail calls %llu\n", chains_linked, chains_run,
                 static_cast<unsigned long long>(total_tail_calls));
+    std::printf("    %d direct-capable chains, %d table-only, %llu holes filled\n",
+                direct_chains, indirect_chains,
+                static_cast<unsigned long long>(direct_calls_patched));
     std::printf("    hits %u  attempts %u  budget exits %u  misses %u\n", chain_stats[0],
                 chain_stats[1], chain_stats[2], chain_stats[3]);
     // All four ways out of a chain, counted separately. A test can be green

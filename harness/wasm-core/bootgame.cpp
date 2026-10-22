@@ -1100,6 +1100,8 @@ int main(int argc, char** argv)
   // same as everything being mid-sized, and only one of those has a fix.
   u64 region_hist[7] = {0, 0, 0, 0, 0, 0, 0};
   u64 succ_edges = 0, succ_sibling = 0;
+  // Direct-call holes reserved, and how many were filled with a sibling.
+  u64 jit_direct_holes = 0, jit_direct_patched = 0;
   // A sink the optimiser cannot see through, for probes whose result is
   // otherwise unused.
   volatile u64 jit_probe_sink = 0;
@@ -1190,6 +1192,9 @@ int main(int argc, char** argv)
   // was not compiled yet.
   u64 miss_but_cached = 0, miss_total = 0;
   jit_layout.enable_linking = want_link;
+  // A hole is only worth reserving because compile_region fills it. Tied
+  // to linking because a direct tail call IS the link.
+  jit_layout.allow_direct = want_link;
 
   // A block that does nothing but return its argument, for probe 3. It
   // isolates the indirect call itself from anything the call does.
@@ -1292,6 +1297,9 @@ int main(int argc, char** argv)
       u8 stop;
       u32 succ[2];
       u32 nsucc;
+      ppc2wasm::Bytes body;
+      u32 locals;
+      std::vector<ppc2wasm::DirectFixup> fixups;
     };
     std::vector<Pending> pending;
 
@@ -1344,8 +1352,12 @@ int main(int argc, char** argv)
       stop_insts[stop] += r.instructions;
       if (r.instructions >= kMinBlock && !r.body.empty())
       {
-        mb.AddFunction(r.body, "f" + std::to_string(pending.size()), r.locals);
-        pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc});
+        // The body is held rather than added to the module now. A direct
+        // call needs the function index of its target, and that is not
+        // known until the whole region has been discovered -- the target
+        // may be a block this walk has not reached yet.
+        pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc,
+                           std::move(r.body), r.locals, std::move(r.fixups)});
         for (u32 i = 0; i < r.nsucc; ++i)
           push(r.succ[i]);
         // The next address in memory after this block, which is past the
@@ -1381,6 +1393,28 @@ int main(int argc, char** argv)
     {
       ensure_seed();
       return;
+    }
+
+    // ── fill the direct-call holes ──
+    //
+    // Function index k is pending[k], because that is the order they are
+    // added to the module below. A target that is not in this region
+    // leaves its hole as nops and falls back to the table lookup.
+    //
+    // Linear search over at most kRegion entries, which beats building a
+    // map for sixteen items.
+    auto index_of = [&pending](u32 target) -> int {
+      for (size_t k = 0; k < pending.size(); ++k)
+        if (pending[k].pc == target)
+          return static_cast<int>(k);
+      return -1;
+    };
+    for (size_t k = 0; k < pending.size(); ++k)
+    {
+      jit_direct_holes += pending[k].fixups.size();
+      jit_direct_patched += ppc2wasm::PatchDirectCalls(pending[k].body, pending[k].fixups,
+                                                       index_of);
+      mb.AddFunction(pending[k].body, "f" + std::to_string(k), pending[k].locals);
     }
 
     const double t_install0 = JitNow();
@@ -1902,6 +1936,12 @@ int main(int argc, char** argv)
       }
       if (want_jit_stats)
       {
+        std::printf("  jit       %llu direct-call holes, %llu filled with a sibling (%.1f%%)\n",
+                    static_cast<unsigned long long>(jit_direct_holes),
+                    static_cast<unsigned long long>(jit_direct_patched),
+                    jit_direct_holes ? 100.0 * static_cast<double>(jit_direct_patched) /
+                                           static_cast<double>(jit_direct_holes)
+                                     : 0.0);
         std::printf("  jit       %llu static successor edges, %llu are siblings (%.1f%%)\n",
                     static_cast<unsigned long long>(succ_edges),
                     static_cast<unsigned long long>(succ_sibling),
