@@ -227,6 +227,53 @@ int main()
     check(b.instructions == 1, "a block stops at the first unsupported instruction");
     check(b.end_pc == 0x80001004, "end pc points AT the unsupported instruction");
 
+    // ── static successors ──
+    //
+    // Where a region compiler is told control can go next. A wrong answer
+    // costs a wasted compile and never correctness, but a MISSING one
+    // costs batch size, which is the whole point of gathering them.
+    {
+      // Fall-through only: nothing here ends the block.
+      const uint32_t plain[] = {0x38600005, 0x38830007};
+      auto a = ppc2wasm::CompileBlock(plain, 0x80001000, 2, L);
+      check(a.nsucc == 1 && a.succ[0] == 0x80001008, "a plain block falls through to its end");
+
+      // An unconditional branch goes one place: the target.
+      const uint32_t uncond[] = {0x48000010};  // b +16
+      auto b2 = ppc2wasm::CompileBlock(uncond, 0x80001000, 1, L);
+      check(b2.nsucc == 1 && b2.succ[0] == 0x80001010, "b has one successor, its target");
+
+      // A call has two: the target, and the RETURN SITE, which is a block
+      // entry and a hot one.
+      const uint32_t call[] = {0x48000011};  // bl +16
+      auto c = ppc2wasm::CompileBlock(call, 0x80001000, 1, L);
+      check(c.nsucc == 2 && c.succ[0] == 0x80001010 && c.succ[1] == 0x80001004,
+            "bl yields both the target and the return site");
+
+      // A conditional branch has both edges.
+      const uint32_t cond[] = {0x41820008};  // beq +8
+      auto d2 = ppc2wasm::CompileBlock(cond, 0x80001000, 1, L);
+      check(d2.nsucc == 2 && d2.succ[0] == 0x80001008 && d2.succ[1] == 0x80001004,
+            "a conditional branch yields taken and not-taken");
+
+      // An unsupported instruction: control resumes PAST it, because the
+      // interpreter will have run exactly that one.
+      const uint32_t stops[] = {0x38600005, 0xFC21002A};  // addi then fadd
+      auto e2 = ppc2wasm::CompileBlock(stops, 0x80001000, 2, L);
+      check(e2.nsucc == 1 && e2.succ[0] == 0x80001008,
+            "a refused instruction is stepped over, not retried");
+
+      // blr's target lives in a register, so only the not-taken edge is
+      // knowable.
+      const uint32_t ret_cond[] = {0x4D820020};  // beqlr
+      auto f2 = ppc2wasm::CompileBlock(ret_cond, 0x80001000, 1, L);
+      check(f2.nsucc == 1 && f2.succ[0] == 0x80001004,
+            "beqlr yields only its not-taken edge");
+      const uint32_t ret_always[] = {0x4E800020};  // blr
+      auto g2 = ppc2wasm::CompileBlock(ret_always, 0x80001000, 1, L);
+      check(g2.nsucc == 0, "an unconditional blr yields no static successor");
+    }
+
     // A branch IS translated, and terminates the block: control leaves, so
     // whatever follows belongs to a different block.
     const uint32_t with_branch[] = {0x38600005, 0x48000010, 0x38830007};

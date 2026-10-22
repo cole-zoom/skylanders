@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include "wasm_emit.h"
@@ -40,6 +41,21 @@ struct BlockResult
   uint32_t instructions;  // PowerPC instructions translated
   uint32_t end_pc;        // where the interpreter should resume
   const char* stopped_on; // why the block ended, for diagnostics
+
+  // Where control can go from here, when that is knowable at compile time.
+  //
+  // This is what lets a caller compile a REGION: follow the successors,
+  // compile them together, and pay one module install for all of them.
+  // Only STATIC targets appear -- the fall-through, and a branch
+  // displacement that is part of the instruction. A bclr or bcctr target
+  // lives in a register and is not knowable here, so it is simply absent;
+  // a region is an optimisation and an incomplete successor set costs
+  // nothing but a smaller batch.
+  //
+  // These are guesses about reachability, not claims about it. The caller
+  // must bound them to mapped memory before reading guest code at one.
+  uint32_t succ[2] = {0, 0};
+  uint32_t nsucc = 0;
 };
 
 // Offsets into the guest state struct. Passed in rather than hardcoded,
@@ -801,6 +817,8 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   // entry rather than at every access.
   bool touches_memory = false;
   const char* stopped = "instruction limit";
+  uint32_t succ[2] = {0, 0};
+  uint32_t nsucc = 0;
 
   for (; n < max_insts; ++n)
   {
@@ -1163,6 +1181,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>((start_pc + (n + 1) * 4) | 2u));
         body.push_back(kReturn);
+        succ[nsucc++] = start_pc + (n + 1) * 4;
         handled = true;
         ends_block = true;
         break;
@@ -1275,6 +1294,11 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       body.push_back(kI32Const);
       PutI32(body, static_cast<int32_t>(target));
       EmitGoTo(body, layout, 0);
+      succ[nsucc++] = target;
+      // A call does not fall through, but its RETURN SITE is a block entry
+      // and a hot one, so it is worth compiling in the same region.
+      if (link)
+        succ[nsucc++] = this_pc + 4;
       handled = true;
       ends_block = true;
       break;
@@ -1320,6 +1344,9 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         // Falling through leaves the block's trailing end_pc as the result,
         // which is this instruction's PC plus four.
       }
+      succ[nsucc++] = target;
+      if ((bo & 0x14) != 0x14)
+        succ[nsucc++] = this_pc + 4;  // the not-taken edge
       handled = true;
       ends_block = true;
       break;
@@ -1382,6 +1409,11 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         EmitGoTo(body, layout, 1);
         body.push_back(kEnd);
       }
+      // The target is in LR or CTR and is not knowable here. The not-taken
+      // edge is, and for the link forms so is the return site -- which is
+      // the same address.
+      if ((bo & 0x14) != 0x14 || link)
+        succ[nsucc++] = this_pc + 4;
       used_locals = used_locals < 2 ? 2 : used_locals;
       handled = true;
       ends_block = true;
@@ -1454,6 +1486,28 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   r.instructions = n;
   r.end_pc = start_pc + n * 4;
   r.stopped_on = stopped;
+  const bool ended_on_branch = (stopped == std::string_view("branch"));
+  if (nsucc == 0 && n != 0 && !ended_on_branch)
+  {
+    // No branch ended this block, so control continues at the next
+    // instruction -- past the one that was refused, if that is why it
+    // stopped, because the interpreter will have run exactly that one.
+    //
+    // The ended_on_branch guard matters: an unconditional blr or bcctr
+    // records NO successor on purpose, because its target is in a
+    // register. Treating that as a fall-through would hand the caller the
+    // address after the return instruction, which is usually the next
+    // function's first byte and is not reachable from here at all.
+    r.succ[0] = (stopped == std::string_view("unsupported instruction")) ? r.end_pc + 4
+                                                                         : r.end_pc;
+    r.nsucc = 1;
+  }
+  else
+  {
+    for (uint32_t i = 0; i < nsucc; ++i)
+      r.succ[i] = succ[i];
+    r.nsucc = nsucc;
+  }
   if (n == 0)
     return r;  // nothing compiled; module stays empty
 

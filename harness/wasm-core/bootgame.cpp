@@ -126,6 +126,34 @@ EM_JS(int, JitInstall, (const uint8_t* ptr, int len), {
     return -1;
   }
 });
+// Install a module holding several blocks, returning the table index of the
+// FIRST of them; the rest follow consecutively.
+//
+// Installation costs about 22 us per module almost regardless of what is in
+// it (harness/wasm-core/jitbatch.cpp measures 13.7 us for one block and
+// 1.44 us per block at sixteen), so this is where the price of compiling
+// drops by an order of magnitude.
+EM_JS(int, JitInstallBatch, (const uint8_t* ptr, int len, int nfuncs), {
+  try {
+    const bytes = HEAPU8.slice(ptr, ptr + len);
+    const mod = new WebAssembly.Module(bytes);
+    const inst = new WebAssembly.Instance(mod, {
+      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
+    });
+    const base = wasmTable.length;
+    wasmTable.grow(nfuncs);
+    for (let i = 0; i < nfuncs; i++)
+      wasmTable.set(base + i, inst.exports['f' + i]);
+    return base;
+  } catch (e) {
+    if (!Module.__jitReported) {
+      Module.__jitReported = 1;
+      out('  jit batch install failed: ' + e);
+    }
+    return -1;
+  }
+});
+
 EM_JS(int, JitMemoryPages, (), { return wasmMemory.buffer.byteLength >>> 16; });
 EM_JS(double, JitNow, (), { return performance.now(); });
 #endif
@@ -1065,7 +1093,12 @@ int main(int argc, char** argv)
   // docs/PHASE2-HANDOFF.md does not list, which is reason enough to measure
   // them before the three it does.
   double jit_t_translate = 0.0, jit_t_install = 0.0;
-  u64 jit_translates = 0, jit_installs = 0;
+  u64 jit_translates = 0, jit_installs = 0, jit_batched = 0;
+  // How many blocks each region actually gathered, bucketed 1,2,3,4,5-8,
+  // 9-15,16. "Blocks per module" is an average and averages hide the
+  // shape: a handful of large regions and a flood of singletons reads the
+  // same as everything being mid-sized, and only one of those has a fix.
+  u64 region_hist[7] = {0, 0, 0, 0, 0, 0, 0};
   // A sink the optimiser cannot see through, for probes whose result is
   // otherwise unused.
   volatile u64 jit_probe_sink = 0;
@@ -1181,6 +1214,190 @@ int main(int argc, char** argv)
   constexpr u32 kMaxBlock = 64;
 #endif
 
+  // ── region compilation ──
+  //
+  // On a cache miss, compile the block at that PC AND the blocks its static
+  // successors start, and install all of them as ONE module.
+  //
+  // Installation costs about 22 us per module and almost nothing per block
+  // inside it (harness/wasm-core/jitbatch.cpp). One block per module made
+  // that 27.8% of an 800M-instruction run -- the second largest cost in the
+  // profile. Sixteen blocks per module pays it once.
+  //
+  // Following successors rather than queueing blocks as they are discovered
+  // is what keeps this from costing latency: every block in the batch is
+  // callable the moment it is installed, so nothing hot waits behind
+  // unrelated discoveries to become compiled.
+  constexpr u32 kRegion = 16;
+  auto compile_region = [&](u32 seed) {
+    // Candidate PCs, bounded to MEM1 with room for a full block read.
+    //
+    // A successor is a GUESS about reachability, and a wrong one points at
+    // data or at nothing. Reading guest memory outside the mapped range
+    // makes Dolphin's CopyFromEmu panic, so the bound is a precondition
+    // here and not a nicety.
+    u32 queue[kRegion * 3];
+    u32 qn = 0, qi = 0;
+    auto push = [&](u32 p) {
+      if (qn >= kRegion * 3)
+        return;
+      if ((p & 0xFE000000) != 0x80000000)
+        return;
+      if ((p & 0x01FFFFFF) + kMaxBlock * 4 > 0x1800000)
+        return;
+      // Stay near the seed.
+      //
+      // There is no block invalidation anywhere in this recompiler, so a
+      // translation made now is used forever. Compiling a block the
+      // instant before it runs kept that hazard narrow; compiling ahead
+      // widens it, because the guest has longer to overwrite the code --
+      // a DMA'd overlay being the case that would actually do it.
+      //
+      // This bound does not fix that and is not pretending to. It keeps
+      // speculation inside code the guest is demonstrably executing right
+      // now, which is the part least likely to be swapped out from under
+      // us, and it costs nothing: a megabyte is far wider than any
+      // function's own branches.
+      const u32 d = p > seed ? p - seed : seed - p;
+      if (d > (1u << 20))
+        return;
+      for (u32 i = 0; i < qn; ++i)
+        if (queue[i] == p)
+          return;
+      queue[qn++] = p;
+    };
+    push(seed);
+
+    ppc2wasm::ModuleBuilder mb;
+    mb.ImportMemory(jit_layout.memory_pages, jit_layout.memory_pages, jit_layout.memory_shared);
+    if (want_link)
+      mb.ImportTable();
+    mb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
+
+    struct Pending
+    {
+      u32 pc;
+      u32 instructions;
+      u8 stop;
+    };
+    std::vector<Pending> pending;
+
+    // When the successor walk runs dry before the batch is full, keep
+    // going LINEARLY from the far end of what the region covered.
+    //
+    // Following successors alone averaged 4.3 blocks per module rather
+    // than sixteen: by the time a region is compiled its neighbours
+    // usually are too, so later misses are isolated PCs reached by an
+    // indirect branch whose static successors are all known already.
+    // Guest code is laid out contiguously, so the next block in memory is
+    // very likely the next block to run.
+    //
+    // Guessing wrong costs translation time and module bytes and nothing
+    // else: a PC that is really data refuses on its first instruction and
+    // is recorded as "interpret this", which is the same verdict the
+    // compiler would reach if the PC were reached for real.
+    u32 frontier = 0;
+    const double t_translate0 = JitNow();
+    while (pending.size() < kRegion)
+    {
+      if (qi >= qn)
+      {
+        if (!frontier)
+          break;
+        const u32 f = frontier;
+        frontier = 0;
+        const u32 before = qn;
+        push(f);
+        if (qn == before)
+          break;  // out of bounds, or already queued
+      }
+      const u32 bpc = queue[qi++];
+      if (jit_cache.count(bpc))
+        continue;
+      u32 code[kMaxBlock];
+      for (u32 k = 0; k < kMaxBlock; ++k)
+        code[k] = system.GetMemory().Read_U32(bpc + k * 4);
+      auto r = ppc2wasm::CompileBlock(code, bpc, kMaxBlock, jit_layout);
+      ++jit_translates;
+      const u8 stop = (std::strcmp(r.stopped_on, "branch") == 0) ? 0
+                      : (std::strcmp(r.stopped_on, "unsupported instruction") == 0)
+                          ? 1
+                          : 2;
+      ++stop_static[stop];
+      stop_insts[stop] += r.instructions;
+      if (r.instructions >= kMinBlock && !r.body.empty())
+      {
+        mb.AddFunction(r.body, "f" + std::to_string(pending.size()), r.locals);
+        pending.push_back({bpc, r.instructions, stop});
+        for (u32 i = 0; i < r.nsucc; ++i)
+          push(r.succ[i]);
+        // The next address in memory after this block, which is past the
+        // refused instruction when that is why it stopped.
+        const u32 linear = r.end_pc + (stop == 1 ? 4u : 0u);
+        if (linear > frontier)
+          frontier = linear;
+      }
+      else
+      {
+        // Nothing compiled here. Remembered so the compiler is not re-run
+        // on every visit, exactly as before -- the only difference is that
+        // this PC may have been reached by guessing rather than by running.
+        JitEntry none;
+        none.stop = stop;
+        jit_cache.emplace(bpc, none);
+      }
+    }
+    jit_t_translate += JitNow() - t_translate0;
+
+    // The seed MUST end up in the cache, compiled or not. Everything
+    // downstream does jit_cache.find(pc) and dereferences the result, and
+    // the walk can decline to look at the seed at all -- a PC outside MEM1
+    // is rejected by the bound above before anything reads it. A negative
+    // entry there means "interpret this", which is the right answer and
+    // the one the old one-block-at-a-time path produced by accident.
+    auto ensure_seed = [&]() {
+      if (!jit_cache.count(seed))
+        jit_cache.emplace(seed, JitEntry{});
+    };
+
+    if (pending.empty())
+    {
+      ensure_seed();
+      return;
+    }
+
+    const double t_install0 = JitNow();
+    const auto bytes = mb.Build();
+    const int base =
+        JitInstallBatch(bytes.data(), static_cast<int>(bytes.size()),
+                        static_cast<int>(pending.size()));
+    jit_t_install += JitNow() - t_install0;
+    ++jit_installs;
+    jit_batched += pending.size();
+    {
+      const size_t n = pending.size();
+      const int bucket = n <= 4 ? static_cast<int>(n) - 1 : (n <= 8 ? 4 : (n < 16 ? 5 : 6));
+      ++region_hist[bucket];
+    }
+
+    for (size_t k = 0; k < pending.size(); ++k)
+    {
+      JitEntry e;
+      e.index = (base < 0) ? -1 : base + static_cast<int>(k);
+      e.instructions = pending[k].instructions;
+      e.stop = pending[k].stop;
+      if (e.index >= 0)
+      {
+        // Publish it so other blocks can jump here directly.
+        const u32 slot = (pending[k].pc >> 2) & jit_layout.link_mask;
+        link_table[slot * 2 + 0] = pending[k].pc;
+        link_table[slot * 2 + 1] = static_cast<u32>(e.index);
+      }
+      jit_cache.emplace(pending[k].pc, e);
+    }
+    ensure_seed();
+  };
+
   // Run one step, through a compiled block when there is one. Returns how
   // many guest instructions were executed.
   auto step_once = [&]() -> u32 {
@@ -1194,35 +1411,8 @@ int main(int argc, char** argv)
     auto it = jit_cache.find(pc);
     if (it == jit_cache.end())
     {
-      const double t_translate0 = JitNow();
-      u32 code[kMaxBlock];
-      for (u32 k = 0; k < kMaxBlock; ++k)
-        code[k] = system.GetMemory().Read_U32(pc + k * 4);
-      auto r = ppc2wasm::CompileBlock(code, pc, kMaxBlock, jit_layout);
-      const double t_translate1 = JitNow();
-      jit_t_translate += t_translate1 - t_translate0;
-      ++jit_translates;
-      JitEntry e;
-      if (r.instructions >= kMinBlock && !r.module.empty())
-      {
-        e.index = JitInstall(r.module.data(), static_cast<int>(r.module.size()));
-        jit_t_install += JitNow() - t_translate1;
-        ++jit_installs;
-        e.instructions = r.instructions;
-      }
-      e.stop = (std::strcmp(r.stopped_on, "branch") == 0)                   ? 0
-               : (std::strcmp(r.stopped_on, "unsupported instruction") == 0) ? 1
-                                                                             : 2;
-      ++stop_static[e.stop];
-      stop_insts[e.stop] += r.instructions;
-      if (e.index >= 0)
-      {
-        // Publish it so other blocks can jump here directly.
-        const u32 slot = (pc >> 2) & jit_layout.link_mask;
-        link_table[slot * 2 + 0] = pc;
-        link_table[slot * 2 + 1] = static_cast<u32>(e.index);
-      }
-      it = jit_cache.emplace(pc, e).first;
+      compile_region(pc);
+      it = jit_cache.find(pc);
     }
     if (it->second.index < 0)
     {
@@ -1625,10 +1815,15 @@ int main(int argc, char** argv)
                   jit_translates ? jit_t_translate * 1000.0 /
                                        static_cast<double>(jit_translates)
                                  : 0.0);
-      std::printf("  jit       install   %.0f ms over %llu modules (%.1f us each)\n",
+      std::printf("  jit       install   %.0f ms over %llu modules holding %llu blocks "
+                  "(%.1f blocks each, %.2f us per block)\n",
                   jit_t_install, static_cast<unsigned long long>(jit_installs),
-                  jit_installs ? jit_t_install * 1000.0 / static_cast<double>(jit_installs)
-                               : 0.0);
+                  static_cast<unsigned long long>(jit_batched),
+                  jit_installs ? static_cast<double>(jit_batched) /
+                                     static_cast<double>(jit_installs)
+                               : 0.0,
+                  jit_batched ? jit_t_install * 1000.0 / static_cast<double>(jit_batched)
+                              : 0.0);
       if (jit_probe)
         std::printf("  jit       probe %d active -- subtract a baseline run\n", jit_probe);
       // Instructions per BLOCK ENTRY, which is a different number from
@@ -1638,6 +1833,13 @@ int main(int argc, char** argv)
       // prologue, the MSR[DR] guard, the whole link epilogue -- is paid.
       // Linking lengthens chains without changing this at all.
       const u64 entries = jit_blocks + static_cast<u64>(link_stats[0]);
+      {
+        static const char* kLbl[7] = {"1", "2", "3", "4", "5-8", "9-15", "16"};
+        std::printf("  jit       region sizes:");
+        for (int k = 0; k < 7; ++k)
+          std::printf("  %s=%llu", kLbl[k], static_cast<unsigned long long>(region_hist[k]));
+        std::printf("\n");
+      }
       std::printf("  jit       %llu block entries, %.2f instructions per entry\n",
                   static_cast<unsigned long long>(entries),
                   entries ? static_cast<double>(jit_insts) / static_cast<double>(entries) : 0.0);
