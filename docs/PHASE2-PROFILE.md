@@ -1,5 +1,13 @@
 # Where the 11× went
 
+> **Status, after the work this document set off: 178.3 MIPS.** The
+> measurements below are the ones that produced that and they are kept as
+> written. What changed since, and what to do next, is in
+> [Where it stands now](#where-it-stands-now) at the end — **read that
+> first if you are picking a next task**, because three items ranked here
+> are now done and two were disproven by doing them.
+
+
 `docs/PHASE2-HANDOFF.md` §1 asked for one thing before anything else: profile a
 chain return, because everything ranked after it was a guess. This is that
 measurement, and it moves most of the ranking.
@@ -262,3 +270,111 @@ permanent decision made from one observation will look much less safe.
   compile — and may well be slower.
 - The probes measure `Advance` with no time to advance by, so they catch its
   fixed cost and not the occasional call that fires a scheduled event.
+
+
+---
+
+## Where it stands now
+
+Same harness, same 800M-instruction boot, one machine.
+
+| | MIPS | what changed |
+|---|---|---|
+| when this document was written | 117.0 | — |
+| `bdnz` and the CTR branch forms | 120.3 | item 0 |
+| link table sized by code span | 127.9 | item 5, promoted |
+| region compilation | 165.1 | item 2 |
+| superblocks through conditional branches | 172.3 | item 3 |
+| the Rc (dot) forms | 175.6 | long tail |
+| stop building an unused module | 178.3 | found by accident |
+
+Against roughly 600 MIPS for full speed, that is **3.4× to go**, down from
+5.1×.
+
+### The budget now
+
+```
+total                         4,487 ms
+  block entries               2,370 ms  52.8%   261.5M entries, 9.07 ns each
+  module installation           691 ms  15.4%   22,893 modules, 83,873 blocks
+  interpreter fallback          636 ms  14.2%   11.65M instructions
+  dispatcher round-trips        601 ms  13.4%   32.8M at 18.3 ns
+  translation                   189 ms   4.2%   98,691 blocks at 1.9 us
+```
+
+Block entry has been the largest line the whole way and still is. It is
+261.5 million entries at **3.02 guest instructions each**, every one paying
+a function prologue, the `MSR[DR]` guard and the link epilogue.
+
+### What was learned by being wrong
+
+- **The dispatcher was not the problem.** The `unordered_map` this document
+  ranked second measured 3.4%. It is still there, still unoptimised.
+- **MEM2 was not the problem.** 251,914 bails against 277 million entries.
+  Its real cost is ~3.5%, and it hides in the interpreter fallback via
+  block retirement, not in the bail counter.
+- **Blocks are not short because they stop at branches.** Compiling through
+  conditional branches moved instructions per entry from 2.83 to 3.00 — six
+  percent. Hot conditional branches are *taken*, so the fall-through adds
+  mostly cold code. The instructions are on the taken edge.
+- **Speculating past static successors does not pay.** Filling a region
+  with the blocks that follow it in memory raised blocks per module from
+  3.7 to 6.8 and cut installation by 35 ms, while translation rose 167 ms.
+  A block costs about 2 µs to translate whether or not it ever runs.
+- **CR0 is not free.** Compiling the dot forms removed 1.3M interpreted
+  instructions and made static blocks 42% longer, for 1.9%. The CR0 update
+  is about a dozen wasm instructions at every dot form, executed every
+  time, and most of those writes are never read.
+
+### Suggested order now
+
+1. **Cheaper block entry — 52.8%, and the only line that has never moved.**
+   - *Direct linking.* A region's blocks share a module, so a statically
+     known successor already has a function index. Replacing the
+     epilogue's hash, table load, PC compare and `return_call_indirect`
+     with a `return_call` removes roughly eight wasm instructions and a
+     runtime type check from 228 million tail calls. Coverage is bounded
+     by how often a successor is a sibling, which today means regions
+     averaging 3.7 blocks — worth measuring before building.
+   - *One function per region, with an internal `br_table`.* The same idea
+     taken further: an intra-region transfer becomes a branch rather than
+     a call. Larger change, larger prize.
+   - *Registers in wasm locals.* Every instruction still loads its operands
+     from the state struct and stores the result back. At 3.02 instructions
+     per entry there is little reuse to find within a block, which is an
+     argument for doing it *after* blocks get longer, not before.
+2. **Lazy or dead-store-eliminated CR0.** Most CR0 writes are overwritten
+   or never read. Safe elimination is bounded by the exits: a bail resumes
+   in the interpreter, which reads CR0 from guest state, so a window may
+   contain no memory access and no branch.
+3. **The interpreter fallback — 14.2%, and it concentrates.** Of 11.65M
+   instructions, `dcbz` is 31.3%, `addic.` 10.6%, `subfic` 6.2%, `mftb`
+   5.9%, `adde` 5.4%, `dcbst` 3.2%. `dcbz` needs HID0.DCE and the
+   low-memory hack checked at runtime; the carry forms need XER[CA], which
+   nothing writes yet.
+4. **Installation — 15.4%.** Regions average 3.7 blocks against a measured
+   ceiling of about 1.4 µs per block at sixteen. The blocker is 13,743
+   regions that find exactly one block, and the obvious fix — walking
+   forward in memory — was measured and is net negative. Batching those
+   across misses, and accepting that a block is interpreted until its batch
+   flushes, is the version that has not been tried.
+5. **Floating point and paired singles.** Still correctness, not speed, and
+   still ranked against a boot profile rather than a gameplay one.
+
+### How to measure
+
+```sh
+harness/wasm-core/run-jit.sh 800000000 --jit              # the number
+harness/wasm-core/run-jit.sh 800000000 --jit --jit-stats  # the breakdowns
+harness/wasm-core/run-jitdiff.sh                          # all four differentials
+```
+
+Measure at **several** step counts. Installation is a one-off, so a short
+run reports a speed dominated by compilation: this build does 54.7 MIPS
+over 200M instructions and 178.3 over 800M.
+
+The boot's final PC is **not** a correctness signal. It differs between
+every configuration including the interpreter, which at 800M ends at
+`0x803873a4` and reaches the FIFO milestone a million instructions earlier
+than the recompiler, because chains advance the emulated clock in lumps.
+Correctness evidence is the differentials.
