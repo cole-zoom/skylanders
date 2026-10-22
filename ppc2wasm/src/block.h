@@ -590,7 +590,7 @@ inline void EmitBumpStat(Bytes& b, const StateLayout& l, uint32_t slot)
 // in local 4 and control branches to the shared epilogue, so every exit --
 // fall-through, taken branch, return instruction -- goes through the same
 // downcount and lookup logic exactly once.
-inline void EmitGoTo(Bytes& b, const StateLayout& l, uint32_t br_depth)
+inline void EmitGoTo(Bytes& b, const StateLayout& l, uint32_t br_depth, uint32_t insts_so_far)
 {
   if (!l.enable_linking)
   {
@@ -599,13 +599,24 @@ inline void EmitGoTo(Bytes& b, const StateLayout& l, uint32_t br_depth)
   }
   b.push_back(kLocalSet);
   PutU32(b, 4);
+  // How many instructions this particular exit has run.
+  //
+  // It used to be a constant folded into the epilogue, which was correct
+  // only while a block had exactly one exit. A block that continues past a
+  // conditional branch has several, each having run a different number of
+  // instructions, and charging the budget for the whole block at an early
+  // exit would advance the emulated clock for work that never happened.
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(insts_so_far));
+  b.push_back(kLocalSet);
+  PutU32(b, 7);
   b.push_back(kBr);
   PutU32(b, br_depth);
 }
 
-inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
+inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
 {
-  // downcount -= insts, keeping the new value
+  // downcount -= local 7, the count the exiting path parked there
   b.push_back(kLocalGet);
   PutU32(b, 0);
   b.push_back(kLocalGet);
@@ -613,8 +624,8 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
   b.push_back(kI32Load);
   PutU32(b, 2);
   PutU32(b, l.downcount_offset);
-  b.push_back(kI32Const);
-  PutI32(b, static_cast<int32_t>(insts));
+  b.push_back(kLocalGet);
+  PutU32(b, 7);
   b.push_back(kI32Sub);
   b.push_back(kLocalTee);
   PutU32(b, 5);
@@ -817,8 +828,21 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   // entry rather than at every access.
   bool touches_memory = false;
   const char* stopped = "instruction limit";
+  // Static successors, collected as they are found.
+  //
+  // BOUNDS-CHECKED through one helper rather than by each caller. A block
+  // used to end at the first branch, so at most one site ever wrote here;
+  // a superblock runs through conditional branches and can reach several
+  // of them before an unconditional one, and the first version of that
+  // change overflowed this array on the very first region the boot
+  // compiled -- a stack smash that presented as "memory access out of
+  // bounds" from inside the compiler, nowhere near the code it emits.
   uint32_t succ[2] = {0, 0};
   uint32_t nsucc = 0;
+  auto add_succ = [&succ, &nsucc](uint32_t p) {
+    if (nsucc < 2)
+      succ[nsucc++] = p;
+  };
 
   for (; n < max_insts; ++n)
   {
@@ -1181,7 +1205,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>((start_pc + (n + 1) * 4) | 2u));
         body.push_back(kReturn);
-        succ[nsucc++] = start_pc + (n + 1) * 4;
+        add_succ(start_pc + (n + 1) * 4);
         handled = true;
         ends_block = true;
         break;
@@ -1293,12 +1317,12 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
       body.push_back(kI32Const);
       PutI32(body, static_cast<int32_t>(target));
-      EmitGoTo(body, layout, 0);
-      succ[nsucc++] = target;
+      EmitGoTo(body, layout, 0, n + 1);
+      add_succ(target);
       // A call does not fall through, but its RETURN SITE is a block entry
       // and a hot one, so it is worth compiling in the same region.
       if (link)
-        succ[nsucc++] = this_pc + 4;
+        add_succ(this_pc + 4);
       handled = true;
       ends_block = true;
       break;
@@ -1328,7 +1352,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(target));
-        EmitGoTo(body, layout, 0);
+        EmitGoTo(body, layout, 0, n + 1);
       }
       else
       {
@@ -1339,16 +1363,28 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(target));
-        EmitGoTo(body, layout, 1);  // 0 is the if, 1 the enclosing block
+        EmitGoTo(body, layout, 1, n + 1);  // 0 is the if, 1 the enclosing block
         body.push_back(kEnd);
         // Falling through leaves the block's trailing end_pc as the result,
         // which is this instruction's PC plus four.
       }
-      succ[nsucc++] = target;
-      if ((bo & 0x14) != 0x14)
-        succ[nsucc++] = this_pc + 4;  // the not-taken edge
+      if (nsucc < 2)
+        add_succ(target);
       handled = true;
-      ends_block = true;
+      // A CONDITIONAL branch does not end the block.
+      //
+      // The taken edge has just exited; what follows the branch in memory
+      // is the not-taken edge, and it is the next instruction either way.
+      // Stopping here was costing the single largest line in the profile:
+      // 277.8 million block entries at 2.83 guest instructions each, every
+      // one paying a function prologue, the MSR[DR] guard and the whole
+      // link epilogue for three instructions of work.
+      //
+      // Continuing makes this a superblock -- one entry, several exits. A
+      // guest that jumps to the not-taken edge directly gets its own block
+      // compiled there, so the code is duplicated rather than shared. That
+      // is the standard trade and it is the cheap side of it.
+      ends_block = ((bo & 0x14) == 0x14);
       break;
     }
 
@@ -1395,7 +1431,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kLocalGet);
         PutU32(body, 1);
-        EmitGoTo(body, layout, 0);
+        EmitGoTo(body, layout, 0, n + 1);
       }
       else
       {
@@ -1406,17 +1442,15 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kLocalGet);
         PutU32(body, 1);
-        EmitGoTo(body, layout, 1);
+        EmitGoTo(body, layout, 1, n + 1);
         body.push_back(kEnd);
       }
-      // The target is in LR or CTR and is not knowable here. The not-taken
-      // edge is, and for the link forms so is the return site -- which is
-      // the same address.
-      if ((bo & 0x14) != 0x14 || link)
-        succ[nsucc++] = this_pc + 4;
       used_locals = used_locals < 2 ? 2 : used_locals;
       handled = true;
-      ends_block = true;
+      // Same as bc: a conditional return exits on one edge and carries on
+      // along the other. An unconditional one really does end the block,
+      // and its target is in a register, so it reports no successor.
+      ends_block = ((bo & 0x14) == 0x14);
       break;
     }
 
@@ -1486,28 +1520,27 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   r.instructions = n;
   r.end_pc = start_pc + n * 4;
   r.stopped_on = stopped;
+  // Static branch targets first, then the fall-through.
+  //
+  // Only an UNCONDITIONAL exit ends a block now, so "ended on a branch"
+  // means control genuinely cannot continue past it. Everything else runs
+  // off the end of the block and into the next instruction -- past the one
+  // that was refused, when that is why it stopped, because the interpreter
+  // will have run exactly that one.
+  //
+  // The distinction matters most for an unconditional blr or bcctr: those
+  // record no successor on purpose, because the target is in a register,
+  // and treating that as a fall-through would hand the caller the address
+  // after a return instruction, which is usually the next function's first
+  // byte and is not reachable from here at all.
   const bool ended_on_branch = (stopped == std::string_view("branch"));
-  if (nsucc == 0 && n != 0 && !ended_on_branch)
-  {
-    // No branch ended this block, so control continues at the next
-    // instruction -- past the one that was refused, if that is why it
-    // stopped, because the interpreter will have run exactly that one.
-    //
-    // The ended_on_branch guard matters: an unconditional blr or bcctr
-    // records NO successor on purpose, because its target is in a
-    // register. Treating that as a fall-through would hand the caller the
-    // address after the return instruction, which is usually the next
-    // function's first byte and is not reachable from here at all.
-    r.succ[0] = (stopped == std::string_view("unsupported instruction")) ? r.end_pc + 4
-                                                                         : r.end_pc;
-    r.nsucc = 1;
-  }
-  else
-  {
-    for (uint32_t i = 0; i < nsucc; ++i)
-      r.succ[i] = succ[i];
-    r.nsucc = nsucc;
-  }
+  uint32_t out = 0;
+  for (uint32_t i = 0; i < nsucc && out < 2; ++i)
+    r.succ[out++] = succ[i];
+  if (!ended_on_branch && n != 0 && out < 2)
+    r.succ[out++] = (stopped == std::string_view("unsupported instruction")) ? r.end_pc + 4
+                                                                             : r.end_pc;
+  r.nsucc = out;
   if (n == 0)
     return r;  // nothing compiled; module stays empty
 
@@ -1553,15 +1586,20 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     wrapped.push_back(kBlock);
     wrapped.push_back(kVoid);
     PutBytes(wrapped, body);
-    // Fall-through case: continue at the instruction after the block.
+    // Fall-through case: continue at the instruction after the block,
+    // having run all of it.
     wrapped.push_back(kI32Const);
     PutI32(wrapped, static_cast<int32_t>(r.end_pc));
     wrapped.push_back(kLocalSet);
     PutU32(wrapped, 4);
+    wrapped.push_back(kI32Const);
+    PutI32(wrapped, static_cast<int32_t>(n));
+    wrapped.push_back(kLocalSet);
+    PutU32(wrapped, 7);
     wrapped.push_back(kEnd);
-    EmitLinkEpilogue(wrapped, layout, n);
+    EmitLinkEpilogue(wrapped, layout);
     body = std::move(wrapped);
-    used_locals = used_locals < 6 ? 6 : used_locals;
+    used_locals = used_locals < 8 ? 8 : used_locals;
   }
   else
   {
