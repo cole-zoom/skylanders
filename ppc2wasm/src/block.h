@@ -26,6 +26,20 @@
 
 namespace ppc2wasm
 {
+// A reserved six-byte slot in a body where a direct tail call may go.
+//
+// The index of a sibling function is not known while a block is being
+// emitted -- the region it belongs to has not finished being discovered --
+// so the call site is emitted as a hole and filled in afterwards. Six bytes
+// is `return_call` plus a five-byte LEB128 index, which is the widest a u32
+// index can be; an unfilled hole becomes six `nop`s and the code falls
+// through to the ordinary table lookup.
+struct DirectFixup
+{
+  uint32_t offset;  // into BlockResult::body
+  uint32_t target;  // the guest PC this call would go to
+};
+
 struct BlockResult
 {
   Bytes module;           // a complete wasm module, or empty if nothing compiled
@@ -61,7 +75,47 @@ struct BlockResult
   // MSR[DR] being set and the BATs being the ones it was compiled under.
   // The check is the caller's -- see the note in CompileBlock.
   bool touches_memory = false;
+
+  // Direct-call holes in `body`, to be filled by PatchDirectCalls once the
+  // caller knows which guest PCs became which function indices. Empty
+  // unless StateLayout::allow_direct is set.
+  std::vector<DirectFixup> fixups;
 };
+
+// Fill the direct-call holes a block left behind.
+//
+// `lookup(target_pc)` returns the function index of that block within the
+// SAME module, or a negative number when it is not there. A hole left
+// unfilled stays six nops and the emitted fallback runs: the block sets up
+// the next PC and drops through to the table lookup exactly as it would
+// have without any of this.
+//
+// The index is written as a FIVE-BYTE LEB128 even when it would fit in
+// one. WebAssembly allows a padded encoding -- the grammar only requires
+// the final byte to carry the remaining bits -- and a fixed width is what
+// makes patching possible at all, because the hole was reserved before the
+// value was known.
+template <typename F>
+inline uint32_t PatchDirectCalls(Bytes& body, const std::vector<DirectFixup>& fixups, F lookup)
+{
+  uint32_t patched = 0;
+  for (const DirectFixup& f : fixups)
+  {
+    const int index = lookup(f.target);
+    if (index < 0)
+      continue;
+    uint32_t v = static_cast<uint32_t>(index);
+    body[f.offset] = kReturnCall;
+    for (uint32_t i = 0; i < 5; ++i)
+    {
+      const uint8_t seven = static_cast<uint8_t>(v & 0x7F);
+      v >>= 7;
+      body[f.offset + 1 + i] = (i == 4) ? seven : static_cast<uint8_t>(seven | 0x80);
+    }
+    ++patched;
+  }
+  return patched;
+}
 
 // Offsets into the guest state struct. Passed in rather than hardcoded,
 // because PowerPCState's layout is Dolphin's business and baking a number
@@ -98,6 +152,15 @@ struct StateLayout
   uint32_t spr_offset = 0;       // offsetof(PowerPCState, spr)
   uint32_t lr_index = 8;         // SPR_LR
   uint32_t ctr_index = 9;        // SPR_CTR
+
+  // When set, an exit whose target is known at compile time reserves a
+  // hole for a direct tail call to it. The caller fills the hole for
+  // targets that ended up in the same module and leaves the rest as nops.
+  //
+  // Off by default: a hole that nobody patches is correct but pointless,
+  // and a caller that does not call PatchDirectCalls should not pay for
+  // the fallback code around it.
+  bool allow_direct = false;
 
   // ── block linking ──
   //
@@ -729,6 +792,117 @@ inline void EmitGoTo(Bytes& b, const StateLayout& l, uint32_t br_depth, uint32_t
   PutU32(b, br_depth);
 }
 
+// Increment a link counter by a signed amount.
+inline void EmitBumpStatBy(Bytes& b, const StateLayout& l, uint32_t slot, int32_t delta)
+{
+  if (!l.link_stats_addr)
+    return;
+  const uint32_t addr = l.link_stats_addr + slot * 4;
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(addr));
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(addr));
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, 0);
+  b.push_back(kI32Const);
+  PutI32(b, delta);
+  b.push_back(kI32Add);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, 0);
+}
+
+// An exit whose target is a compile-time constant.
+//
+// Without allow_direct this is what it always was: push the PC and let the
+// shared epilogue charge the budget and look the target up.
+//
+// With it, the budget is charged HERE and a six-byte hole is reserved for
+// a direct tail call to the target. Filled, the exit is one instruction --
+// no hash, no table load, no stored-PC compare, no runtime type check.
+// Unfilled, the hole is six nops and control drops through to exactly the
+// fallback that would have run anyway, with the budget charge zeroed so
+// the epilogue does not take it twice.
+//
+// Everything after a filled `return_call` is unreachable. WebAssembly
+// validates unreachable code against a polymorphic stack, so the same
+// bytes are well-formed whichever way the hole is filled -- which is the
+// property that makes patching rather than recompiling possible.
+inline void EmitStaticExit(Bytes& b, const StateLayout& l, uint32_t target,
+                           uint32_t insts_so_far, uint32_t br_depth,
+                           std::vector<DirectFixup>& fixups)
+{
+  if (!l.enable_linking || !l.allow_direct)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(target));
+    EmitGoTo(b, l, br_depth, insts_so_far);
+    return;
+  }
+
+  // downcount -= insts_so_far
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.downcount_offset);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(insts_so_far));
+  b.push_back(kI32Sub);
+  b.push_back(kLocalTee);
+  PutU32(b, 5);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, l.downcount_offset);
+
+  // Out of budget: hand back to the dispatcher.
+  b.push_back(kLocalGet);
+  PutU32(b, 5);
+  b.push_back(kI32Const);
+  PutI32(b, 0);
+  b.push_back(kI32LeS);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  EmitBumpStatBy(b, l, 2, 1);  // budget exhausted
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(target));
+  b.push_back(kReturn);
+  b.push_back(kEnd);
+
+  // Counted as a hit up front and taken back below if the hole stays
+  // empty, because the code that would know lives on the other side of a
+  // tail call that never returns.
+  EmitBumpStatBy(b, l, 0, 1);
+  EmitBumpStatBy(b, l, 1, 1);
+
+  b.push_back(kLocalGet);
+  PutU32(b, 0);  // the successor takes the same state pointer
+  DirectFixup fx;
+  fx.offset = static_cast<uint32_t>(b.size());
+  fx.target = target;
+  fixups.push_back(fx);
+  for (int i = 0; i < 6; ++i)
+    b.push_back(kNop);
+
+  // Only reached when the hole was not filled.
+  b.push_back(kDrop);
+  EmitBumpStatBy(b, l, 0, -1);
+  EmitBumpStatBy(b, l, 1, -1);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(target));
+  b.push_back(kLocalSet);
+  PutU32(b, 4);
+  b.push_back(kI32Const);
+  PutI32(b, 0);  // the budget is already charged
+  b.push_back(kLocalSet);
+  PutU32(b, 7);
+  b.push_back(kBr);
+  PutU32(b, br_depth);
+}
+
 inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
 {
   // downcount -= local 7, the count the exiting path parked there
@@ -956,6 +1130,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   // change overflowed this array on the very first region the boot
   // compiled -- a stack smash that presented as "memory access out of
   // bounds" from inside the compiler, nowhere near the code it emits.
+  std::vector<DirectFixup> fixups;
   uint32_t succ[2] = {0, 0};
   uint32_t nsucc = 0;
   auto add_succ = [&succ, &nsucc](uint32_t p) {
@@ -1434,9 +1609,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       const uint32_t target = absolute ? static_cast<uint32_t>(li) : this_pc + li;
       if (link)
         EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-      body.push_back(kI32Const);
-      PutI32(body, static_cast<int32_t>(target));
-      EmitGoTo(body, layout, 0, n + 1);
+      EmitStaticExit(body, layout, target, n + 1, 0, fixups);
       add_succ(target);
       // A call does not fall through, but its RETURN SITE is a block entry
       // and a hot one, so it is worth compiling in the same region.
@@ -1469,9 +1642,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         // Neither CTR nor the condition register is consulted.
         if (link)
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-        body.push_back(kI32Const);
-        PutI32(body, static_cast<int32_t>(target));
-        EmitGoTo(body, layout, 0, n + 1);
+        EmitStaticExit(body, layout, target, n + 1, 0, fixups);
       }
       else
       {
@@ -1480,9 +1651,8 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kVoid);
         if (link)
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-        body.push_back(kI32Const);
-        PutI32(body, static_cast<int32_t>(target));
-        EmitGoTo(body, layout, 1, n + 1);  // 0 is the if, 1 the enclosing block
+        // 0 is the if, 1 the enclosing block
+        EmitStaticExit(body, layout, target, n + 1, 1, fixups);
         body.push_back(kEnd);
         // Falling through leaves the block's trailing end_pc as the result,
         // which is this instruction's PC plus four.
@@ -1707,17 +1877,36 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     Bytes wrapped;
     wrapped.push_back(kBlock);
     wrapped.push_back(kVoid);
+    // Every fixup recorded so far is an offset into `body`, which is about
+    // to be copied two bytes into `wrapped`. The patcher indexes the final
+    // body, so they move with it. Getting this wrong would write a
+    // function index over two bytes of real code and leave the call site
+    // as nops -- wrong code that still validates, which is the worst
+    // shape a bug can have here.
+    for (DirectFixup& f : fixups)
+      f.offset += 2;
     PutBytes(wrapped, body);
     // Fall-through case: continue at the instruction after the block,
-    // having run all of it.
-    wrapped.push_back(kI32Const);
-    PutI32(wrapped, static_cast<int32_t>(r.end_pc));
-    wrapped.push_back(kLocalSet);
-    PutU32(wrapped, 4);
-    wrapped.push_back(kI32Const);
-    PutI32(wrapped, static_cast<int32_t>(n));
-    wrapped.push_back(kLocalSet);
-    PutU32(wrapped, 7);
+    // having run all of it. A static target like any other, and the most
+    // common one, so it gets a direct-call hole too.
+    //
+    // The fixup offsets recorded here are relative to `wrapped`, which is
+    // about to become the body -- the same buffer the patcher indexes.
+    if (layout.allow_direct)
+    {
+      EmitStaticExit(wrapped, layout, r.end_pc, n, 0, fixups);
+    }
+    else
+    {
+      wrapped.push_back(kI32Const);
+      PutI32(wrapped, static_cast<int32_t>(r.end_pc));
+      wrapped.push_back(kLocalSet);
+      PutU32(wrapped, 4);
+      wrapped.push_back(kI32Const);
+      PutI32(wrapped, static_cast<int32_t>(n));
+      wrapped.push_back(kLocalSet);
+      PutU32(wrapped, 7);
+    }
     wrapped.push_back(kEnd);
     EmitLinkEpilogue(wrapped, layout);
     body = std::move(wrapped);
@@ -1731,6 +1920,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   }
 
   r.locals = used_locals;
+  r.fixups = std::move(fixups);
   if (!emit_module)
   {
     r.body = std::move(body);

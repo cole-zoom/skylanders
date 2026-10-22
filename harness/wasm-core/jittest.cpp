@@ -227,6 +227,62 @@ int main()
     check(b.instructions == 1, "a block stops at the first unsupported instruction");
     check(b.end_pc == 0x80001004, "end pc points AT the unsupported instruction");
 
+    // ── direct-call holes ──
+    //
+    // Checked by STRUCTURE rather than by running anything, because the
+    // failure this guards against is an offset that points two bytes off:
+    // the patch would then overwrite real code and leave the call site as
+    // nops, which still validates and runs the wrong thing.
+    {
+      ppc2wasm::StateLayout D = L;
+      D.enable_linking = true;
+      D.allow_direct = true;
+      D.downcount_offset = 100;
+      const uint32_t uncond[] = {0x48000010};  // b +16
+      auto r2 = ppc2wasm::CompileBlock(uncond, 0x80001000, 1, D);
+      check(r2.fixups.size() >= 1, "a static exit reserves a direct-call hole");
+      bool holes_ok = !r2.fixups.empty();
+      for (const auto& f : r2.fixups)
+      {
+        if (f.offset + 6 > r2.body.size())
+        {
+          holes_ok = false;
+          break;
+        }
+        for (int i = 0; i < 6; ++i)
+          if (r2.body[f.offset + i] != ppc2wasm::kNop)
+            holes_ok = false;
+      }
+      check(holes_ok, "an unpatched hole is six nops inside the body");
+      bool targets_ok = false;
+      for (const auto& f : r2.fixups)
+        if (f.target == 0x80001010)
+          targets_ok = true;
+      check(targets_ok, "the hole names the branch target");
+
+      // Patch it and read the index back out the way a decoder would.
+      auto body = r2.body;
+      const uint32_t n = ppc2wasm::PatchDirectCalls(
+          body, r2.fixups, [](uint32_t pc) { return pc == 0x80001010 ? 300 : -1; });
+      check(n == 1, "exactly the resolvable hole is patched");
+      const uint32_t off = r2.fixups[0].target == 0x80001010 ? r2.fixups[0].offset
+                                                             : r2.fixups[1].offset;
+      check(body[off] == ppc2wasm::kReturnCall, "a patched hole starts with return_call");
+      uint32_t decoded = 0, shift = 0;
+      for (int i = 0; i < 5; ++i)
+      {
+        decoded |= static_cast<uint32_t>(body[off + 1 + i] & 0x7F) << shift;
+        shift += 7;
+      }
+      check(decoded == 300, "the five-byte padded index decodes to what was written");
+      check((body[off + 5] & 0x80) == 0, "the last LEB byte has no continuation bit");
+      // An unresolvable target must be left alone, not written with -1.
+      auto body2 = r2.body;
+      const uint32_t n2 =
+          ppc2wasm::PatchDirectCalls(body2, r2.fixups, [](uint32_t) { return -1; });
+      check(n2 == 0 && body2 == r2.body, "an unresolvable hole is left as nops");
+    }
+
     // ── static successors ──
     //
     // Where a region compiler is told control can go next. A wrong answer
