@@ -125,32 +125,126 @@ Linking was the right fix for chain length and it worked. It does nothing for
 this, because linking changes how often the *dispatcher* is reached, not how
 often a *block* is entered.
 
+---
+
+## Why blocks are short, and what the interpreter is left holding
+
+Two more counters, because "blocks are 2.82 instructions" does not say what to
+*do*. Lengthening them by compiling more instruction forms and lengthening
+them by compiling across branches are different projects.
+
+Behind `--jit-stats`, and off by default: they sit on the dispatch and
+interpreter-fallback paths and cost about 4% (6883 ms becomes 6975 ms over
+800M). The speed line is the number this project steers by, and a
+measurement that quietly taxes the thing it measures is worse than none.
+
+### Why a block ends
+
+| ends on | distinct blocks | avg instructions | dispatches |
+|---|---|---|---|
+| a branch | 67,863 | **5.09** | 42,875,744 |
+| an unsupported instruction | 23,872 | **1.47** | 4,051,554 |
+| the 64-instruction limit | 82 | 64.00 | 166 |
+
+Blocks that end at a branch already average 5.09 instructions, at the ceiling
+branch density implies. **Branches are not the problem.** Blocks that end on
+an instruction we cannot translate average 1.47 — they stop almost
+immediately — and there are 23,872 of them.
+
+Three averages worth holding together:
+
+- 4.20 instructions per **distinct** block
+- 4.78 per block the **dispatcher** enters
+- 2.82 per block entry **overall**, so blocks reached by a **tail call**
+  average **2.43**
+
+Chains are long (16.69) and made of very short blocks. Linking is doing its
+job and the thing it links is too small.
+
+### What the interpreter runs
+
+16,830,113 instructions, split by *why* they are there — a distinction that
+turned out to matter more than the totals.
+
+**Retired: 9,835 blocks, 4,455,074 instructions, 26.5%.** A block that refuses
+its first instruction is dropped and interpreted from then on. The list is
+98% loads and stores — `lwz` 28.5%, `stw` 25.4%, `stbu` 19.7%, `lbzu` 10.0%,
+`stwu` 8.3%, `lbz` 4.7%. This is MEM2, and it is the reason the bail count
+does not show it.
+
+**Never compiled: 73.5%**, and it concentrates:
+
+| form | share of never-compiled | instructions |
+|---|---|---|
+| `bdnz` / `bdz` (opcode 16, BO bit 2 clear) | **29.7%** | 3,675,627 |
+| `dcbz` | 18.9% | 2,336,730 |
+| `rlwinm.` (Rc set) | 8.9% | 1,097,934 |
+| `addic.` | 6.4% | 789,359 |
+| `subfic` | 3.7% | 460,258 |
+| `mftb` | 3.6% | 441,690 |
+| `adde` | 3.2% | 400,769 |
+| `dcbst` | 2.3% | 281,703 |
+
+`bdnz` is the top of that list and it is worse than its share suggests,
+because it is **the loop back-edge**. `block.h` refuses the CTR-decrementing
+branch forms, so a counted loop leaves compiled code, interprets one
+instruction and re-enters *on every iteration*. That is 3.68M forced chain
+exits — 7.8% of all 46.9M dispatches — and it caps chain length at the body
+of one loop iteration no matter how good linking gets.
+
+The rest of the list is mostly one theme: **the condition register and XER
+carry are not modelled for arithmetic**. `rlwinm.`, `addic.`, `subfic` and
+`adde` together are 22.2%.
+
+---
+
 ### Suggested order now
 
-1. **Cut the per-block-entry cost — 46% of the run.** Three independent
-   levers, probably in this order:
-   - *Direct linking.* When a block's successor is already compiled and the
-     target is static, the epilogue's hash, table load and PC compare are all
-     avoidable. Chains already hit 91.5% of the time.
-   - *Longer blocks.* Blocks end at every branch, and branch density is ~22%,
-     so the ceiling on a basic block is about 4.5 instructions and we get
-     2.82. Traces or superblocks that continue through a predicted branch
-     raise the ceiling instead of approaching it.
-   - *Registers in wasm locals.* Ranked 5th before. The fixed cost of an entry
-     is only worth paying if the block does real work between prologue and
-     epilogue.
-2. **Batch installation — 25% of the run, and the reason short runs look
-   slow.** 76,556 separate `new WebAssembly.Module` calls at 22.4 µs. One
-   module holding many blocks would amortise nearly all of it. This is the
-   cheapest large win on the list.
-3. **Interpreter fallback — 13%.** 2.1% of instructions taking 13% of the
-   time. Worth finding what they are before building anything: a coverage run
-   that ranks the *interpreted* instructions, not the executed ones.
-4. **Link-table collisions — now 58.9% of misses have a compiled successor**,
-   up from 39.1% at 200M. This grew exactly as predicted and is real, but it
-   buys chain length, which is worth ~13% in total.
-5. **MEM2, floating point, paired singles.** Correctness, not speed. Re-rank
-   against a *gameplay* profile, not this one.
+0. **`bdnz` and the CTR-decrementing branch forms.** Smallest change on this
+   list by a wide margin — CTR is already read and written through the SPR
+   path, and the only reason these are refused is that the decrement is not
+   modelled. It pays three times: 3.68M interpreted instructions, 3.68M
+   forced chain exits, and a ceiling on chain length that no amount of link
+   tuning can lift while a loop's back-edge is uncompiled. Do this first.
+
+1. **The rest of the unsupported long tail**, in the order measured above:
+   `dcbz` and `dcbst`, then CR-and-carry arithmetic (`rlwinm.`, `addic.`,
+   `subfic`, `adde`), then `mftb`. These attack the 13% interpreter fallback
+   and the 46% per-entry cost at the same time, because the 23,872 blocks
+   that end on an unsupported instruction stop after 1.47 of them.
+
+2. **Batch installation — 25% of the run.** 76,556 separate
+   `new WebAssembly.Module` calls at 22.4 µs. One module holding many blocks
+   amortises nearly all of it, and it is a precondition for the next item:
+   two blocks in the same module can `return_call` each other directly.
+
+3. **Cut the per-block-entry cost — 46% of the run.**
+   - *Direct linking.* When the successor is known and in the same module,
+     the epilogue's hash, table load and PC compare all disappear. Chains
+     already hit 91.5% of the time, so the lookup is nearly always answering
+     a question we could have answered at compile time.
+   - *Registers in wasm locals.* Ranked 5th before this profile. The fixed
+     cost of an entry is only worth paying if the block does real work
+     between prologue and epilogue.
+   - *Traces across branches.* Last, because the measurement says branches
+     are not currently the binding constraint: blocks that end at a branch
+     already reach 5.09 instructions.
+
+4. **MEM2 — ~3.5% of the run and 9,835 retired blocks.** Now sized. Also a
+   correctness gap, which is the better reason to do it.
+
+5. **Link-table collisions — 58.9% of misses have a compiled successor**, up
+   from 39.1% at 200M. Real and growing, but it buys chain length, and chain
+   length is not what is costing us.
+
+6. **Floating point and paired singles.** Re-rank against a *gameplay*
+   profile, not this one.
+
+**Block retirement deserves a second look while doing any of this.** It is
+permanent, with no re-entry, and it is currently load-bearing: it is what
+keeps a MEM2 access from bailing 4.5 million times. Once MEM2 is supported,
+the blocks it retires will be a different and much smaller population, and a
+permanent decision made from one observation will look much less safe.
 
 ---
 

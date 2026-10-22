@@ -62,6 +62,13 @@ The constraint is that **blocks are 2.82 instructions long**. Chains average
 16.69 instructions but cross 5.9 blocks, and every block entry pays a
 prologue, the `MSR[DR]` guard and the entire link epilogue.
 
+And the first thing to do about it is smaller than any item below: **`bdnz`
+and the CTR-decrementing branch forms are not translated**, so a counted loop
+leaves compiled code, interprets one instruction and re-enters on every
+iteration — 3.68M forced chain exits, 7.8% of all dispatches, and a hard
+ceiling on chain length that no link tuning can lift. The profile document
+ranks the rest.
+
 ### 2. Make the dispatcher cheap
 
 `jit_cache` is a `std::unordered_map<u32, JitEntry>` consulted on every chain
