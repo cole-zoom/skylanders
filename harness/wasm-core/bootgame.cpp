@@ -1408,6 +1408,8 @@ int main(int argc, char** argv)
     // counts successor EDGES rather than executions of them.
     for (const Pending& pb : pending)
     {
+      if (!want_jit_stats)
+        break;
       for (u32 i = 0; i < pb.nsucc; ++i)
       {
         ++succ_edges;
@@ -1891,7 +1893,6 @@ int main(int argc, char** argv)
       // how often the fixed cost of entering compiled code -- function
       // prologue, the MSR[DR] guard, the whole link epilogue -- is paid.
       // Linking lengthens chains without changing this at all.
-      const u64 entries = jit_blocks + static_cast<u64>(link_stats[0]);
       {
         static const char* kLbl[7] = {"1", "2", "3", "4", "5-8", "9-15", "16"};
         std::printf("  jit       region sizes:");
@@ -1899,15 +1900,24 @@ int main(int argc, char** argv)
           std::printf("  %s=%llu", kLbl[k], static_cast<unsigned long long>(region_hist[k]));
         std::printf("\n");
       }
-      std::printf("  jit       %llu static successor edges, %llu are siblings (%.1f%%)\n",
-                  static_cast<unsigned long long>(succ_edges),
-                  static_cast<unsigned long long>(succ_sibling),
-                  succ_edges ? 100.0 * static_cast<double>(succ_sibling) /
-                                   static_cast<double>(succ_edges)
-                             : 0.0);
-      std::printf("  jit       %llu block entries, %.2f instructions per entry\n",
-                  static_cast<unsigned long long>(entries),
-                  entries ? static_cast<double>(jit_insts) / static_cast<double>(entries) : 0.0);
+      if (want_jit_stats)
+      {
+        std::printf("  jit       %llu static successor edges, %llu are siblings (%.1f%%)\n",
+                    static_cast<unsigned long long>(succ_edges),
+                    static_cast<unsigned long long>(succ_sibling),
+                    succ_edges ? 100.0 * static_cast<double>(succ_sibling) /
+                                     static_cast<double>(succ_edges)
+                               : 0.0);
+        // Derived from the link hit counter, which is itself behind this
+        // flag. Printed without it, the sum is the round-trip count
+        // wearing the wrong label -- it read 24.02 instructions per entry
+        // where the real figure is 3.02.
+        const u64 entries = jit_blocks + static_cast<u64>(link_stats[0]);
+        std::printf("  jit       %llu block entries, %.2f instructions per entry\n",
+                    static_cast<unsigned long long>(entries),
+                    entries ? static_cast<double>(jit_insts) / static_cast<double>(entries)
+                            : 0.0);
+      }
       if (want_jit_stats)
       {
         static const char* kStop[3] = {"branch", "unsupported", "limit"};

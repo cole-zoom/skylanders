@@ -334,8 +334,9 @@ a function prologue, the `MSR[DR]` guard and the link epilogue.
      epilogue's hash, table load, PC compare and `return_call_indirect`
      with a `return_call` removes roughly eight wasm instructions and a
      runtime type check from 228 million tail calls. Coverage is bounded
-     by how often a successor is a sibling, which today means regions
-     averaging 3.7 blocks — worth measuring before building.
+     by how often a successor is a sibling: **measured at 47.4% of static
+     successor edges** (`--jit-stats` reports it), with regions averaging
+     3.7 blocks. Dynamic coverage is unknown and could go either way.
    - *One function per region, with an internal `br_table`.* The same idea
      taken further: an intra-region transfer becomes a branch rather than
      a call. Larger change, larger prize.
