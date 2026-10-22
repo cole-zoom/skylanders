@@ -498,6 +498,188 @@ int main()
     check(rand_fail == 0, "randomised differential over every supported form");
   }
 
+  // ── randomised BLOCK differential ──
+  //
+  // The per-instruction differential checks each form in isolation. What it
+  // cannot see is everything that only exists once instructions are put
+  // together: the block epilogue, a branch leaving mid-block, a guard
+  // refusing partway through, and whether stores landed where they should.
+  //
+  // This generates random SEQUENCES, runs the interpreter for exactly as many
+  // instructions as the compiled block actually executed, and compares the
+  // whole of the guest state -- registers, condition fields, link and count
+  // registers, and a window of guest MEMORY. Memory matters: a store to the
+  // wrong address is invisible to any comparison that only reads registers.
+  {
+    std::printf("\n  randomised block differential\n");
+
+    // A scratch window for stores, well away from the code being run.
+    constexpr u32 kScratch = 0x8001'0000;
+    constexpr u32 kScratchWords = 256;
+
+    // Instructions the generator draws from. Deliberately a mix of
+    // arithmetic, memory, compares and branches, because a block of pure
+    // arithmetic exercises none of the interesting paths.
+    struct Gen { u32 primary; u32 xo; };
+    static const Gen pool[] = {
+        {14, 0}, {15, 0}, {7, 0},  {24, 0}, {26, 0}, {21, 0},
+        {11, 0}, {10, 0},
+        {32, 0}, {34, 0}, {40, 0}, {36, 0}, {38, 0}, {44, 0},
+        {31, 266}, {31, 40}, {31, 444}, {31, 28}, {31, 316},
+        {31, 24}, {31, 536}, {31, 954}, {31, 922}, {31, 104},
+        {31, 26}, {31, 60}, {31, 124}, {31, 235},
+        {31, 23}, {31, 151}, {31, 87}, {31, 215},
+        {16, 0},  // a conditional branch, to exercise an early exit
+    };
+
+    u32 seed = 0xC0FFEE11;
+    auto rnd = [&seed]() {
+      seed ^= seed << 13;
+      seed ^= seed >> 17;
+      seed ^= seed << 5;
+      return seed;
+    };
+
+    auto digest = [&]() {
+      u64 h = 0xcbf29ce484222325ULL;
+      for (u32 w = 0; w < kScratchWords; ++w)
+      {
+        const u32 v = memory.Read_U32(kScratch + w * 4);
+        for (int by = 0; by < 4; ++by)
+        {
+          h ^= (v >> (by * 8)) & 0xFF;
+          h *= 0x100000001b3ULL;
+        }
+      }
+      return h;
+    };
+
+    int block_fail = 0, blocks_run = 0;
+    for (int trial = 0; trial < 400 && block_fail < 4; ++trial)
+    {
+      const u32 len = 2 + (rnd() % 10);
+      std::vector<u32> prog;
+      for (u32 k = 0; k < len; ++k)
+      {
+        const Gen& g = pool[rnd() % (sizeof(pool) / sizeof(pool[0]))];
+        const u32 a = rnd() % 31 + 1;
+        u32 b = rnd() % 31 + 1;
+        if (b == a)
+          b = (a % 31) + 1;
+        const u32 d = rnd() % 31 + 1;
+        u32 ins;
+        if (g.primary == 31)
+          ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
+        else if (g.primary == 16)
+          // A forward conditional branch with BO bit 2 set, so it is a plain
+          // condition test rather than a CTR form.
+          ins = (16u << 26) | (12u << 21) | ((rnd() % 4) << 16) | 0x0008;
+        else
+          ins = (g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0);
+        prog.push_back(ins);
+      }
+
+      // A starting state both engines share, including memory.
+      u32 init_gpr[32];
+      for (int i = 0; i < 32; ++i)
+        init_gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : rnd();
+      // Every register that might be used as a base points into the scratch
+      // window, so loads and stores stay inside MEM1 and inside the window
+      // the digest covers.
+      for (int i = 1; i < 32; ++i)
+        if (rnd() & 1)
+          init_gpr[i] = kScratch + (rnd() % 64) * 4;
+      for (u32 w = 0; w < kScratchWords; ++w)
+        memory.Write_U32(rnd(), kScratch + w * 4);
+      std::vector<u32> init_mem(kScratchWords);
+      for (u32 w = 0; w < kScratchWords; ++w)
+        init_mem[w] = memory.Read_U32(kScratch + w * 4);
+
+      auto reset = [&]() {
+        for (int i = 0; i < 32; ++i)
+          state.gpr[i] = init_gpr[i];
+        for (int i = 0; i < 8; ++i)
+          state.cr.fields[i] = 0;
+        state.spr[SPR_LR] = 0;
+        state.spr[SPR_CTR] = 0;
+        state.downcount = 10000;
+        state.pc = state.npc = BASE;
+        for (u32 w = 0; w < kScratchWords; ++w)
+          memory.Write_U32(init_mem[w], kScratch + w * 4);
+      };
+
+      for (u32 k = 0; k < prog.size(); ++k)
+        memory.Write_U32(prog[k], BASE + k * 4);
+
+      auto rr = ppc2wasm::CompileBlock(prog.data(), BASE, static_cast<u32>(prog.size()), layout);
+      if (rr.instructions == 0 || rr.module.empty())
+        continue;
+      const int ix = InstallModule(rr.module.data(), static_cast<int>(rr.module.size()));
+      if (ix < 0)
+        continue;
+
+      // Compiled first, so how far it got decides how far the interpreter
+      // is allowed to run. A bail means it stopped early, and comparing
+      // against an interpreter that ran the whole block would report a
+      // difference that is the harness's fault.
+      reset();
+      const u32 ret = reinterpret_cast<BlockFn>(ix)(
+          static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+      const bool bailed = (ret & 1u) != 0;
+      const u32 end_pc = ret & ~1u;
+      u32 jit_gpr[32];
+      std::memcpy(jit_gpr, state.gpr, sizeof(jit_gpr));
+      u64 jit_cr[8];
+      std::memcpy(jit_cr, state.cr.fields, sizeof(jit_cr));
+      const u32 jit_lr = state.spr[SPR_LR];
+      const u64 jit_mem = digest();
+
+      u32 ran = bailed ? (end_pc - BASE) / 4 : rr.instructions;
+      // A taken branch leaves the block, and the whole block ran.
+      if (!bailed && (end_pc < BASE || end_pc > BASE + rr.instructions * 4))
+        ran = rr.instructions;
+
+      reset();
+      for (u32 k = 0; k < ran; ++k)
+        ppc.SingleStep();
+      const u64 int_mem = digest();
+
+      ++blocks_run;
+      bool ok = (jit_mem == int_mem);
+      int bad = -1;
+      for (int i = 0; i < 32; ++i)
+        if (state.gpr[i] != jit_gpr[i])
+        {
+          ok = false;
+          if (bad < 0)
+            bad = i;
+        }
+      for (int i = 0; i < 8; ++i)
+        if (state.cr.fields[i] != jit_cr[i])
+          ok = false;
+      if (state.spr[SPR_LR] != jit_lr)
+        ok = false;
+
+      if (!ok)
+      {
+        ++block_fail;
+        std::printf("  block of %u (%u ran%s):", static_cast<u32>(prog.size()), ran,
+                    bailed ? ", bailed" : "");
+        for (u32 k = 0; k < prog.size() && k < 6; ++k)
+          std::printf(" %08x", prog[k]);
+        std::printf("\n");
+        if (bad >= 0)
+          std::printf("      r%-2d interpreter=%08x recompiled=%08x\n", bad, state.gpr[bad],
+                      jit_gpr[bad]);
+        if (jit_mem != int_mem)
+          std::printf("      memory digests differ\n");
+      }
+    }
+    char lbl[128];
+    std::snprintf(lbl, sizeof(lbl), "randomised block differential (%d blocks)", blocks_run);
+    check(block_fail == 0, lbl);
+  }
+
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
   std::fflush(stdout);
   return g_failures ? 1 : 0;
