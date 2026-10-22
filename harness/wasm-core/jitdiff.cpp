@@ -526,6 +526,15 @@ int main()
         {31, 83, "mfmsr"}, {31, 146, "mtmsr"},
         {31, 23, "lwzx"},   {31, 151, "stwx"}, {31, 87, "lbzx"},  {31, 215, "stbx"},
         {31, 279, "lhzx"},  {31, 407, "sthx"},
+        // Update forms and the SPR moves. Both write a GPR in a shape no
+        // other template here produces -- the update forms write rA, the
+        // BASE register, on top of whatever they load; mfspr writes a
+        // register from somewhere that is not another register. The boot
+        // is full of both and neither had ever been generated.
+        {33, 0, "lwzu"},    {37, 0, "stwu"},   {35, 0, "lbzu"},   {39, 0, "stbu"},
+        {41, 0, "lhzu"},    {45, 0, "sthu"},
+        {31, 55, "lwzux"},  {31, 183, "stwux"},
+        {31, 339, "mfspr"}, {31, 467, "mtspr"},
     };
 
     u32 seed = 0x12345678;
@@ -553,7 +562,16 @@ int main()
           b = (a % 31) + 1;
         const u32 d = rnd() % 31 + 1;
         u32 ins;
-        if (t.primary == 31)
+        if (t.primary == 31 && (t.xo == 339 || t.xo == 467))
+        {
+          // The SPR field is split and swapped, and only LR and CTR are
+          // translated. Anything else stops the block and compares
+          // nothing.
+          const u32 spr = (rnd() & 1) ? 8u : 9u;
+          ins = (31u << 26) | (d << 21) | ((spr & 0x1F) << 16) |
+                (((spr >> 5) & 0x1F) << 11) | (t.xo << 1);
+        }
+        else if (t.primary == 31)
         {
           ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (t.xo << 1);
           // Set Rc half the time wherever the form has one. CR0 after a
@@ -695,6 +713,21 @@ int main()
         {31, 24}, {31, 536}, {31, 954}, {31, 922}, {31, 104},
         {31, 26}, {31, 60}, {31, 124}, {31, 235},
         {31, 23}, {31, 151}, {31, 87}, {31, 215}, {31, 83}, {31, 146},
+        // Update forms, which write rA as well as the loaded register, and
+        // mfspr, which writes a register from somewhere that is not
+        // another register. Both are everywhere in the boot and neither
+        // was ever generated here -- so every GPR write this pool
+        // exercised came from the same two or three shapes.
+        {33, 0},   // lwzu
+        {37, 0},   // stwu
+        {35, 0},   // lbzu
+        {39, 0},   // stbu
+        {41, 0},   // lhzu
+        {45, 0},   // sthu
+        {31, 55},  // lwzux
+        {31, 183}, // stwux
+        {31, 339}, // mfspr
+        {31, 467}, // mtspr
         {16, 0},  // a conditional branch, to exercise an early exit
     };
     // Forms that carry an Rc bit, drawn with it set so CR0 is exercised
@@ -752,6 +785,14 @@ int main()
           // behaving correctly for the state they were given, and it says
           // nothing about the compiler.
           ins = (31u << 26) | (1u << 21) | (146u << 1);
+        else if (g.primary == 31 && (g.xo == 339 || g.xo == 467))
+        {
+          // The SPR field is split and swapped; only LR (8) and CTR (9)
+          // are translated.
+          const u32 spr = (rnd() & 1) ? 8u : 9u;
+          ins = (31u << 26) | (d << 21) | ((spr & 0x1F) << 16) | (((spr >> 5) & 0x1F) << 11) |
+                (g.xo << 1);
+        }
         else if (g.primary == 31)
           ins = maybe_rc((31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1),
                          (rnd() & 1) != 0);
