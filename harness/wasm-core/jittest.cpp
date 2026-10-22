@@ -19,6 +19,7 @@
 //                                                arithmetic on arguments)
 //   3. its exports can be INSTALLED in the table and called as a function
 //      pointer from C++  (dispatch works without a JS round trip per call)
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -126,6 +127,62 @@ int main()
       0x0A, 0x06, 0x01, 0x04, 0x00, 0x20, 0x00, 0x0B,  // code:  local.get 0; end
   };
   check(bytes == expect, "a complete module encodes byte for byte as expected");
+
+  // Several functions in ONE module. Checked by structure rather than byte
+  // for byte: what matters is that the counts in the function, export and
+  // code sections agree with each other, because a module whose section
+  // counts disagree is rejected outright and the message says nothing
+  // useful about which count was wrong.
+  {
+    ppc2wasm::ModuleBuilder many;
+    many.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
+    ppc2wasm::Bytes b0;
+    b0.push_back(ppc2wasm::kLocalGet);
+    ppc2wasm::PutU32(b0, 0);
+    check(many.AddFunction(b0, "f0") == 0, "the first added function is index 0");
+    check(many.AddFunction(b0, "f1") == 1, "the second is index 1");
+    check(many.AddFunction(b0, "f2", 3) == 2, "the third is index 2");
+    check(many.FunctionCount() == 3, "the builder counts three functions");
+    const auto m = many.Build();
+    // Section 3 (function) must list three type indices, section 7
+    // (export) three names, section 10 (code) three bodies.
+    auto section_count = [&](uint8_t id) -> int {
+      size_t i = 8;  // past magic and version
+      while (i < m.size())
+      {
+        const uint8_t sid = m[i++];
+        uint32_t len = 0, shift = 0;
+        while (i < m.size())
+        {
+          const uint8_t byte = m[i++];
+          len |= static_cast<uint32_t>(byte & 0x7F) << shift;
+          shift += 7;
+          if (!(byte & 0x80))
+            break;
+        }
+        if (sid == id)
+          return static_cast<int>(m[i]);  // counts here are all < 128
+        i += len;
+      }
+      return -1;
+    };
+    check(section_count(3) == 3, "the function section lists three");
+    check(section_count(7) == 3, "the export section lists three");
+    check(section_count(10) == 3, "the code section lists three");
+  }
+
+  // A compiled block hands back its BODY as well as a whole module, so a
+  // caller can pack several into one. The two must describe the same code:
+  // the body has to appear inside the module the same call produced.
+  {
+    ppc2wasm::StateLayout L2{.gpr_offset = 20, .memory_pages = 4096, .memory_shared = true};
+    const uint32_t two[] = {0x38600005, 0x38830007};
+    auto rb = ppc2wasm::CompileBlock(two, 0x80001000, 2, L2);
+    check(!rb.body.empty(), "a compiled block exposes its function body");
+    check(std::search(rb.module.begin(), rb.module.end(), rb.body.begin(), rb.body.end()) !=
+              rb.module.end(),
+          "the body is the code inside the module from the same call");
+  }
   if (bytes != expect)
   {
     std::printf("    got %zu bytes, want %zu\n", bytes.size(), expect.size());

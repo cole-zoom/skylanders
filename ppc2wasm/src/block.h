@@ -28,6 +28,15 @@ namespace ppc2wasm
 struct BlockResult
 {
   Bytes module;           // a complete wasm module, or empty if nothing compiled
+  // The same code as a bare function BODY, with the locals it needs.
+  //
+  // A module costs about 22 us to compile and instantiate almost regardless
+  // of its size, so that price is paid per MODULE, not per block. Handing
+  // back the body lets a caller pack many blocks into one module and pay it
+  // once -- and two blocks in the same module can call each other directly,
+  // with no table and no PC compare.
+  Bytes body;
+  uint32_t locals = 0;
   uint32_t instructions;  // PowerPC instructions translated
   uint32_t end_pc;        // where the interpreter should resume
   const char* stopped_on; // why the block ended, for diagnostics
@@ -1506,6 +1515,9 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     body.push_back(kI32Const);
     PutI32(body, static_cast<int32_t>(r.end_pc));
   }
+
+  r.body = body;
+  r.locals = used_locals;
 
   ModuleBuilder mb;
   mb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
