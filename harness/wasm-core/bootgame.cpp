@@ -475,6 +475,7 @@ int main(int argc, char** argv)
   bool want_coverage = false;
   bool want_jit = false;
   bool want_link = true;
+  int jit_probe = 0;
   bool want_render = false;
   std::string xfb_path;
   u64 frame_every = 0;
@@ -555,6 +556,11 @@ int main(int argc, char** argv)
     // without. It did not pay until two other things were true -- every
     // block gets compiled, so a successor exists to link to, and blocks
     // that always refuse get retired, so a chain is not routed through one.
+    else if (std::strncmp(argv[i], "--jit-probe=", 12) == 0)
+      // 1 = cache lookup, 2 = CoreTiming::Advance, 3 = one indirect call.
+      // Each repeats work the dispatcher already does, once more per
+      // round-trip; the cost is the delta against a baseline run.
+      jit_probe = std::atoi(argv[i] + 12);
     else if (std::strcmp(argv[i], "--jit-no-link") == 0)
       want_link = false;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
@@ -1041,6 +1047,19 @@ int main(int argc, char** argv)
   };
   std::unordered_map<u32, JitEntry> jit_cache;
   u64 jit_blocks = 0, jit_insts = 0, jit_interp = 0, jit_bails = 0;
+
+  // ── where the time goes ──
+  //
+  // Translation and installation happen once per UNIQUE block, not once per
+  // round-trip, so timing them individually costs nothing measurable and
+  // needs no sampling. They are also the two costs the ranked plan in
+  // docs/PHASE2-HANDOFF.md does not list, which is reason enough to measure
+  // them before the three it does.
+  double jit_t_translate = 0.0, jit_t_install = 0.0;
+  u64 jit_translates = 0, jit_installs = 0;
+  // A sink the optimiser cannot see through, for probes whose result is
+  // otherwise unused.
+  volatile u64 jit_probe_sink = 0;
 #if defined(__EMSCRIPTEN__)
   ppc2wasm::StateLayout jit_layout;
   jit_layout.gpr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, gpr));
@@ -1078,6 +1097,21 @@ int main(int argc, char** argv)
   u64 miss_but_cached = 0, miss_total = 0;
   jit_layout.enable_linking = want_link;
 
+  // A block that does nothing but return its argument, for probe 3. It
+  // isolates the indirect call itself from anything the call does.
+  int jit_probe_fn = -1;
+  if (jit_probe == 3)
+  {
+    ppc2wasm::ModuleBuilder pmb;
+    pmb.ImportMemory(jit_layout.memory_pages, jit_layout.memory_pages, true);
+    ppc2wasm::Bytes pbody;
+    pbody.push_back(ppc2wasm::kLocalGet);
+    ppc2wasm::PutU32(pbody, 0);
+    pmb.SetFunction({ppc2wasm::kI32}, {ppc2wasm::kI32}, pbody, "f", 0);
+    const auto pm = pmb.Build();
+    jit_probe_fn = JitInstall(pm.data(), static_cast<int>(pm.size()));
+  }
+
   // How many guest instructions a chain may run before handing control back
   // so the emulated clock can advance. Short enough that scheduled events are
   // not noticeably late, long enough that dispatch is amortised.
@@ -1110,14 +1144,20 @@ int main(int argc, char** argv)
     auto it = jit_cache.find(pc);
     if (it == jit_cache.end())
     {
+      const double t_translate0 = JitNow();
       u32 code[kMaxBlock];
       for (u32 k = 0; k < kMaxBlock; ++k)
         code[k] = system.GetMemory().Read_U32(pc + k * 4);
       auto r = ppc2wasm::CompileBlock(code, pc, kMaxBlock, jit_layout);
+      const double t_translate1 = JitNow();
+      jit_t_translate += t_translate1 - t_translate0;
+      ++jit_translates;
       JitEntry e;
       if (r.instructions >= kMinBlock && !r.module.empty())
       {
         e.index = JitInstall(r.module.data(), static_cast<int>(r.module.size()));
+        jit_t_install += JitNow() - t_translate1;
+        ++jit_installs;
         e.instructions = r.instructions;
       }
       if (e.index >= 0)
@@ -1236,6 +1276,36 @@ int main(int argc, char** argv)
     jit_timing.GetGlobals().slice_length = consumed;
     state.downcount = 0;
     jit_timing.Advance();
+
+    // ── per-round-trip probes ──
+    //
+    // performance.now() resolves to 5 us even in a cross-origin-isolated
+    // page, and a round-trip is on the order of 100 ns, so these cannot be
+    // timed one at a time. They are timed by DOING ONE TWICE: run the boot
+    // with a probe on, subtract the baseline, divide by the round-trip
+    // count. The clock is only read at the ends of the run, where 5 us
+    // against four seconds does not matter.
+    //
+    // Each probe repeats work that is already happening, so none of them
+    // changes what the guest does -- which is the one thing a dispatcher
+    // must never do by accident (see the landmine in the handoff).
+    switch (jit_probe)
+    {
+    case 1:  // the cache lookup
+      jit_probe_sink += (jit_cache.find(next_pc) != jit_cache.end()) ? 1 : 0;
+      break;
+    case 2:  // CoreTiming::Advance, with no time to advance by
+      jit_timing.GetGlobals().slice_length = 0;
+      state.downcount = 0;
+      jit_timing.Advance();
+      break;
+    case 3:  // one indirect call through the table, into a block that returns
+      if (jit_probe_fn >= 0)
+        jit_probe_sink += reinterpret_cast<u32 (*)(u32)>(jit_probe_fn)(jit_state_ptr);
+      break;
+    default:
+      break;
+    }
 
     ++jit_blocks;
     jit_insts += static_cast<u64>(consumed);
@@ -1474,6 +1544,27 @@ int main(int argc, char** argv)
                   miss_total ? 100.0 * static_cast<double>(miss_but_cached) /
                                    static_cast<double>(miss_total)
                              : 0.0);
+      std::printf("  jit       translate %.0f ms over %llu blocks (%.1f us each)\n",
+                  jit_t_translate, static_cast<unsigned long long>(jit_translates),
+                  jit_translates ? jit_t_translate * 1000.0 /
+                                       static_cast<double>(jit_translates)
+                                 : 0.0);
+      std::printf("  jit       install   %.0f ms over %llu modules (%.1f us each)\n",
+                  jit_t_install, static_cast<unsigned long long>(jit_installs),
+                  jit_installs ? jit_t_install * 1000.0 / static_cast<double>(jit_installs)
+                               : 0.0);
+      if (jit_probe)
+        std::printf("  jit       probe %d active -- subtract a baseline run\n", jit_probe);
+      // Instructions per BLOCK ENTRY, which is a different number from
+      // instructions per chain and a more important one. A chain is how far
+      // control runs before the dispatcher sees it again; a block entry is
+      // how often the fixed cost of entering compiled code -- function
+      // prologue, the MSR[DR] guard, the whole link epilogue -- is paid.
+      // Linking lengthens chains without changing this at all.
+      const u64 entries = jit_blocks + static_cast<u64>(link_stats[0]);
+      std::printf("  jit       %llu block entries, %.2f instructions per entry\n",
+                  static_cast<unsigned long long>(entries),
+                  entries ? static_cast<double>(jit_insts) / static_cast<double>(entries) : 0.0);
       std::printf("  jit       link table %llu/%u slots live, %.2f instructions per chain\n",
                   static_cast<unsigned long long>(live), kLinkEntries,
                   jit_blocks ? static_cast<double>(jit_insts) / static_cast<double>(jit_blocks)
