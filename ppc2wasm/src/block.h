@@ -84,7 +84,12 @@ struct StateLayout
   uint32_t downcount_offset = 0;  // offsetof(PowerPCState, downcount)
   uint32_t link_base = 0;         // host address of the link table
   uint32_t link_mask = 0;         // entry count - 1, entries are {pc, index}
-  uint32_t link_hits_addr = 0;    // optional counter, incremented on a hit
+  // Optional counters, as four consecutive u32: hits, link attempts,
+  // budget exits, and exits taken because the lookup missed. Counting all
+  // four is what separates "chains are short" from "the lookup never
+  // matches" from "the budget runs out" -- three different causes with three
+  // different fixes.
+  uint32_t link_stats_addr = 0;
 };
 
 namespace detail
@@ -435,6 +440,27 @@ inline void EmitSetSpr(Bytes& b, const StateLayout& l, uint32_t index, uint32_t 
   PutU32(b, l.spr_offset + index * 4);
 }
 
+// Increment one of the link counters.
+inline void EmitBumpStat(Bytes& b, const StateLayout& l, uint32_t slot)
+{
+  if (!l.link_stats_addr)
+    return;
+  const uint32_t addr = l.link_stats_addr + slot * 4;
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(addr));
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(addr));
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, 0);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32Add);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, 0);
+}
+
 // The shared block epilogue, used only when linking is enabled.
 //
 // local 4 holds the PC to continue at. The block has already applied all its
@@ -491,10 +517,13 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
   b.push_back(kI32LeS);
   b.push_back(kIf);
   b.push_back(kVoid);
+  EmitBumpStat(b, l, 2);  // budget exhausted
   b.push_back(kLocalGet);
   PutU32(b, 4);
   b.push_back(kReturn);
   b.push_back(kEnd);
+
+  EmitBumpStat(b, l, 1);  // reached the lookup
 
   // slot = link_base + ((next_pc >> 2) & mask) * 8
   b.push_back(kLocalGet);
@@ -527,24 +556,7 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
   b.push_back(kI32Eq);
   b.push_back(kIf);
   b.push_back(kVoid);
-  if (l.link_hits_addr)
-  {
-    // Count hits, so "chains are one block long" can be told apart from
-    // "the lookup never matches". Those have completely different causes.
-    b.push_back(kI32Const);
-    PutI32(b, static_cast<int32_t>(l.link_hits_addr));
-    b.push_back(kI32Const);
-    PutI32(b, static_cast<int32_t>(l.link_hits_addr));
-    b.push_back(kI32Load);
-    PutU32(b, 2);
-    PutU32(b, 0);
-    b.push_back(kI32Const);
-    PutI32(b, 1);
-    b.push_back(kI32Add);
-    b.push_back(kI32Store);
-    PutU32(b, 2);
-    PutU32(b, 0);
-  }
+  EmitBumpStat(b, l, 0);  // hit
   b.push_back(kLocalGet);
   PutU32(b, 0);  // the next block takes the same state pointer
   b.push_back(kLocalGet);
@@ -561,6 +573,7 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
   b.push_back(kEnd);
 
   // Lookup missed: the dispatcher will compile or find it.
+  EmitBumpStat(b, l, 3);
   b.push_back(kLocalGet);
   PutU32(b, 4);
 }
