@@ -1317,7 +1317,11 @@ int main(int argc, char** argv)
       u32 code[kMaxBlock];
       for (u32 k = 0; k < kMaxBlock; ++k)
         code[k] = system.GetMemory().Read_U32(bpc + k * 4);
-      auto r = ppc2wasm::CompileBlock(code, bpc, kMaxBlock, jit_layout);
+      // Bodies only: this packs them into a shared module itself, so the
+      // single-function module CompileBlock would otherwise build is
+      // scaffolding around a copy of code that is about to be copied
+      // again.
+      auto r = ppc2wasm::CompileBlock(code, bpc, kMaxBlock, jit_layout, false);
       ++jit_translates;
       const u8 stop = (std::strcmp(r.stopped_on, "branch") == 0) ? 0
                       : (std::strcmp(r.stopped_on, "unsupported instruction") == 0)

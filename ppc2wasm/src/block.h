@@ -923,8 +923,12 @@ inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
 // until one is not understood or `max_insts` is reached.
+// emit_module builds the single-function module in BlockResult::module.
+// A caller that is packing bodies into a shared module does not need it,
+// and building one is a second pass over the code plus the section
+// scaffolding around it.
 inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_t max_insts,
-                                const StateLayout& layout)
+                                const StateLayout& layout, bool emit_module = true)
 {
   using namespace detail;
   Bytes body;
@@ -1727,9 +1731,14 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     PutI32(body, static_cast<int32_t>(r.end_pc));
   }
 
-  r.body = body;
   r.locals = used_locals;
+  if (!emit_module)
+  {
+    r.body = std::move(body);
+    return r;
+  }
 
+  r.body = body;
   ModuleBuilder mb;
   mb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
   if (layout.enable_linking)
