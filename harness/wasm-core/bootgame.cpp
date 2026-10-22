@@ -1050,6 +1050,7 @@ int main(int argc, char** argv)
   jit_layout.ram_base =
       static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetRAM()));
   jit_layout.memory_pages = static_cast<u32>(JitMemoryPages());
+  jit_layout.msr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, msr));
   jit_layout.downcount_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount));
 
   // ── the link table ──
@@ -1058,10 +1059,16 @@ int main(int argc, char** argv)
   // so a block can jump to its successor without returning here. Entries are
   // {pc, index}; a slot collision is a miss, which is correct and cheap,
   // because the emitted code compares the stored PC before jumping.
-  constexpr u32 kLinkEntries = 1u << 16;
+  // Sized well above the number of blocks a boot produces (about 84,000).
+  // At 1<<16 the table held only 20,016 live entries against that many
+  // blocks: a direct-mapped cache that small spends its time evicting the
+  // very blocks a chain is trying to reach.
+  constexpr u32 kLinkEntries = 1u << 19;
   std::vector<u32> link_table(kLinkEntries * 2, 0);
   jit_layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
   jit_layout.link_mask = kLinkEntries - 1;
+  u32 link_hits = 0;
+  jit_layout.link_hits_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&link_hits));
   jit_layout.enable_linking = want_link;
 
   // How many guest instructions a chain may run before handing control back
@@ -1137,7 +1144,8 @@ int main(int argc, char** argv)
     const u32 ret = f(jit_state_ptr);
 
     const bool bailed = (ret & 1u) != 0;
-    const u32 next_pc = ret & ~1u;
+    const bool msr_changed = (ret & 2u) != 0;
+    const u32 next_pc = ret & ~3u;
     state.pc = state.npc = next_pc;
     if (bailed)
       ++jit_bails;
@@ -1152,7 +1160,8 @@ int main(int argc, char** argv)
       // One block, so the PC says how much of it ran: a bail lands inside the
       // block, anything else is the whole of it.
       consumed = bailed ? static_cast<int>((next_pc - pc) / 4)
-                        : static_cast<int>(it->second.instructions);
+                        : (msr_changed ? static_cast<int>((next_pc - pc) / 4)
+                                       : static_cast<int>(it->second.instructions));
     }
     if (consumed < 0)
       consumed = 0;
@@ -1173,6 +1182,17 @@ int main(int argc, char** argv)
     // Events that would have fired mid-chain fire at its end, so the slice
     // size sets timing granularity. That is a real behavioural difference
     // from the interpreter, not an implementation detail.
+    if (msr_changed)
+    {
+      // The block wrote MSR and stopped. Everything the interpreter does
+      // after that write happens here: translation state is recomputed, and
+      // any interrupt that was already pending is taken -- which is the
+      // whole reason enabling MSR[EE] cannot be a plain store.
+      ppc.MSRUpdated();
+      ppc.CheckExceptions();
+      state.pc = state.npc;
+    }
+
     jit_timing.GetGlobals().slice_length = consumed;
     state.downcount = 0;
     jit_timing.Advance();
@@ -1406,6 +1426,7 @@ int main(int argc, char** argv)
       for (u32 i = 0; i < kLinkEntries; ++i)
         if (link_table[i * 2 + 1] != 0)
           ++live;
+      std::printf("  jit       link hits %u\n", link_hits);
       std::printf("  jit       link table %llu/%u slots live, %.2f instructions per chain\n",
                   static_cast<unsigned long long>(live), kLinkEntries,
                   jit_blocks ? static_cast<double>(jit_insts) / static_cast<double>(jit_blocks)
