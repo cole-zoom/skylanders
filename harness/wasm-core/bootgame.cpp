@@ -1184,7 +1184,10 @@ int main(int argc, char** argv)
   // The numbers are worth having and they are not worth having by
   // default, which is the same conclusion the per-dispatch counters
   // reached. --jit-stats turns both on together.
-  u32 link_stats[4] = {0, 0, 0, 0};
+  // 0..3 hits/attempts/budget/misses; 4..7 which kind of exit a block
+  // entry left by: unconditional b, bl, a taken conditional branch, and
+  // the fall-through off the end of a block.
+  u32 link_stats[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   if (want_jit_stats)
     jit_layout.link_stats_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(link_stats));
   // Of the exits that missed, how many had a compiled successor anyway? That
@@ -1195,6 +1198,22 @@ int main(int argc, char** argv)
   // A hole is only worth reserving because compile_region fills it. Tied
   // to linking because a direct tail call IS the link.
   jit_layout.allow_direct = want_link;
+  // Both OFF. Each was implemented, measured, and left off:
+  //
+  //   trace_uncond    follows b and bl. Removed 65.6M exits and created
+  //                   52.7M new ones in their place -- the block simply
+  //                   ends further along -- for 13M fewer entries and no
+  //                   measurable speed change.
+  //   trace_backward  follows the taken edge of a backward conditional
+  //                   branch, unrolling loops into the block. Removed
+  //                   94.2M block entries, 36% of them, and the run got
+  //                   very slightly SLOWER.
+  //
+  // The second is the useful one. Removing a third of all block entries
+  // for no gain says the cost does not scale with entries; it scales with
+  // instructions. See docs/PHASE2-PROFILE.md.
+  jit_layout.trace_uncond = false;
+  jit_layout.trace_backward = false;
 
   // A block that does nothing but return its argument, for probe 3. It
   // isolates the indirect call itself from anything the call does.
@@ -1936,6 +1955,8 @@ int main(int argc, char** argv)
       }
       if (want_jit_stats)
       {
+        std::printf("  jit       exits: uncond-b %u  bl %u  cond-taken %u  fallthrough %u\n",
+                    link_stats[4], link_stats[5], link_stats[6], link_stats[7]);
         std::printf("  jit       %llu direct-call holes, %llu filled with a sibling (%.1f%%)\n",
                     static_cast<unsigned long long>(jit_direct_holes),
                     static_cast<unsigned long long>(jit_direct_patched),
