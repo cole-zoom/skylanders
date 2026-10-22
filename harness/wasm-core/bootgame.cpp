@@ -1281,8 +1281,24 @@ int main(int argc, char** argv)
       // tally that lumps them together says nothing useful.
       const u32 ins = mem_for_cov->Read_U32(state.pc);
       const u32 primary = ins >> 26;
+      // The Rc bit is part of the key. Without it `add` and `add.` share a
+      // bucket, one example encoding stands for both, and an opcode whose
+      // dot form is refused is reported as translated.
+      // mfspr and mtspr are keyed by WHICH register, because whether they
+      // can be translated depends entirely on that and not on the opcode.
+      const u32 xo_now = (ins >> 1) & 0x3FF;
+      if (primary == 31 && (xo_now == 339 || xo_now == 467))
+      {
+        const u32 sprn = ((ins >> 16) & 0x1F) | (((ins >> 11) & 0x1F) << 5);
+        auto& sl = cov_counts[(31u << 16) | (0xF000u) | (xo_now == 339 ? 0u : 0x800u) | sprn];
+        ++sl.first;
+        sl.second = ins;
+        ++cov_total;
+        goto cov_done;
+      }
+      {
       const u32 key = (primary == 31 || primary == 19 || primary == 63)
-                          ? (primary << 16) | ((ins >> 1) & 0x3FF)
+                          ? (primary << 16) | (((ins >> 1) & 0x3FF) << 1) | (ins & 1)
                           : (primary << 16);
       auto& slot = cov_counts[key];
       ++slot.first;
@@ -1292,6 +1308,8 @@ int main(int argc, char** argv)
       // reports every conditional branch as unsupported.
       slot.second = ins;
       ++cov_total;
+      }
+    cov_done:;
     }
 
     if (watch_addr)
@@ -1423,9 +1441,13 @@ int main(int argc, char** argv)
   // Both --until-fifo and --capture-fifo stop early ON PURPOSE, so the step
   // count is not the success condition for them -- staying on valid code is.
   const bool early_stop_ok = stop_at_fifo || g_fifo_limit || g_gx_limit;
-  check(early_stop_ok ? state.pc != 0 : executed == steps,
+  // A compiled block runs to its own end, so the step limit is a floor
+  // rather than an exact count -- the last block can carry execution a few
+  // instructions past it. Requiring equality was right for an interpreter
+  // stepping one at a time and is simply wrong now.
+  check(early_stop_ok ? state.pc != 0 : executed >= steps,
         early_stop_ok ? "ran until the stop condition without falling off"
-                      : "ran the full step count without falling off");
+                      : "ran at least the full step count without falling off");
   check(state.pc != 0, "pc is still valid");
 
   // Is anything draining the FIFO? If CPReadWriteDistance only grows, the GPU
@@ -1568,7 +1590,7 @@ int main(int argc, char** argv)
       if (shown++ >= 24)
         break;
       const bool ok = ppc2wasm::CompileBlock(&r.example, 0x8000'0000, 1, probe).instructions == 1;
-      std::printf("  %-10u %-8u %12llu  %5.2f%%  %s\n", r.key >> 16, r.key & 0xFFFF,
+      std::printf("  %-10u %-8u %12llu  %5.2f%%  %s\n", r.key >> 16, (r.key & 0xFFFF) >> 1,
                   static_cast<unsigned long long>(r.count),
                   100.0 * static_cast<double>(r.count) / static_cast<double>(cov_total),
                   ok ? "translated" : "NOT translated");

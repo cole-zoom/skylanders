@@ -116,6 +116,8 @@ enum : uint8_t
   kI32GtS = 0x4A,
   kI32GtU = 0x4B,
   kI32LeS = 0x4C,
+  kI32Eqz = 0x45,
+  kI32Clz = 0x67,
 
   kI64Load = 0x29,
   kI64Store = 0x37,
