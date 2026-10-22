@@ -492,6 +492,16 @@ contended** — that is the generalisable part, and it applies to every later br
 
 ### Phase 2 — `ppc2wasm`, the recompiler · ~4–6 months
 
+> **Status: the recompiler runs the game.** 98.7% of executed instructions translate, blocks
+> tail-call their successors, and the boot completes at **54.0 MIPS against 18.0 interpreted** —
+> a 3× win, with 94.9% of instructions executing as compiled WebAssembly. Full speed is ~600 MIPS,
+> so roughly 11× remains.
+>
+> **The constraint is no longer code generation.** Emitted code measured 1538–2811 MIPS in a
+> microbenchmark; the cost is the ~17.7 million dispatcher round-trips a 200M-instruction boot
+> makes. See **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** for the ranked next steps, the
+> methodology that produced the measurable progress, and the landmines.
+
 The longest and least certain phase. A full Broadway decoder including paired singles, lazy
 condition-register evaluation to avoid emulating flags on every operation, static discovery of
 function boundaries and indirect branch targets across the `DOL` and `REL`s, then WebAssembly
