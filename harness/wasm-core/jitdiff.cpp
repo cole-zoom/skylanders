@@ -61,6 +61,25 @@ EM_JS(int, MemoryPages, (), { return wasmMemory.buffer.byteLength >>> 16; });
 
 using BlockFn = u32 (*)(u32);
 
+// Run a compiled block and apply the same fix-up the dispatcher would.
+//
+// A block that writes MSR stops and marks its return with bit 1. Everything
+// the interpreter does after that write -- recomputing translation state and
+// taking any interrupt that became deliverable -- happens outside the block,
+// so a differential that skips it is comparing against a different machine.
+static u32 RunBlock(int index, PowerPC::PowerPCState& state, PowerPC::PowerPCManager& ppc)
+{
+  const u32 ret = reinterpret_cast<BlockFn>(index)(
+      static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+  if (ret & 2u)
+  {
+    ppc.MSRUpdated();
+    ppc.CheckExceptions();
+    state.pc = state.npc;
+  }
+  return ret;
+}
+
 static constexpr u32 BASE = 0x8000'1000;
 
 // One case: a program, how many instructions it should translate, and a name.
@@ -134,6 +153,7 @@ int main()
   // The interpreter's own table, by address. Recomputing the encoding here
   // would be a second source of truth for something that must match exactly.
   layout.spr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, spr));
+  layout.msr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, msr));
   layout.downcount_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount));
   layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
   layout.link_mask = 4095;
@@ -322,7 +342,7 @@ int main()
     state.pc = state.npc = BASE;
 
     BlockFn f = reinterpret_cast<BlockFn>(idx);
-    const u32 got_pc = f(static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+    const u32 got_pc = RunBlock(idx, state, ppc);
 
     if (c.expect_bail_at >= 0)
     {
@@ -407,6 +427,7 @@ int main()
         {31, 32, "cmpl"},   {31, 954, "extsb"},{31, 922, "extsh"},{31, 104, "neg"},
         {31, 26, "cntlzw"}, {31, 60, "andc"},  {31, 412, "orc"},  {31, 124, "nor"},
         {31, 476, "nand"},  {31, 284, "eqv"},  {31, 235, "mullw"},
+        {31, 83, "mfmsr"}, {31, 146, "mtmsr"},
         {31, 23, "lwzx"},   {31, 151, "stwx"}, {31, 87, "lbzx"},  {31, 215, "stbx"},
         {31, 279, "lhzx"},  {31, 407, "sthx"},
     };
@@ -480,7 +501,7 @@ int main()
         state.spr[SPR_LR] = 0;
         state.downcount = 1000;
         state.pc = state.npc = BASE;
-        reinterpret_cast<BlockFn>(ix)(static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+        RunBlock(ix, state, ppc);
 
         for (int i = 0; i < 32; ++i)
         {
@@ -528,7 +549,7 @@ int main()
         {31, 266}, {31, 40}, {31, 444}, {31, 28}, {31, 316},
         {31, 24}, {31, 536}, {31, 954}, {31, 922}, {31, 104},
         {31, 26}, {31, 60}, {31, 124}, {31, 235},
-        {31, 23}, {31, 151}, {31, 87}, {31, 215},
+        {31, 23}, {31, 151}, {31, 87}, {31, 215}, {31, 83}, {31, 146},
         {16, 0},  // a conditional branch, to exercise an early exit
     };
 
@@ -568,7 +589,15 @@ int main()
           b = (a % 31) + 1;
         const u32 d = rnd() % 31 + 1;
         u32 ins;
-        if (g.primary == 31)
+        if (g.primary == 31 && g.xo == 146)
+          // mtmsr always takes r1, which is seeded with a REALISTIC machine
+          // state value. A random 32-bit word in MSR turns address
+          // translation off and arms exceptions the guest never asked for;
+          // what follows is a divergence between two engines that are both
+          // behaving correctly for the state they were given, and it says
+          // nothing about the compiler.
+          ins = (31u << 26) | (1u << 21) | (146u << 1);
+        else if (g.primary == 31)
           ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
         else if (g.primary == 16)
           // A forward conditional branch with BO bit 2 set, so it is a plain
@@ -589,13 +618,25 @@ int main()
       for (int i = 1; i < 32; ++i)
         if (rnd() & 1)
           init_gpr[i] = kScratch + (rnd() % 64) * 4;
+      // r1 carries a machine state value an mtmsr can safely write: the one
+      // the harness is already running under, with the interrupt-enable bit
+      // varied so the path that takes a pending interrupt is exercised.
+      init_gpr[1] = (state.msr.Hex & ~0x8000u) | ((rnd() & 1) ? 0x8000u : 0u);
       for (u32 w = 0; w < kScratchWords; ++w)
         memory.Write_U32(rnd(), kScratch + w * 4);
       std::vector<u32> init_mem(kScratchWords);
       for (u32 w = 0; w < kScratchWords; ++w)
         init_mem[w] = memory.Read_U32(kScratch + w * 4);
 
+      // MSR is part of the starting state, and a block containing mtmsr
+      // changes it. Restoring only registers and memory leaves the second
+      // engine running under the machine state the first one left behind --
+      // which showed up as the two disagreeing about a bit that neither
+      // program had computed.
+      const u32 init_msr = state.msr.Hex;
       auto reset = [&]() {
+        state.msr.Hex = init_msr;
+        ppc.MSRUpdated();
         for (int i = 0; i < 32; ++i)
           state.gpr[i] = init_gpr[i];
         for (int i = 0; i < 8; ++i)
@@ -623,10 +664,10 @@ int main()
       // against an interpreter that ran the whole block would report a
       // difference that is the harness's fault.
       reset();
-      const u32 ret = reinterpret_cast<BlockFn>(ix)(
-          static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+      const u32 ret = RunBlock(ix, state, ppc);
       const bool bailed = (ret & 1u) != 0;
-      const u32 end_pc = ret & ~1u;
+      const bool msr_changed = (ret & 2u) != 0;
+      const u32 end_pc = ret & ~3u;
       u32 jit_gpr[32];
       std::memcpy(jit_gpr, state.gpr, sizeof(jit_gpr));
       u64 jit_cr[8];
@@ -634,9 +675,10 @@ int main()
       const u32 jit_lr = state.spr[SPR_LR];
       const u64 jit_mem = digest();
 
-      u32 ran = bailed ? (end_pc - BASE) / 4 : rr.instructions;
+      u32 ran = (bailed || msr_changed) ? (end_pc - BASE) / 4 : rr.instructions;
       // A taken branch leaves the block, and the whole block ran.
-      if (!bailed && (end_pc < BASE || end_pc > BASE + rr.instructions * 4))
+      if (!bailed && !msr_changed &&
+          (end_pc < BASE || end_pc > BASE + rr.instructions * 4))
         ran = rr.instructions;
 
       reset();

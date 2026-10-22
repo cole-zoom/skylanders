@@ -80,9 +80,11 @@ struct StateLayout
   // compiling blocks that simply return -- the thing it checks is the guest
   // state a block produces, not how control leaves it.
   bool enable_linking = false;
+  uint32_t msr_offset = 0;        // offsetof(PowerPCState, msr)
   uint32_t downcount_offset = 0;  // offsetof(PowerPCState, downcount)
   uint32_t link_base = 0;         // host address of the link table
   uint32_t link_mask = 0;         // entry count - 1, entries are {pc, index}
+  uint32_t link_hits_addr = 0;    // optional counter, incremented on a hit
 };
 
 namespace detail
@@ -153,6 +155,34 @@ inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
   PutU32(b, l.gpr_offset + n * 4);
 }
 
+// The body of a refusal, assuming an `if` is already open.
+inline void EmitBailBody(Bytes& b, const StateLayout& l, uint32_t bail_pc, uint32_t insts_before)
+{
+  // A bail skips the shared epilogue, so it has to account for its own
+  // partial execution. Without this the dispatcher cannot tell how far a
+  // CHAIN got: it sees only the final PC, and the blocks that ran before the
+  // refusal are invisible.
+  if (l.enable_linking && insts_before)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.downcount_offset);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(insts_before));
+    b.push_back(kI32Sub);
+    b.push_back(kI32Store);
+    PutU32(b, 2);
+    PutU32(b, l.downcount_offset);
+  }
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(bail_pc | 1u));
+  b.push_back(kReturn);
+}
+
 // Emit: if ((ea & guard_mask) != guard_value) return bail_pc | 1;
 //
 // A compiled block may only touch MEM1. Anything else -- MEM2, MMIO, an
@@ -183,29 +213,7 @@ inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_
   b.push_back(kI32Ne);
   b.push_back(kIf);
   b.push_back(kVoid);
-  // A bail skips the shared epilogue, so it has to account for its own
-  // partial execution. Without this the dispatcher cannot tell how far a
-  // CHAIN got: it sees only the final PC, and the blocks that ran before the
-  // refusal are invisible.
-  if (l.enable_linking && insts_before)
-  {
-    b.push_back(kLocalGet);
-    PutU32(b, 0);
-    b.push_back(kLocalGet);
-    PutU32(b, 0);
-    b.push_back(kI32Load);
-    PutU32(b, 2);
-    PutU32(b, l.downcount_offset);
-    b.push_back(kI32Const);
-    PutI32(b, static_cast<int32_t>(insts_before));
-    b.push_back(kI32Sub);
-    b.push_back(kI32Store);
-    PutU32(b, 2);
-    PutU32(b, l.downcount_offset);
-  }
-  b.push_back(kI32Const);
-  PutI32(b, static_cast<int32_t>(bail_pc | 1u));
-  b.push_back(kReturn);
+  EmitBailBody(b, l, bail_pc, insts_before);
   b.push_back(kEnd);
 }
 
@@ -519,6 +527,24 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
   b.push_back(kI32Eq);
   b.push_back(kIf);
   b.push_back(kVoid);
+  if (l.link_hits_addr)
+  {
+    // Count hits, so "chains are one block long" can be told apart from
+    // "the lookup never matches". Those have completely different causes.
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.link_hits_addr));
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.link_hits_addr));
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, 0);
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32Add);
+    b.push_back(kI32Store);
+    PutU32(b, 2);
+    PutU32(b, 0);
+  }
   b.push_back(kLocalGet);
   PutU32(b, 0);  // the next block takes the same state pointer
   b.push_back(kLocalGet);
@@ -660,6 +686,10 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   // 2 = the value being stored. Declared only if used, so a block of pure
   // register arithmetic still emits none.
   uint32_t used_locals = 0;
+  // Whether the block performs any guest memory access. Such a block is only
+  // valid while data address translation is on, and that is checked once at
+  // entry rather than at every access.
+  bool touches_memory = false;
   const char* stopped = "instruction limit";
 
   for (; n < max_insts; ++n)
@@ -830,6 +860,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
             break;
           EmitMemOp(body, layout, start_pc + n * 4, n, RA(ins), RB(ins), 0, true, RS(ins),
                     xf.size, xf.store, xf.sign, xf.update);
+      touches_memory = true;
           used_locals = used_locals < 4 ? 4 : used_locals;
           handled = true;
           break;
@@ -919,6 +950,111 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32Mul);
         EndStoreGpr(body, layout, RS(ins));
         handled = true;
+        break;
+      }
+
+      if (xo == 83)  // mfmsr rD
+      {
+        // A pure read of the machine state register -- except that it is
+        // PRIVILEGED. In user mode it raises a program exception instead,
+        // which this cannot do, so the block refuses in that case and the
+        // interpreter takes the exception properly.
+        //
+        // Game code runs supervisor-side, so the guard is expected never to
+        // fire. It is emitted anyway: "this bit is never set in practice" is
+        // how a recompiler acquires a bug that only appears in the one place
+        // it matters.
+        //
+        // mtmsr is NOT translated. Writing the register requires
+        // PowerPC::MSRUpdated() -- address translation and the exception
+        // check are recomputed from it -- and that is host code a compiled
+        // block cannot call.
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.msr_offset);
+        body.push_back(kI32Const);
+        PutI32(body, 1 << 14);  // MSR[PR]
+        body.push_back(kI32And);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        EmitBailBody(body, layout, start_pc + n * 4, n);
+        body.push_back(kEnd);
+
+        BeginStoreGpr(body);
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.msr_offset);
+        EndStoreGpr(body, layout, RS(ins));
+        handled = true;
+        break;
+      }
+
+      if (xo == 146)  // mtmsr rS
+      {
+        // The write itself is compiled; everything that must happen AFTER it
+        // is handed back to the dispatcher.
+        //
+        // The interpreter does four things here: write the register, call
+        // PowerPC::MSRUpdated(), check floating-point exceptions, and call
+        // CheckExceptions() -- which matters because setting MSR[EE] has to
+        // take any interrupt that was already pending. None of that is
+        // reachable from inside a wasm module.
+        //
+        // So the block exits with bit 1 of the returned PC set, meaning "the
+        // machine state register changed". PowerPC instructions are
+        // four-byte aligned, so bits 0 and 1 are both free: bit 0 already
+        // means a bail, and this is the second marker. The dispatcher does
+        // the rest, and the interpreter ends its own block here too
+        // (Interpreter_SystemRegisters.cpp sets m_end_block), so this is not
+        // a shorter block than the interpreter would have run.
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.msr_offset);
+        body.push_back(kI32Const);
+        PutI32(body, 1 << 14);  // MSR[PR] -- privileged, as mfmsr
+        body.push_back(kI32And);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        EmitBailBody(body, layout, start_pc + n * 4, n);
+        body.push_back(kEnd);
+
+        // msr = gpr[rS]
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        LoadGpr(body, layout, RS(ins));
+        body.push_back(kI32Store);
+        PutU32(body, 2);
+        PutU32(body, layout.msr_offset);
+
+        // Leave immediately, marked. This instruction DID run, so with
+        // linking the budget must account for it.
+        if (layout.enable_linking)
+        {
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(n + 1));
+          body.push_back(kI32Sub);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+        }
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>((start_pc + (n + 1) * 4) | 2u));
+        body.push_back(kReturn);
+        handled = true;
+        ends_block = true;
         break;
       }
 
@@ -1181,6 +1317,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         break;
       EmitMemOp(body, layout, start_pc + n * 4, n, RA(ins), 0, SIMM(ins), false, RS(ins),
                 form.size, form.store, form.sign, form.update);
+      touches_memory = true;
       used_locals = used_locals < 4 ? 4 : used_locals;
       handled = true;
       break;
@@ -1209,6 +1346,40 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   r.stopped_on = stopped;
   if (n == 0)
     return r;  // nothing compiled; module stays empty
+
+  if (touches_memory)
+  {
+    // ── translation guard, once per block ──
+    //
+    // Every memory access this block emits maps a guest address with
+    // ram_base + (ea & mask), which is only the right translation while
+    // MSR[DR] is set and the BATs are the ones the boot installed. A block
+    // compiled under those conditions can be reached later under different
+    // ones -- the cache is keyed by PC, not by machine state.
+    //
+    // Checking once at entry rather than at every access costs one test per
+    // block instead of one per load. The cost of NOT checking is a block
+    // that reads host memory through a translation the guest has turned off,
+    // which is silent and unbounded.
+    Bytes prologue;
+    prologue.push_back(kLocalGet);
+    PutU32(prologue, 0);
+    prologue.push_back(kI32Load);
+    PutU32(prologue, 2);
+    PutU32(prologue, layout.msr_offset);
+    prologue.push_back(kI32Const);
+    PutI32(prologue, 1 << 4);  // MSR[DR]
+    prologue.push_back(kI32And);
+    prologue.push_back(kI32Eqz);
+    prologue.push_back(kIf);
+    prologue.push_back(kVoid);
+    prologue.push_back(kI32Const);
+    PutI32(prologue, static_cast<int32_t>(start_pc | 1u));
+    prologue.push_back(kReturn);
+    prologue.push_back(kEnd);
+    prologue.insert(prologue.end(), body.begin(), body.end());
+    body = std::move(prologue);
+  }
 
   if (layout.enable_linking)
   {
