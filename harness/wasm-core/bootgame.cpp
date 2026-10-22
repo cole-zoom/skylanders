@@ -1113,11 +1113,28 @@ int main(int argc, char** argv)
   // so a block can jump to its successor without returning here. Entries are
   // {pc, index}; a slot collision is a miss, which is correct and cheap,
   // because the emitted code compares the stored PC before jumping.
-  // Sized well above the number of blocks a boot produces (about 84,000).
-  // At 1<<16 the table held only 20,016 live entries against that many
-  // blocks: a direct-mapped cache that small spends its time evicting the
-  // very blocks a chain is trying to reach.
-  constexpr u32 kLinkEntries = 1u << 19;
+  // Sized by the ADDRESS SPAN of guest code, not by the number of blocks.
+  //
+  // That distinction is the whole of this constant. The slot is
+  // (pc >> 2) & mask, so a table of N entries separates N*4 bytes of code
+  // and everything further apart than that aliases onto it. This game's
+  // code spans 5.80 MB, which is 1,450,029 distinct (pc >> 2) values; at
+  // 1<<19 the table covered 2.1 MB, so up to three hot PCs shared every
+  // slot and evicted each other forever. 1<<21 covers 8.4 MB, and the
+  // aliasing disappears rather than being reduced.
+  //
+  // Measured over 800M instructions, of 9,580,876 missed exits only 3.1%
+  // now have a successor that was compiled -- down from 58.1%.
+  //
+  // The cost is 16 MB of the host heap, up from 4 MB. The alternative --
+  // keeping the table small and mixing high bits into the hash -- costs two
+  // wasm instructions in an epilogue executed 277 million times, which is
+  // the more expensive side of the trade by a wide margin.
+  //
+  // A game with more than 8.4 MB of hot code would alias again. The counter
+  // that detects it is miss_but_cached, below: if that climbs back toward
+  // half, this number is why.
+  constexpr u32 kLinkEntries = 1u << 21;
   std::vector<u32> link_table(kLinkEntries * 2, 0);
   jit_layout.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table.data()));
   jit_layout.link_mask = kLinkEntries - 1;
