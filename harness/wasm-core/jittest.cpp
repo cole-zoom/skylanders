@@ -177,11 +177,18 @@ int main()
     check(br.instructions == 2, "a branch is translated and ends the block");
     check(br.end_pc == 0x80001008, "end pc is past the branch, not at it");
 
-    // A conditional branch that also decrements CTR is not modelled.
-    // Treating it as a plain conditional would skip the decrement and spin.
-    const uint32_t ctr_branch[] = {0x4200FFFC};  // bdnz
+    // A conditional branch that also decrements CTR IS translated now, and
+    // like every branch it ends the block.
+    const uint32_t ctr_branch[] = {0x4200FFFC};  // bdnz -4
     auto cb = ppc2wasm::CompileBlock(ctr_branch, 0x80001000, 1, L);
-    check(cb.instructions == 0, "a CTR-decrementing branch stops the block");
+    check(cb.instructions == 1, "a CTR-decrementing branch is translated");
+    check(cb.end_pc == 0x80001004, "end pc is past the bdnz");
+
+    // bcctr with BO2 clear remains refused: CTR cannot be both the counter
+    // and the branch target, and the architecture calls it invalid.
+    const uint32_t ctr_indirect[] = {0x4C000420};  // bcctr, BO2 clear
+    auto ci = ppc2wasm::CompileBlock(ctr_indirect, 0x80001000, 1, L);
+    check(ci.instructions == 0, "bcctr that decrements CTR is still refused");
 
     // The dot forms set the condition register, which is not modelled. They
     // must stop the block, not be treated as their non-dot twins.
