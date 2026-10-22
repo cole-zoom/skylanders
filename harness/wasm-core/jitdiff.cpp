@@ -529,13 +529,41 @@ int main()
         const u32 d = rnd() % 31 + 1;
         u32 ins;
         if (t.primary == 31)
+        {
           ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (t.xo << 1);
+          // Set Rc half the time wherever the form has one. CR0 after a
+          // dot form uses an encoding the interpreter builds by hand
+          // rather than from s_crTable, so it is a second thing that can
+          // be wrong and the only check on it is this comparison.
+          if ((rnd() & 1) && ppc2wasm::detail::RcDestination(ins | 1u) >= 0)
+            ins |= 1u;
+        }
         else
+        {
           // A SMALL non-negative displacement, so the address stays inside
           // MEM1. A random 16-bit field is signed and routinely lands outside
           // it, where the interpreter faults and a compiled block bails --
           // both correct, and not comparable.
           ins = (t.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x0FF0);
+          if (t.primary == 21 && (rnd() & 1))
+            ins |= 1u;  // rlwinm.
+        }
+
+        // Restore the machine state before every trial.
+        //
+        // One of the templates is mtmsr, and it writes a register seeded
+        // with a random 32-bit value -- which clears MSR[DR]. From that
+        // trial onward the INTERPRETER cannot translate a data address,
+        // so it reads zero while compiled code reads real memory, and the
+        // oracle is the side that is wrong. It presents as a load
+        // mismatch, with "Unable to resolve read address" in the log for
+        // anyone who thinks to look.
+        //
+        // The same bug was found by review in the block and chain
+        // differentials. It was latent here for exactly as long, and only
+        // surfaced when an unrelated change reshuffled the random stream.
+        state.msr.Hex = kPristineMsr;
+        ppc.MSRUpdated();
 
         // Seed registers with a mix of small, negative and large values, and
         // point the ones used as addresses somewhere inside MEM1.
@@ -578,16 +606,33 @@ int main()
         state.pc = state.npc = BASE;
         RunBlock(ix, state, ppc);
 
-        for (int i = 0; i < 32; ++i)
+        bool bad = false;
+        for (int i = 0; i < 32 && !bad; ++i)
         {
           if (state.gpr[i] != want[i])
           {
             std::printf("  %-8s ins=%08x r%-2d interpreter=%08x recompiled=%08x\n", t.name, ins,
                         i, want[i], state.gpr[i]);
-            ++fails_here;
-            ++rand_fail;
-            break;
+            bad = true;
           }
+        }
+        // The condition register, which an Rc form writes and nothing here
+        // used to look at. A dot form that computed the right value and
+        // the wrong CR0 would have passed.
+        for (int i = 0; i < 8 && !bad; ++i)
+        {
+          if (state.cr.fields[i] != want_cr[i])
+          {
+            std::printf("  %-8s ins=%08x cr%d interpreter=%016llx recompiled=%016llx\n", t.name,
+                        ins, i, static_cast<unsigned long long>(want_cr[i]),
+                        static_cast<unsigned long long>(state.cr.fields[i]));
+            bad = true;
+          }
+        }
+        if (bad)
+        {
+          ++fails_here;
+          ++rand_fail;
         }
       }
     }
@@ -626,6 +671,12 @@ int main()
         {31, 26}, {31, 60}, {31, 124}, {31, 235},
         {31, 23}, {31, 151}, {31, 87}, {31, 215}, {31, 83}, {31, 146},
         {16, 0},  // a conditional branch, to exercise an early exit
+    };
+    // Forms that carry an Rc bit, drawn with it set so CR0 is exercised
+    // inside a block and not only in isolation -- a dot form mid-block
+    // writes CR0 that a later conditional branch then reads.
+    auto maybe_rc = [](u32 ins, bool want) {
+      return (want && ppc2wasm::detail::RcDestination(ins | 1u) >= 0) ? (ins | 1u) : ins;
     };
 
     u32 seed = 0xC0FFEE11;
@@ -677,7 +728,8 @@ int main()
           // nothing about the compiler.
           ins = (31u << 26) | (1u << 21) | (146u << 1);
         else if (g.primary == 31)
-          ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
+          ins = maybe_rc((31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1),
+                         (rnd() & 1) != 0);
         else if (g.primary == 16)
         {
           // A forward conditional branch, drawn across all six shapes of
@@ -695,7 +747,8 @@ int main()
           ins = (16u << 26) | (bo << 21) | ((rnd() % 4) << 16) | 0x0008 | (rnd() & 1);
         }
         else
-          ins = (g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0);
+          ins = maybe_rc((g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0),
+                         g.primary == 21 && (rnd() & 1) != 0);
         prog.push_back(ins);
       }
 
@@ -976,9 +1029,13 @@ int main()
       const u32 a = mem ? (24 + rnd() % 8) : (2 + rnd() % 14);
       const u32 b = mem ? (16 + rnd() % 7) : (rnd() % 31 + 1);
       const u32 d = 2 + rnd() % 14;
+      const bool want_rc = (rnd() & 1) != 0;
+      auto rc = [&](u32 i) {
+        return (want_rc && ppc2wasm::detail::RcDestination(i | 1u) >= 0) ? (i | 1u) : i;
+      };
       if (g.primary == 31)
-        return (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
-      return (g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0);
+        return rc((31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1));
+      return rc((g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0));
     };
 
     int fails = 0, chains_run = 0, chains_linked = 0, longest = 0;
