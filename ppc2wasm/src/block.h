@@ -153,6 +153,19 @@ struct StateLayout
   uint32_t lr_index = 8;         // SPR_LR
   uint32_t ctr_index = 9;        // SPR_CTR
 
+  // When set, a block FOLLOWS a branch whose target is known at compile
+  // time instead of ending at it. One entry then covers what used to be
+  // two or more.
+  //
+  // Measured over an 800M-instruction boot, of 261.5 million block
+  // entries: 126.8M left by a taken conditional branch, 40.2M by a call,
+  // 25.4M by an unconditional branch, 2.2M by running off the end. Those
+  // are not blocks that ran out of things to do -- they are blocks that
+  // stopped at a transfer whose destination was sitting in the
+  // instruction.
+  bool trace_uncond = false;    // follow b and bl
+  bool trace_backward = false;  // follow the taken edge of a backward branch
+
   // When set, an exit whose target is known at compile time reserves a
   // hole for a direct tail call to it. The caller fills the hole for
   // targets that ended up in the same module and leaves the rest as nops.
@@ -831,8 +844,12 @@ inline void EmitBumpStatBy(Bytes& b, const StateLayout& l, uint32_t slot, int32_
 // property that makes patching rather than recompiling possible.
 inline void EmitStaticExit(Bytes& b, const StateLayout& l, uint32_t target,
                            uint32_t insts_so_far, uint32_t br_depth,
-                           std::vector<DirectFixup>& fixups)
+                           std::vector<DirectFixup>& fixups, uint32_t kind_slot = 0)
 {
+  // Which kind of exit this is, counted only when the counters are on.
+  // Slots 4..7 are free; see the dispatcher for what each means.
+  if (kind_slot)
+    EmitBumpStatBy(b, l, kind_slot, 1);
   if (!l.enable_linking || !l.allow_direct)
   {
     b.push_back(kI32Const);
@@ -1106,8 +1123,13 @@ inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t
 // A caller that is packing bodies into a shared module does not need it,
 // and building one is a second pass over the code plus the section
 // scaffolding around it.
-inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_t max_insts,
-                                const StateLayout& layout, bool emit_module = true)
+// `fetch(pc)` returns the guest instruction at that address, or anything
+// that does not decode (zero will do) for an address the caller cannot
+// supply. Threading a PC rather than walking an array is what lets a block
+// FOLLOW a branch instead of stopping at it.
+template <typename Fetch>
+inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t max_insts,
+                                     const StateLayout& layout, bool emit_module = true)
 {
   using namespace detail;
   Bytes body;
@@ -1138,9 +1160,19 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       succ[nsucc++] = p;
   };
 
-  for (; n < max_insts; ++n)
+  // The guest PC being compiled, tracked SEPARATELY from how many
+  // instructions have been compiled. They are the same thing only while a
+  // block is a straight run of memory; following a branch breaks the
+  // relationship, and every place that used to say start_pc + n * 4 now
+  // says this_pc instead.
+  uint32_t cur_pc = start_pc;
+  while (n < max_insts)
   {
-    const uint32_t ins = code[n];
+    const uint32_t this_pc = cur_pc;
+    const uint32_t ins = fetch(this_pc);
+    // Set by a handler that FOLLOWED a transfer: it has advanced n and
+    // cur_pc itself, and the block carries on at the target.
+    bool followed = false;
     const uint32_t op = Opcode(ins);
     bool handled = false;
     // A branch is translated and then TERMINATES the block: control leaves
@@ -1304,7 +1336,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         {
           if (xf.update && RA(ins) == 0)
             break;
-          EmitMemOp(body, layout, start_pc + n * 4, n, RA(ins), RB(ins), 0, true, RS(ins),
+          EmitMemOp(body, layout, this_pc, n, RA(ins), RB(ins), 0, true, RS(ins),
                     xf.size, xf.store, xf.sign, xf.update);
       touches_memory = true;
           used_locals = used_locals < 4 ? 4 : used_locals;
@@ -1425,7 +1457,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32And);
         body.push_back(kIf);
         body.push_back(kVoid);
-        EmitBailBody(body, layout, start_pc + n * 4, n);
+        EmitBailBody(body, layout, this_pc, n);
         body.push_back(kEnd);
 
         BeginStoreGpr(body);
@@ -1467,7 +1499,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         body.push_back(kI32And);
         body.push_back(kIf);
         body.push_back(kVoid);
-        EmitBailBody(body, layout, start_pc + n * 4, n);
+        EmitBailBody(body, layout, this_pc, n);
         body.push_back(kEnd);
 
         // msr = gpr[rS]
@@ -1497,9 +1529,9 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
           PutU32(body, layout.downcount_offset);
         }
         body.push_back(kI32Const);
-        PutI32(body, static_cast<int32_t>((start_pc + (n + 1) * 4) | 2u));
+        PutI32(body, static_cast<int32_t>((this_pc + 4) | 2u));
         body.push_back(kReturn);
-        add_succ(start_pc + (n + 1) * 4);
+        add_succ(this_pc + 4);
         handled = true;
         ends_block = true;
         break;
@@ -1599,7 +1631,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
 
     case 18:  // b / ba / bl / bla
     {
-      const uint32_t this_pc = start_pc + n * 4;
       // LI is a signed 24-bit word displacement, stored shifted left by two.
       int32_t li = static_cast<int32_t>(ins & 0x03FFFFFC);
       if (li & 0x02000000)
@@ -1609,13 +1640,26 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       const uint32_t target = absolute ? static_cast<uint32_t>(li) : this_pc + li;
       if (link)
         EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-      EmitStaticExit(body, layout, target, n + 1, 0, fixups);
+      handled = true;
+      if (layout.trace_uncond)
+      {
+        // An unconditional transfer goes exactly one place, so following
+        // it needs no prediction and no guard: carry on compiling there.
+        // For a call that means inlining the callee, which then ends at
+        // its own return -- an indirect branch this cannot follow.
+        ++n;
+        cur_pc = target;
+        if (link)
+          add_succ(this_pc + 4);  // the return site is still a block entry
+        followed = true;
+        break;
+      }
+      EmitStaticExit(body, layout, target, n + 1, 0, fixups, link ? 5 : 4);
       add_succ(target);
       // A call does not fall through, but its RETURN SITE is a block entry
       // and a hot one, so it is worth compiling in the same region.
       if (link)
         add_succ(this_pc + 4);
-      handled = true;
       ends_block = true;
       break;
     }
@@ -1624,7 +1668,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     {
       const uint32_t bo = RS(ins);
       const uint32_t bi = RA(ins);
-      const uint32_t this_pc = start_pc + n * 4;
       int32_t bd = static_cast<int32_t>(ins & 0x0000FFFC);
       if (bd & 0x8000)
         bd -= 0x10000;  // sign extend from 16 bits
@@ -1646,14 +1689,49 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       }
       else
       {
+        // Which edge to follow, and which to exit on.
+        //
+        // A block normally exits on TAKEN and carries on along the
+        // not-taken edge, because that edge is simply the next address.
+        // For a BACKWARD branch that is the wrong way round: a backward
+        // conditional branch is a loop back edge, taken on every
+        // iteration but the last, and exiting there costs one block entry
+        // per iteration. 126.8 million of 261.5 million block entries
+        // leave by a taken conditional branch.
+        //
+        // Following it instead unrolls the loop into the block: the test
+        // is inverted so the exit is the not-taken edge, and compilation
+        // continues at the target, which is code this block already
+        // contains. Nothing is predicted and nothing is guessed -- both
+        // edges still go exactly where they went.
+        const bool follow_taken = layout.trace_backward && target < this_pc;
+
         EmitBranchTaken(body, layout, bo, bi);
+        if (follow_taken)
+          body.push_back(kI32Eqz);  // exit on NOT taken instead
         body.push_back(kIf);
         body.push_back(kVoid);
-        if (link)
+        // bcl writes LR only when it branches, so the write belongs on
+        // whichever edge is the taken one: inside the if normally, and
+        // after it when the taken edge is the one being followed.
+        if (link && !follow_taken)
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         // 0 is the if, 1 the enclosing block
-        EmitStaticExit(body, layout, target, n + 1, 1, fixups);
+        EmitStaticExit(body, layout, follow_taken ? this_pc + 4 : target, n + 1, 1, fixups, 6);
         body.push_back(kEnd);
+
+        if (follow_taken)
+        {
+          if (link)
+            EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
+          if (nsucc < 2)
+            add_succ(this_pc + 4);
+          handled = true;
+          ++n;
+          cur_pc = target;
+          followed = true;
+          break;
+        }
         // Falling through leaves the block's trailing end_pc as the result,
         // which is this instruction's PC plus four.
       }
@@ -1690,7 +1768,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       if (via_ctr && (bo & 0x04) == 0)
         break;
 
-      const uint32_t this_pc = start_pc + n * 4;
       const bool link = (ins & 1) != 0;
 
       // Read the target register BEFORE any write to the link register:
@@ -1780,7 +1857,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       // An update form with rA == 0 has no register to write back.
       if (form.update && RA(ins) == 0)
         break;
-      EmitMemOp(body, layout, start_pc + n * 4, n, RA(ins), 0, SIMM(ins), false, RS(ins),
+      EmitMemOp(body, layout, this_pc, n, RA(ins), 0, SIMM(ins), false, RS(ins),
                 form.size, form.store, form.sign, form.update);
       touches_memory = true;
       used_locals = used_locals < 4 ? 4 : used_locals;
@@ -1797,6 +1874,10 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       stopped = "unsupported instruction";
       break;
     }
+    if (followed)
+      continue;
+    ++n;
+    cur_pc = this_pc + 4;
     // The dot forms set CR0 from the result they just wrote. Emitted after
     // the instruction rather than inside each handler, because the rule is
     // one rule and the handlers are seventeen.
@@ -1808,7 +1889,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     }
     if (ends_block)
     {
-      ++n;
       stopped = "branch";
       break;
     }
@@ -1816,7 +1896,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
 
   BlockResult r;
   r.instructions = n;
-  r.end_pc = start_pc + n * 4;
+  r.end_pc = cur_pc;
   r.stopped_on = stopped;
   // Static branch targets first, then the fall-through.
   //
@@ -1894,7 +1974,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     // about to become the body -- the same buffer the patcher indexes.
     if (layout.allow_direct)
     {
-      EmitStaticExit(wrapped, layout, r.end_pc, n, 0, fixups);
+      EmitStaticExit(wrapped, layout, r.end_pc, n, 0, fixups, 7);
     }
     else
     {
@@ -1935,5 +2015,22 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
   mb.SetFunction({kI32}, {kI32}, body, "f", used_locals);
   r.module = mb.Build();
   return r;
+}
+
+// The sequential form every existing caller uses: `code` holds max_insts
+// instructions starting at start_pc.
+//
+// Addresses outside that window fetch as zero, which does not decode and
+// so ends the block. That is what bounds a followed branch to memory the
+// caller actually provided.
+inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_t max_insts,
+                                const StateLayout& layout, bool emit_module = true)
+{
+  return CompileBlockFetch(
+      [code, start_pc, max_insts](uint32_t pc) -> uint32_t {
+        const uint32_t index = (pc - start_pc) / 4;
+        return index < max_insts ? code[index] : 0u;
+      },
+      start_pc, max_insts, layout, emit_module);
 }
 }  // namespace ppc2wasm
