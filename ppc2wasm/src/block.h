@@ -453,6 +453,116 @@ inline void EmitCRBit(Bytes& b, const StateLayout& l, uint32_t bit)
   }
 }
 
+// Write CR0 the way an Rc (dot) form does.
+//
+// NOT via s_crTable, which is what every other condition-register write
+// here uses. Interpreter::Helper_UpdateCR0 builds the 64-bit encoding
+// directly out of the value instead:
+//
+//   cr_val = (s64)(s32)value
+//   if (value == 0)  cr_val |= 1 << 63
+//   cr_val = (cr_val & ~(1 << 59)) | (XER[SO] << 59)
+//
+// Those two encodings are equivalent to every READER -- LT is bit 62, GT
+// is (s64)v > 0, EQ is the low word being zero, SO is bit 59 -- and they
+// are different 64-bit numbers. Compiled code shares guest state with the
+// interpreter and the differential compares cr.fields byte for byte, so
+// the only correct choice is the one the interpreter makes.
+//
+// The zero case is why bit 63 is forced: GT is "sign clear AND non-zero",
+// so setting the SO bit on an all-zero field would otherwise turn a result
+// of zero into GT.
+//
+// Built from two i32 halves rather than one i64, matching the rest of the
+// emitter: the low half is the value, the high half carries the sign, the
+// zero marker and SO.
+inline void EmitUpdateCR0(Bytes& b, const StateLayout& l, uint32_t reg)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  LoadGpr(b, l, reg);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, l.cr_offset + 0);
+
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  // sign extension into the high half
+  LoadGpr(b, l, reg);
+  b.push_back(kI32Const);
+  PutI32(b, 31);
+  b.push_back(kI32ShrS);
+  // | (value == 0) << 31, which is bit 63 of the field
+  LoadGpr(b, l, reg);
+  b.push_back(kI32Eqz);
+  b.push_back(kI32Const);
+  PutI32(b, 31);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Or);
+  // clear bit 59, which is bit 27 of the high half
+  b.push_back(kI32Const);
+  PutI32(b, ~(1 << 27));
+  b.push_back(kI32And);
+  // | XER[SO], stored as (SO << 1) | OV in a byte of guest state
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load8U);
+  PutU32(b, 0);
+  PutU32(b, l.xer_so_ov_offset);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32ShrU);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, 27);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Or);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, l.cr_offset + 4);
+}
+
+// Which register an Rc form writes, or -1 when the form has no Rc.
+//
+// The destination is NOT always the same field: the arithmetic forms write
+// rD and the logical ones write rA, which is the field everything else
+// reads as a source. Getting that backwards silently updates CR0 from an
+// operand instead of the result.
+inline int RcDestination(uint32_t ins)
+{
+  const uint32_t op = Opcode(ins);
+  if (op == 21)  // rlwinm
+    return static_cast<int>(RA(ins));
+  if (op != 31)
+    return -1;
+  switch (XO(ins))
+  {
+  case 266:  // add
+  case 40:   // subf
+  case 235:  // mullw
+  case 104:  // neg
+    return static_cast<int>(RS(ins));
+  case 28:   // and
+  case 444:  // or
+  case 316:  // xor
+  case 476:  // nand
+  case 124:  // nor
+  case 60:   // andc
+  case 412:  // orc
+  case 284:  // eqv
+  case 24:   // slw
+  case 536:  // srw
+  case 954:  // extsb
+  case 922:  // extsh
+  case 26:   // cntlzw
+    return static_cast<int>(RA(ins));
+  default:
+    return -1;
+  }
+}
+
 // Store a value into an SPR (used for the link register).
 inline void EmitSetSpr(Bytes& b, const StateLayout& l, uint32_t index, uint32_t value)
 {
@@ -895,10 +1005,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
 
     case 21:  // rlwinm rA, rS, SH, MB, ME -- rotate left then mask
     {
-      // Rc (the dot form) sets the condition register, which is not modelled
-      // yet, so those stop the block rather than being silently ignored.
-      if (Rc(ins))
-        break;
       BeginStoreGpr(body);
       LoadGpr(body, layout, RS(ins));
       if (SH(ins))
@@ -917,7 +1023,11 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
 
     case 31:  // the extended-opcode space
     {
-      if (Rc(ins))
+      // Rc is allowed only for the forms whose destination register is
+      // known. For everything else in this opcode space -- memory, SPR
+      // moves, mtmsr -- bit 0 is reserved, and a set bit means an encoding
+      // this does not understand.
+      if (Rc(ins) && RcDestination(ins) < 0)
         break;
       const uint32_t xo = XO(ins);
 
@@ -1507,6 +1617,15 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     {
       stopped = "unsupported instruction";
       break;
+    }
+    // The dot forms set CR0 from the result they just wrote. Emitted after
+    // the instruction rather than inside each handler, because the rule is
+    // one rule and the handlers are seventeen.
+    if (Rc(ins))
+    {
+      const int rc_dest = RcDestination(ins);
+      if (rc_dest >= 0)
+        EmitUpdateCR0(body, layout, static_cast<uint32_t>(rc_dest));
     }
     if (ends_block)
     {

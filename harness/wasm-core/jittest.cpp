@@ -294,11 +294,19 @@ int main()
     auto ci = ppc2wasm::CompileBlock(ctr_indirect, 0x80001000, 1, L);
     check(ci.instructions == 0, "bcctr that decrements CTR is still refused");
 
-    // The dot forms set the condition register, which is not modelled. They
-    // must stop the block, not be treated as their non-dot twins.
+    // The dot forms set CR0 and ARE translated now.
     const uint32_t rc_form[] = {0x7C632215};  // add. r3, r3, r4
     auto d = ppc2wasm::CompileBlock(rc_form, 0x80001000, 1, L);
-    check(d.instructions == 0, "an Rc (dot) form stops the block");
+    check(d.instructions == 1, "an Rc (dot) form is translated");
+    check(ppc2wasm::detail::RcDestination(0x7C632215) == 3, "add. writes rD");
+    check(ppc2wasm::detail::RcDestination(0x7C652378) == 5, "or. writes rA, not rD");
+    check(ppc2wasm::detail::RcDestination(0x5464103B) == 4, "rlwinm. writes rA");
+    // An Rc bit on a form that has no Rc is an encoding this does not
+    // understand, and must still stop the block rather than be guessed at.
+    check(ppc2wasm::detail::RcDestination(0x7CA3212F) < 0, "stwx has no Rc destination");
+    const uint32_t rc_mem[] = {0x7CA3212F};  // stwx with bit 0 set
+    auto dm = ppc2wasm::CompileBlock(rc_mem, 0x80001000, 1, L);
+    check(dm.instructions == 0, "a reserved bit on a memory form stops the block");
 
     // Memory operands compile, and a block that needs scratch locals must
     // actually declare them -- a body that uses local 1 without declaring it
