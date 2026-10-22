@@ -3,12 +3,19 @@
 # Separate from ci.yml because these jobs are minutes-to-an-hour, not seconds,
 # and nothing here should sit between a push and a merge.
 #
-# What runs here: the native differential tests that need Dolphin's libraries
-# built but NOT the game disc -- coreboot (Core/PowerPC/IOS/DiscIO bring-up,
-# 67 assertions) and tracetest (instruction-level trace, native vs the expected
-# sequence). Those are the only harness binaries that are disc-free; bootgame
-# and the FIFO capture need a 4.7 GB copyrighted disc that cannot be provided
-# to a hosted runner, so they stay manual.
+# What runs here: everything that needs Dolphin's libraries built but NOT the
+# game disc.
+#
+#   native-differential      coreboot (Core/PowerPC/IOS/DiscIO bring-up, 67
+#                            assertions) and tracetest (instruction-level
+#                            trace, native vs the expected sequence)
+#   recompiler-differential  the four differentials in jitdiff.cpp, which
+#                            compare compiled blocks against the interpreter
+#                            in the same process
+#
+# bootgame and the FIFO capture need a 4.7 GB copyrighted disc that cannot be
+# provided to a hosted runner, so they stay manual -- which means the SPEED
+# numbers are still measured by hand. Correctness is not.
 #
 # STATUS: unverified. This has not completed a run on a hosted runner yet --
 # the Dolphin build has a long dependency list and the first run is where that
@@ -18,10 +25,22 @@ name: nightly
 on:
   schedule:
     - cron: "0 7 * * *"
+  # A manual run can pick one job. The native differential needs a macOS
+  # runner, which bills at ten times a Linux one, and verifying a change to
+  # the wasm job should not cost ninety minutes of that.
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: which jobs to run
+        default: all
+        type: choice
+        options: [all, native, recompiler]
 
 jobs:
   native-differential:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.jobs == 'all' || inputs.jobs == 'native'
     name: native differential (no disc)
     # macOS, not Linux. harness/wasm-core/link-native.sh names the static
     # libraries it links explicitly, and that list includes libvideometal.a,
@@ -98,3 +117,64 @@ jobs:
           harness/wasm-core/link-native.sh harness/wasm-core/tracetest.cpp /tmp/tracetest
           /tmp/tracetest > /tmp/trace.txt
           grep -c '^T ' /tmp/trace.txt
+
+  recompiler-differential:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.jobs == 'all' || inputs.jobs == 'recompiler'
+    name: recompiler differentials (wasm, no disc)
+    # The four differentials in harness/wasm-core/jitdiff.cpp: hand-written
+    # cases, a randomised per-instruction differential, a randomised block
+    # differential including guest memory, and a randomised CHAIN
+    # differential that links blocks and runs them.
+    #
+    # These are the project's main correctness gate for the recompiler and
+    # until now they ran only when someone remembered. They need no disc --
+    # only Emscripten and Dolphin's libraries built for wasm32 -- so there
+    # is no reason they cannot run unattended. They do not go in ci.yml
+    # because the Dolphin build is the better part of an hour and nothing
+    # that slow belongs between a push and a merge.
+    #
+    # Linux, unlike the native job above. That one needs macOS because
+    # link-native.sh links libvideometal.a; link.sh does not, and a wasm
+    # build is the same on either host because the target is wasm32.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: clone Dolphin
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/dolphin-emu/dolphin.git dolphin
+
+      - name: apply patches
+        run: scripts/apply-patches.sh dolphin
+
+      - name: install Emscripten
+        # Installed by hand into ~/emsdk rather than through a third-party
+        # action, because that is the path scripts/build-wasm.sh and
+        # harness/wasm-core/link.sh already look in when EMSDK is unset. CI
+        # and a local checkout then run the same scripts unmodified.
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install latest
+          "$HOME/emsdk/emsdk" activate latest
+
+      - name: build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: build Dolphin for wasm32
+        # Everything, not just libcore: link.sh names a fixed list of static
+        # archives and a partial build leaves the link failing on whichever
+        # one it reaches first.
+        run: scripts/build-wasm.sh
+
+      - name: the four differentials
+        # run-jitdiff.sh builds jitdiff.cpp against those libraries and runs
+        # it under node. Its exit status is the suite's -- a differential
+        # that fails returns non-zero, and so does one that fails its own
+        # coverage assertions, which is the point of having them.
+        run: harness/wasm-core/run-jitdiff.sh
