@@ -49,13 +49,18 @@ measured fact, and the first job is to turn it into one.
 
 ### 1. Profile a chain return — before changing anything
 
-Everything below is a guess until this exists. Instrument or sample the
-dispatcher loop and find the split between: the cache lookup, the call itself,
-`CoreTiming::Advance`, and the bookkeeping.
+**Done — see `docs/PHASE2-PROFILE.md`, and read it before trusting §2-§6
+below, which it contradicts in three places.**
 
-The counters that already exist (`link_stats`, `miss_but_cached`, per-chain
-instruction counts) are the model to copy: count the things that distinguish
-*different causes*, not just the things that are easy to count.
+The short version: 54 MIPS was measuring compilation. The same build does
+117.0 MIPS over 800M instructions, because module installation is a one-off
+~22 µs per block that a 200M run never amortises. Of an 800M run, compiled
+execution is 46%, installation 25%, the interpreter fallback 13% and the whole
+dispatcher round-trip 13% — of which the `unordered_map` is 3.4%.
+
+The constraint is that **blocks are 2.82 instructions long**. Chains average
+16.69 instructions but cross 5.9 blocks, and every block entry pays a
+prologue, the `MSR[DR]` guard and the entire link epilogue.
 
 ### 2. Make the dispatcher cheap
 
@@ -63,8 +68,9 @@ instruction counts) are the model to copy: count the things that distinguish
 return. A direct-mapped array keyed by PC — the same shape as the link table —
 would remove a hash and a pointer chase from the hottest path in the emulator.
 
-Low risk, mechanical, and probably the largest single win if the hypothesis in
-§1 holds.
+Low risk and mechanical — but **measured at 3.4% of the run**, not the largest
+single win. The hypothesis in §1 did not hold. Do it when it is convenient,
+not first.
 
 ### 3. Fix the link table's collisions
 
@@ -89,8 +95,17 @@ The guard accepts only MEM1 (`0x80000000`, mask `0xFE000000`). **MEM2 lives at
 Every MEM2 access bails, which ends a chain *and* forces a dispatcher
 round-trip *and* interprets an instruction.
 
-This is probably the biggest remaining source of short chains. It needs a
-second region in the guard and a second host base in `StateLayout`.
+It needs a second region in the guard and a second host base in
+`StateLayout`.
+
+This was guessed to be "probably the biggest remaining source of short
+chains". **Measured: 251,914 bails out of 277,355,832 block entries**, under
+one in a thousand — so not that.
+
+Do not read the bail count as MEM2 being free. A block that refuses its first
+instruction is retired and interpreted from then on, so a MEM2 access bails
+once and is interpreted forever. Sized separately: 9,835 retired blocks and
+4,455,074 instructions through them, ~3.5% of the run.
 
 ### 5. Keep guest registers in wasm locals within a block
 
@@ -99,7 +114,12 @@ and stores the result back. Within a block, a value produced by one
 instruction and consumed by the next could stay in a local.
 
 Spike A's `dispatch` variant shows memory-resident state still reaches 863
-MIPS, so this is an optimisation rather than a necessity — do it after §1–4.
+MIPS, so this looked like an optimisation rather than a necessity.
+
+**Promoted.** In situ, compiled code runs at about 250 MIPS, not the 1538–2811
+a microbenchmark reported — the microbenchmark measured long blocks and real
+guest code does not come in long blocks. Compiled execution is 46% of the run.
+This is now part of the top item, alongside direct linking and longer blocks.
 
 ### 6. Floating point and paired singles
 
@@ -121,6 +141,11 @@ measurable progress.
 
 **Measure before changing.** Every performance intuition in this project has
 been wrong, and every measurement has been right within one run:
+
+- "The dispatcher's hash lookup is probably the largest single win" — wrong,
+  3.4%. "MEM2 is probably the biggest source of short chains" — wrong, one
+  bail in a thousand entries. Both were written in this document, in a
+  section that said they were guesses, and both were settled by one profile.
 
 - "Linking is gated on coverage" (PR #48) — wrong. Coverage reached 98.7% and
   linking still lost.
