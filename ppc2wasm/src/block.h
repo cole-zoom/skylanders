@@ -440,6 +440,94 @@ inline void EmitSetSpr(Bytes& b, const StateLayout& l, uint32_t index, uint32_t 
   PutU32(b, l.spr_offset + index * 4);
 }
 
+// ── the BO field, and what a conditional branch actually tests ──
+//
+// PowerPC's BO is five bits, numbered 0..4 from the most significant. Here
+// they appear as the low five bits of the RS field, so BO0 is 0x10:
+//
+//   0x10  BO0  ignore the condition register entirely
+//   0x08  BO1  the CR bit value to branch on
+//   0x04  BO2  do NOT decrement CTR
+//   0x02  BO3  with CTR: branch when it is zero (set) or non-zero (clear)
+//   0x01  BO4  a prediction hint, which means nothing here
+//
+// The branch is taken when BOTH tests pass, and the CTR decrement happens
+// whether or not it is. This mirrors Interpreter::bcx exactly; the shape of
+// that function is the specification.
+//
+// Blocks used to refuse every form with BO2 clear. Measured over an
+// 800M-instruction boot, that was 3.68 million interpreted instructions --
+// the largest single entry in the interpreter fallback -- and worse than
+// its share suggests, because bdnz is the BACK EDGE of a counted loop. An
+// uncompiled back edge means every iteration leaves compiled code,
+// interprets one instruction and re-enters, which caps chain length at one
+// loop body no matter how well the link table performs.
+inline void EmitDecrementCtr(Bytes& b, const StateLayout& l)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.spr_offset + l.ctr_index * 4);
+  b.push_back(kI32Const);
+  PutI32(b, 1);
+  b.push_back(kI32Sub);
+  b.push_back(kI32Store);
+  PutU32(b, 2);
+  PutU32(b, l.spr_offset + l.ctr_index * 4);
+}
+
+// Push 1 if the branch should be taken, 0 if not.
+//
+// Emits the CTR decrement first when BO asks for it, because the decrement
+// is unconditional and the test reads the DECREMENTED value.
+inline void EmitBranchTaken(Bytes& b, const StateLayout& l, uint32_t bo, uint32_t bi)
+{
+  const bool tests_ctr = (bo & 0x04) == 0;
+  const bool tests_cr = (bo & 0x10) == 0;
+
+  if (tests_ctr)
+    EmitDecrementCtr(b, l);
+
+  if (tests_ctr)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.spr_offset + l.ctr_index * 4);
+    if (bo & 0x02)
+    {
+      b.push_back(kI32Eqz);  // branch when the counter reached zero
+    }
+    else
+    {
+      b.push_back(kI32Const);
+      PutI32(b, 0);
+      b.push_back(kI32Ne);  // ... or when it has not
+    }
+  }
+
+  if (tests_cr)
+  {
+    EmitCRBit(b, l, bi);
+    b.push_back(kI32Const);
+    PutI32(b, (bo & 0x08) ? 1 : 0);
+    b.push_back(kI32Eq);
+  }
+
+  if (tests_ctr && tests_cr)
+    b.push_back(kI32And);
+  else if (!tests_ctr && !tests_cr)
+  {
+    // Neither test applies: an unconditional branch written the long way.
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+  }
+}
+
 // Increment one of the link counters.
 inline void EmitBumpStat(Bytes& b, const StateLayout& l, uint32_t slot)
 {
@@ -1187,12 +1275,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
     {
       const uint32_t bo = RS(ins);
       const uint32_t bi = RA(ins);
-      // BO bit 2 clear means the branch also decrements CTR, which is not
-      // modelled. Treating it as a plain conditional would skip the
-      // decrement and loop forever.
-      if ((bo & 0x04) == 0)
-        break;
-
       const uint32_t this_pc = start_pc + n * 4;
       int32_t bd = static_cast<int32_t>(ins & 0x0000FFFC);
       if (bd & 0x8000)
@@ -1206,9 +1288,9 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       // it within "if (counter && condition)" -- and writing it
       // unconditionally corrupts the return address of whatever call the
       // not-taken path eventually returns from.
-      if (bo & 0x10)
+      if ((bo & 0x14) == 0x14)
       {
-        // Branch always -- the condition is ignored.
+        // Neither CTR nor the condition register is consulted.
         if (link)
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
         body.push_back(kI32Const);
@@ -1217,11 +1299,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       }
       else
       {
-        // Taken when the tested bit equals BO bit 3.
-        EmitCRBit(body, layout, bi);
-        body.push_back(kI32Const);
-        PutI32(body, (bo & 0x08) ? 1 : 0);
-        body.push_back(kI32Eq);
+        EmitBranchTaken(body, layout, bo, bi);
         body.push_back(kIf);
         body.push_back(kVoid);
         if (link)
@@ -1245,8 +1323,11 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         break;
       const uint32_t bo = RS(ins);
       const uint32_t bi = RA(ins);
-      if ((bo & 0x04) == 0)
-        break;  // CTR-decrementing form, not modelled
+      // bcctr with BO2 clear is architecturally invalid -- CTR cannot be
+      // both the counter and the target -- and Dolphin only asserts on it.
+      // bclr with BO2 clear is bdnzlr and is perfectly ordinary.
+      if (via_ctr && (bo & 0x04) == 0)
+        break;
 
       const uint32_t this_pc = start_pc + n * 4;
       const bool link = (ins & 1) != 0;
@@ -1272,7 +1353,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       // As in bc: the link write belongs to the TAKEN path only. The target
       // was already read into local 1 above, so writing LR here cannot
       // disturb it -- which is the whole reason the read came first.
-      if (bo & 0x10)
+      if ((bo & 0x14) == 0x14)
       {
         if (link)
           EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
@@ -1282,10 +1363,7 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       }
       else
       {
-        EmitCRBit(body, layout, bi);
-        body.push_back(kI32Const);
-        PutI32(body, (bo & 0x08) ? 1 : 0);
-        body.push_back(kI32Eq);
+        EmitBranchTaken(body, layout, bo, bi);
         body.push_back(kIf);
         body.push_back(kVoid);
         if (link)
