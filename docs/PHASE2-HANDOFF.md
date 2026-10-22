@@ -5,7 +5,7 @@ the state of the recompiler, what the constraint actually is, and the traps
 that have already cost time.
 
 > **This document has been overtaken in places.** It was written at 54 MIPS;
-> the recompiler now does **189.2 MIPS** on the same boot. Its §1 asked for a
+> the recompiler now does **195.8 MIPS** on the same boot. Its §1 asked for a
 > profile, the profile happened, and it disproved two of the items ranked
 > below. **`docs/PHASE2-PROFILE.md` is the current state and the current
 > ranking — start there.** What is still worth reading here is unchanged:
@@ -22,10 +22,10 @@ speed dominated by compiling rather than running.
 | instructions | interpreter | `--jit` |
 |---|---|---|
 | 200M | 18.3 | 54.7 |
-| 800M | 18.8 | **189.2** |
+| 800M | 18.8 | **195.8** |
 
 Full speed is roughly **600 MIPS** — Broadway is 729 MHz at close to 1 IPC —
-so there is about **3.2×** still to find. It was 11× when this was written,
+so there is about **3.1×** still to find. It was 11× when this was written,
 and a third of that gap turned out to be the 200M window measuring
 compilation.
 

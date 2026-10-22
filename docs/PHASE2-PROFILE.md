@@ -1,6 +1,6 @@
 # Where the 11× went
 
-> **Status, after the work this document set off: 178.3 MIPS.** The
+> **Status, after the work this document set off: 195.8 MIPS.** The
 > measurements below are the ones that produced that and they are kept as
 > written. What changed since, and what to do next, is in
 > [Where it stands now](#where-it-stands-now) at the end — **read that
@@ -287,9 +287,48 @@ Same harness, same 800M-instruction boot, one machine.
 | superblocks through conditional branches | 172.3 | item 3 |
 | the Rc (dot) forms | 175.6 | long tail |
 | stop building an unused module | 178.3 | found by accident |
+| `MSR[DR]` checked once per chain | 183.0 | block entry |
+| link counters made opt-in | 189.2 | they cost 5.6% |
+| direct same-module tail calls | 194.0 | block entry |
 
-Against roughly 600 MIPS for full speed, that is **3.4× to go**, down from
-5.1×.
+Against roughly 600 MIPS for full speed, that is **3.1× to go**, down from
+5.1×. The last clean measurement is **195.8 MIPS**.
+
+### Three things that should have worked and did not
+
+This is the most useful section here, because each was built, measured and
+reverted, and together they say the model behind the ranking below was
+wrong.
+
+**Removing 94 million block entries changed nothing.** Following the taken
+edge of backward conditional branches unrolls loops into the block: entries
+fell from 261.5M to 167.3M, instructions per entry rose from 3.02 to 4.71,
+and the run got marginally *slower*. Whatever a block entry costs, it is
+not the 7.9 ns the residual implied.
+
+**Following unconditional branches moved the exits rather than removing
+them.** `b` and `bl` exits went to zero while run-off-the-end exits went
+from 2.2M to 54.9M — a block that follows a branch ends further along,
+usually at an instruction that does not translate. 13M fewer entries out
+of 65.6M followed, no speed change.
+
+**Caching guest registers in wasm locals bought nothing.** Write-through,
+so only redundant reads were saved: 192.9 MIPS against 194-195 without it.
+Blocks average three instructions, so there is little reuse, and the extra
+`local.tee` costs about what it saves.
+
+The cost is therefore **neither block entry nor guest-state memory
+traffic**. It scales with instructions executed in compiled code, at
+roughly 2.6 ns each -- about 380 MIPS for the emitted code itself, against
+the 863 MIPS Spike A measured for hand-written wasm. What is left is the
+quality of the emitted code per instruction. Nothing structural around it
+has moved the number.
+
+One more thing worth knowing before trying again: the register-caching
+experiment **broke the boot outright while all four differentials stayed
+green**, because they generated 11-instruction programs and the dispatcher
+compiles up to 64. They now generate up to 41, and the same bug dies in
+four seconds.
 
 ### The budget now
 
@@ -328,7 +367,13 @@ a function prologue, the `MSR[DR]` guard and the link epilogue.
 
 ### Suggested order now
 
-1. **Cheaper block entry — 52.8%, and the only line that has never moved.**
+**Read "Three things that should have worked and did not" first.** The
+first item below is written against a model the measurements have since
+contradicted. Its sub-items are still worth doing; the reason given for
+them is not the right one, and two of the three have now been tried.
+
+1. **Cheaper block entry — 52.8% as a residual, and the only line that has
+   never moved.**
    - *Direct linking.* A region's blocks share a module, so a statically
      known successor already has a function index. Replacing the
      epilogue's hash, table load, PC compare and `return_call_indirect`
@@ -337,6 +382,7 @@ a function prologue, the `MSR[DR]` guard and the link epilogue.
      by how often a successor is a sibling: **measured at 47.4% of static
      successor edges** (`--jit-stats` reports it), with regions averaging
      3.7 blocks. Dynamic coverage is unknown and could go either way.
+     **Done, +2.5%** — see #72. Measured at 42.6% of holes filled.
    - *One function per region, with an internal `br_table`.* The same idea
      taken further: an intra-region transfer becomes a branch rather than
      a call. Larger change, larger prize.
@@ -372,7 +418,7 @@ harness/wasm-core/run-jitdiff.sh                          # all four differentia
 
 Measure at **several** step counts. Installation is a one-off, so a short
 run reports a speed dominated by compilation: this build does 54.7 MIPS
-over 200M instructions and 178.3 over 800M.
+over 200M instructions and 195.8 over 800M.
 
 The boot's final PC is **not** a correctness signal. It differs between
 every configuration including the interpreter, which at 800M ends at
