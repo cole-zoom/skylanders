@@ -227,6 +227,41 @@ int main()
       {"beqlr not taken", {0x3C60'8000, 0x6063'2000, 0x7C68'03A6, 0x3880'0009,
                            0x2C04'0005, 0x4D82'0020}},
 
+      // ── the long tail ──
+      // Sign extension: 0x80 as a byte is negative, which a zero-extending
+      // implementation gets wrong only for values with the high bit set.
+      {"extsb sign-extends a negative byte", {0x3860'0080, 0x7C64'0774}},
+      {"extsb on a positive byte", {0x3860'007F, 0x7C64'0774}},
+      {"extsh sign-extends a halfword", {0x3C60'8000, 0x7C64'0734}},
+      {"neg", {0x3860'0005, 0x7C83'00D0}},
+      {"cntlzw counts leading zeros", {0x3860'0001, 0x7C64'0034}},
+      {"cntlzw of zero is 32", {0x3860'0000, 0x7C64'0034}},
+      // The complement forms: each gets the NOT in a different place.
+      {"andc", {0x3860'00FF, 0x3880'000F, 0x7C65'2078}},
+      {"orc", {0x3860'00F0, 0x3880'000F, 0x7C65'2338}},
+      {"nor", {0x3860'00F0, 0x3880'000F, 0x7C65'20F8}},
+      {"nand", {0x3860'00FF, 0x3880'0F0F, 0x7C65'23B8}},
+      {"eqv", {0x3860'00FF, 0x3880'0F0F, 0x7C65'2238}},
+      {"mullw", {0x3860'0007, 0x3880'0006, 0x7CA3'21D6}},
+      {"mulli", {0x3860'0007, 0x1C83'0005}},
+      // Halfword memory, where byte order matters most.
+      {"sth then lhz round-trips a halfword",
+       {0x3C60'8000, 0x6063'7000, 0x3880'ABCD, 0xB083'0000, 0xA0A3'0000}},
+      {"lha sign-extends what sth wrote",
+       {0x3C60'8000, 0x6063'7100, 0x3880'8001, 0xB083'0000, 0xA8A3'0000}},
+      // Indexed addressing.
+      {"stwx then lwzx",
+       {0x3C60'8000, 0x6063'7200, 0x3880'0010, 0x38A0'1234, 0x7CA3'212E, 0x7CC3'202E}},
+      // Update forms write the address back.
+      {"lwzu updates the base",
+       {0x3C60'8000, 0x6063'7300, 0x3880'4321, 0x9083'0004, 0x84A3'0004}},
+      {"stbu updates the base",
+       {0x3C60'8000, 0x6063'7400, 0x3880'0055, 0x9C83'0008}},
+
+      // bcctr is the indirect branch: mtspr CTR then jump to it.
+      {"bcctr branches through CTR",
+       {0x3C60'8000, 0x6063'2000, 0x7C69'03A6, 0x4E80'0420}},
+
       // ── the guard ──
       // MEM2 lives at 0x90000000 and a compiled block may not touch it, so
       // the block must refuse instruction 2 and hand back its PC.
@@ -345,6 +380,122 @@ int main()
       if (got_pc != expect_pc)
         std::printf("      pc  interpreter=%08x recompiled=%08x\n", expect_pc, got_pc);
     }
+  }
+
+  // ── randomised differential ──
+  //
+  // Thirty-odd hand-written cases check the instructions someone thought to
+  // write a case for, with the register numbers and operand values they
+  // happened to choose. That is exactly the coverage that lets a decode bug
+  // reach a two-hundred-million-instruction boot and crash it.
+  //
+  // This fires random encodings of every supported form at both engines, with
+  // random register numbers and random register contents, and compares the
+  // whole guest state.
+  {
+    std::printf("\n  randomised differential\n");
+    // Templates: primary opcode, and for the extended space an XO.
+    struct T { u32 primary; u32 xo; const char* name; };
+    static const T templates[] = {
+        {14, 0, "addi"},    {15, 0, "addis"},  {7, 0, "mulli"},   {11, 0, "cmpi"},
+        {10, 0, "cmpli"},   {24, 0, "ori"},    {25, 0, "oris"},   {26, 0, "xori"},
+        {27, 0, "xoris"},   {21, 0, "rlwinm"},
+        {32, 0, "lwz"},     {34, 0, "lbz"},    {40, 0, "lhz"},    {42, 0, "lha"},
+        {36, 0, "stw"},     {38, 0, "stb"},    {44, 0, "sth"},
+        {31, 266, "add"},   {31, 40, "subf"},  {31, 444, "or"},   {31, 28, "and"},
+        {31, 316, "xor"},   {31, 24, "slw"},   {31, 536, "srw"},  {31, 0, "cmp"},
+        {31, 32, "cmpl"},   {31, 954, "extsb"},{31, 922, "extsh"},{31, 104, "neg"},
+        {31, 26, "cntlzw"}, {31, 60, "andc"},  {31, 412, "orc"},  {31, 124, "nor"},
+        {31, 476, "nand"},  {31, 284, "eqv"},  {31, 235, "mullw"},
+        {31, 23, "lwzx"},   {31, 151, "stwx"}, {31, 87, "lbzx"},  {31, 215, "stbx"},
+        {31, 279, "lhzx"},  {31, 407, "sthx"},
+    };
+
+    u32 seed = 0x12345678;
+    auto rnd = [&seed]() {
+      seed ^= seed << 13;
+      seed ^= seed >> 17;
+      seed ^= seed << 5;
+      return seed;
+    };
+
+    int rand_fail = 0;
+    for (const T& t : templates)
+    {
+      int fails_here = 0;
+      for (int trial = 0; trial < 200 && fails_here < 2; ++trial)
+      {
+        const u32 a = rnd() % 31 + 1;
+        // b must differ from a: the two are given different roles below (base
+        // address and offset), and when they collide the second assignment
+        // destroys the first, producing an address outside MEM1 that the
+        // interpreter faults on and a compiled block refuses. Both are
+        // correct and they are not comparable.
+        u32 b = rnd() % 31 + 1;
+        if (b == a)
+          b = (a % 31) + 1;
+        const u32 d = rnd() % 31 + 1;
+        u32 ins;
+        if (t.primary == 31)
+          ins = (31u << 26) | (d << 21) | (a << 16) | (b << 11) | (t.xo << 1);
+        else
+          // A SMALL non-negative displacement, so the address stays inside
+          // MEM1. A random 16-bit field is signed and routinely lands outside
+          // it, where the interpreter faults and a compiled block bails --
+          // both correct, and not comparable.
+          ins = (t.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x0FF0);
+
+        // Seed registers with a mix of small, negative and large values, and
+        // point the ones used as addresses somewhere inside MEM1.
+        for (int i = 0; i < 32; ++i)
+          state.gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : rnd();
+        state.gpr[a] = 0x8000'0000 + (rnd() & 0x000F'FFF0);
+        if (t.primary == 31)
+          state.gpr[b] = rnd() & 0xFF0;
+        for (int i = 0; i < 8; ++i)
+          state.cr.fields[i] = 0;
+        state.spr[SPR_LR] = 0;
+        state.downcount = 1000;
+        u32 before[32];
+        std::memcpy(before, state.gpr, sizeof(before));
+
+        memory.Write_U32(ins, BASE);
+        state.pc = state.npc = BASE;
+        ppc.SingleStep();
+        u32 want[32];
+        std::memcpy(want, state.gpr, sizeof(want));
+        u64 want_cr[8];
+        std::memcpy(want_cr, state.cr.fields, sizeof(want_cr));
+
+        auto rr = ppc2wasm::CompileBlock(&ins, BASE, 1, layout);
+        if (rr.instructions != 1)
+          continue;  // refused; nothing to compare
+        const int ix = InstallModule(rr.module.data(), static_cast<int>(rr.module.size()));
+        if (ix < 0)
+          continue;
+
+        std::memcpy(state.gpr, before, sizeof(before));
+        for (int i = 0; i < 8; ++i)
+          state.cr.fields[i] = 0;
+        state.spr[SPR_LR] = 0;
+        state.downcount = 1000;
+        state.pc = state.npc = BASE;
+        reinterpret_cast<BlockFn>(ix)(static_cast<u32>(reinterpret_cast<uintptr_t>(&state)));
+
+        for (int i = 0; i < 32; ++i)
+        {
+          if (state.gpr[i] != want[i])
+          {
+            std::printf("  %-8s ins=%08x r%-2d interpreter=%08x recompiled=%08x\n", t.name, ins,
+                        i, want[i], state.gpr[i]);
+            ++fails_here;
+            ++rand_fail;
+            break;
+          }
+        }
+      }
+    }
+    check(rand_fail == 0, "randomised differential over every supported form");
   }
 
   std::printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);

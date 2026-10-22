@@ -538,6 +538,114 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l, uint32_t insts)
   b.push_back(kLocalGet);
   PutU32(b, 4);
 }
+
+// One emitter for every integer load and store.
+//
+// PowerPC spells these many ways -- displacement or indexed addressing, one
+// two or four bytes, zero or sign extended, with or without writing the
+// address back -- but they differ only in those four axes. Writing them out
+// separately is how a decoder ends up with the byte order right in three
+// places and wrong in the fourth.
+//
+// Locals: 1 is the address, 2 the value, 3 the guest address kept for an
+// update form.
+inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t insts_before,
+                      uint32_t ra, uint32_t rb, int32_t disp, bool indexed, uint32_t reg,
+                      int size, bool is_store, bool sign_extend, bool update)
+{
+  // Effective address.
+  LoadGprOrZero(b, l, ra);
+  if (indexed)
+  {
+    LoadGpr(b, l, rb);
+    b.push_back(kI32Add);
+  }
+  else if (disp)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, disp);
+    b.push_back(kI32Add);
+  }
+  b.push_back(kLocalSet);
+  PutU32(b, 1);
+
+  EmitGuard(b, l, 1, this_pc, insts_before);
+
+  if (update)
+  {
+    // The GUEST address is written back, not the host one.
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kLocalSet);
+    PutU32(b, 3);
+  }
+
+  EmitToHostAddress(b, l, 1);
+
+  if (is_store)
+  {
+    LoadGpr(b, l, reg);
+    b.push_back(kLocalSet);
+    PutU32(b, 2);
+    for (int byte = 0; byte < size; ++byte)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 1);
+      b.push_back(kLocalGet);
+      PutU32(b, 2);
+      const int shift = (size - 1 - byte) * 8;
+      if (shift)
+      {
+        b.push_back(kI32Const);
+        PutI32(b, shift);
+        b.push_back(kI32ShrU);
+      }
+      b.push_back(kI32Store8);
+      PutU32(b, 0);
+      PutU32(b, static_cast<uint32_t>(byte));
+    }
+  }
+  else
+  {
+    BeginStoreGpr(b);
+    for (int byte = 0; byte < size; ++byte)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 1);
+      b.push_back(kI32Load8U);
+      PutU32(b, 0);
+      PutU32(b, static_cast<uint32_t>(byte));
+      const int shift = (size - 1 - byte) * 8;
+      if (shift)
+      {
+        b.push_back(kI32Const);
+        PutI32(b, shift);
+        b.push_back(kI32Shl);
+      }
+      if (byte)
+        b.push_back(kI32Or);
+    }
+    if (sign_extend && size < 4)
+    {
+      const int bits = 32 - size * 8;
+      b.push_back(kI32Const);
+      PutI32(b, bits);
+      b.push_back(kI32Shl);
+      b.push_back(kI32Const);
+      PutI32(b, bits);
+      b.push_back(kI32ShrS);
+    }
+    EndStoreGpr(b, l, reg);
+  }
+
+  if (update)
+  {
+    BeginStoreGpr(b);
+    b.push_back(kLocalGet);
+    PutU32(b, 3);
+    EndStoreGpr(b, l, ra);
+  }
+}
 }  // namespace detail
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
@@ -684,6 +792,169 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
         break;
       }
 
+      // dcbz is NOT translated, despite being cheap to emit.
+      //
+      // It raises an alignment exception when HID0[DCE] is clear
+      // (Interpreter_LoadStore.cpp:539) and takes a Dolphin-specific path
+      // when data cache emulation is off. Emitting a plain 32-byte zero is
+      // right only when the cache is enabled, and wrong silently otherwise --
+      // the first test written for it showed the interpreter at the alignment
+      // vector while the compiled block zeroed memory and carried on.
+
+      // ── integer loads and stores, indexed form ──
+      {
+        struct XForm { int size; bool store, sign, update; };
+        XForm xf{};
+        bool is_mem = true;
+        switch (xo)
+        {
+        case 23:  xf = {4, false, false, false}; break;  // lwzx
+        case 55:  xf = {4, false, false, true};  break;  // lwzux
+        case 87:  xf = {1, false, false, false}; break;  // lbzx
+        case 119: xf = {1, false, false, true};  break;  // lbzux
+        case 279: xf = {2, false, false, false}; break;  // lhzx
+        case 311: xf = {2, false, false, true};  break;  // lhzux
+        case 343: xf = {2, false, true,  false}; break;  // lhax
+        case 375: xf = {2, false, true,  true};  break;  // lhaux
+        case 151: xf = {4, true,  false, false}; break;  // stwx
+        case 183: xf = {4, true,  false, true};  break;  // stwux
+        case 215: xf = {1, true,  false, false}; break;  // stbx
+        case 247: xf = {1, true,  false, true};  break;  // stbux
+        case 407: xf = {2, true,  false, false}; break;  // sthx
+        case 439: xf = {2, true,  false, true};  break;  // sthux
+        default: is_mem = false; break;
+        }
+        if (is_mem)
+        {
+          if (xf.update && RA(ins) == 0)
+            break;
+          EmitMemOp(body, layout, start_pc + n * 4, n, RA(ins), RB(ins), 0, true, RS(ins),
+                    xf.size, xf.store, xf.sign, xf.update);
+          used_locals = used_locals < 4 ? 4 : used_locals;
+          handled = true;
+          break;
+        }
+      }
+
+      // ── single-operand and complement forms ──
+      //
+      // All pure register arithmetic: no memory, no carry, no condition
+      // register. They are implemented together because each is two or three
+      // wasm instructions and because the LONG TAIL is what caps block
+      // length -- at 17% unsupported, a block truncates after about six
+      // instructions no matter which 17% it is.
+      if (xo == 954 || xo == 922)  // extsb, extsh
+      {
+        const int bits = (xo == 954) ? 24 : 16;
+        BeginStoreGpr(body);
+        LoadGpr(body, layout, RS(ins));
+        body.push_back(kI32Const);
+        PutI32(body, bits);
+        body.push_back(kI32Shl);
+        body.push_back(kI32Const);
+        PutI32(body, bits);
+        body.push_back(kI32ShrS);  // arithmetic shift back sign-extends
+        EndStoreGpr(body, layout, RA(ins));
+        handled = true;
+        break;
+      }
+      if (xo == 104)  // neg rD, rA
+      {
+        BeginStoreGpr(body);
+        body.push_back(kI32Const);
+        PutI32(body, 0);
+        LoadGpr(body, layout, RA(ins));
+        body.push_back(kI32Sub);
+        EndStoreGpr(body, layout, RS(ins));
+        handled = true;
+        break;
+      }
+      if (xo == 26)  // cntlzw rA, rS
+      {
+        BeginStoreGpr(body);
+        LoadGpr(body, layout, RS(ins));
+        body.push_back(kI32Clz);
+        EndStoreGpr(body, layout, RA(ins));
+        handled = true;
+        break;
+      }
+      if (xo == 60 || xo == 412 || xo == 124 || xo == 476 || xo == 284)
+      {
+        // andc, orc, nor, nand, eqv -- a plain operation with one or both
+        // sides complemented. WebAssembly has no NOT, so each complement is
+        // an xor with -1.
+        auto emit_not = [&] {
+          body.push_back(kI32Const);
+          PutI32(body, -1);
+          body.push_back(kI32Xor);
+        };
+        BeginStoreGpr(body);
+        LoadGpr(body, layout, RS(ins));
+        if (xo == 284)  // eqv = ~(a ^ b)
+        {
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32Xor);
+          emit_not();
+        }
+        else
+        {
+          LoadGpr(body, layout, RB(ins));
+          if (xo == 60 || xo == 412)
+            emit_not();  // andc / orc complement only the second operand
+          body.push_back((xo == 60) ? kI32And
+                                    : (xo == 412) ? kI32Or
+                                                  : (xo == 124) ? kI32Or : kI32And);
+          if (xo == 124 || xo == 476)
+            emit_not();  // nor / nand complement the result
+        }
+        EndStoreGpr(body, layout, RA(ins));
+        handled = true;
+        break;
+      }
+      if (xo == 235)  // mullw rD, rA, rB -- low 32 bits of the product
+      {
+        BeginStoreGpr(body);
+        LoadGpr(body, layout, RA(ins));
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kI32Mul);
+        EndStoreGpr(body, layout, RS(ins));
+        handled = true;
+        break;
+      }
+
+      if (xo == 24 || xo == 536)  // slw, srw
+      {
+        // PowerPC uses a SIX-bit shift count and yields zero when it is 32 or
+        // more. WebAssembly's i32.shl masks the count to five bits, so a
+        // shift of 32 becomes a shift of 0 -- the value passes through
+        // unchanged where the guest expects it cleared.
+        //
+        // The result is masked by (((rB >> 5) & 1) - 1), which is 0 when bit
+        // five is set and -1 otherwise. Branchless, and it costs three
+        // instructions on a path that is common enough to matter.
+        BeginStoreGpr(body);
+        LoadGpr(body, layout, RS(ins));
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kI32Const);
+        PutI32(body, 31);
+        body.push_back(kI32And);
+        body.push_back((xo == 24) ? kI32Shl : kI32ShrU);
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kI32Const);
+        PutI32(body, 5);
+        body.push_back(kI32ShrU);
+        body.push_back(kI32Const);
+        PutI32(body, 1);
+        body.push_back(kI32And);
+        body.push_back(kI32Const);
+        PutI32(body, 1);
+        body.push_back(kI32Sub);
+        body.push_back(kI32And);
+        EndStoreGpr(body, layout, RA(ins));
+        handled = true;
+        break;
+      }
+
       uint8_t wasm_op = 0;
       bool swap = false;  // subf computes rB - rA, the reverse of the field order
       switch (xo)
@@ -693,8 +964,6 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       case 444: wasm_op = kI32Or; break;    // or (and mr, which is or rA,rS,rS)
       case 28:  wasm_op = kI32And; break;   // and
       case 316: wasm_op = kI32Xor; break;   // xor
-      case 24:  wasm_op = kI32Shl; break;   // slw
-      case 536: wasm_op = kI32ShrU; break;  // srw
       default: break;
       }
       if (!wasm_op)
@@ -814,9 +1083,10 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       break;
     }
 
-    case 19:  // bclr -- the return instruction
+    case 19:  // bclr (return) and bcctr (indirect branch)
     {
-      if (XO(ins) != 16)
+      const bool via_ctr = (XO(ins) == 528);
+      if (XO(ins) != 16 && !via_ctr)
         break;
       const uint32_t bo = RS(ins);
       const uint32_t bi = RA(ins);
@@ -826,14 +1096,17 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       const uint32_t this_pc = start_pc + n * 4;
       const bool link = (ins & 1) != 0;
 
-      // Read the link register BEFORE any write to it: bclrl both branches
-      // to the old LR and replaces it, and doing those in the wrong order
-      // makes a call return to itself.
+      // Read the target register BEFORE any write to the link register:
+      // bclrl both branches to the old LR and replaces it, and doing those in
+      // the wrong order makes a call return to itself. bcctr reads CTR, which
+      // the link write cannot disturb, but the same shape is used so there is
+      // one ordering to get right rather than two.
       body.push_back(kLocalGet);
       PutU32(body, 0);
       body.push_back(kI32Load);
       PutU32(body, 2);
-      PutU32(body, layout.spr_offset + layout.lr_index * 4);
+      PutU32(body, layout.spr_offset +
+                       (via_ctr ? layout.ctr_index : layout.lr_index) * 4);
       // The low two bits are not part of the address.
       body.push_back(kI32Const);
       PutI32(body, -4);
@@ -869,119 +1142,46 @@ inline BlockResult CompileBlock(const uint32_t* code, uint32_t start_pc, uint32_
       break;
     }
 
-    case 37:  // stwu rS, d(rA) -- store and write the address back
-    {
-      // rA == 0 is an invalid form: there would be no register to update.
-      if (RA(ins) == 0)
-        break;
-      const uint32_t this_pc = start_pc + n * 4;
-      EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
-      EmitGuard(body, layout, 1, this_pc, n);
-      // Keep the GUEST address: it is what gets written back, not the host
-      // address the store uses.
-      body.push_back(kLocalGet);
-      PutU32(body, 1);
-      body.push_back(kLocalSet);
-      PutU32(body, 3);
-      EmitToHostAddress(body, layout, 1);
-      LoadGpr(body, layout, RS(ins));
-      body.push_back(kLocalSet);
-      PutU32(body, 2);
-      for (int byte = 0; byte < 4; ++byte)
-      {
-        body.push_back(kLocalGet);
-        PutU32(body, 1);
-        body.push_back(kLocalGet);
-        PutU32(body, 2);
-        const int shift = 24 - byte * 8;
-        if (shift)
-        {
-          body.push_back(kI32Const);
-          PutI32(body, shift);
-          body.push_back(kI32ShrU);
-        }
-        body.push_back(kI32Store8);
-        PutU32(body, 0);
-        PutU32(body, static_cast<uint32_t>(byte));
-      }
+    case 7:  // mulli rD, rA, SIMM
       BeginStoreGpr(body);
-      body.push_back(kLocalGet);
-      PutU32(body, 3);
-      EndStoreGpr(body, layout, RA(ins));
-      used_locals = used_locals < 4 ? 4 : used_locals;
-      handled = true;
-      break;
-    }
-
-    case 32:  // lwz rD, d(rA)
-    case 34:  // lbz rD, d(rA)
-    {
-      const uint32_t this_pc = start_pc + n * 4;
-      EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
-      EmitGuard(body, layout, 1, this_pc, n);
-      EmitToHostAddress(body, layout, 1);
-      BeginStoreGpr(body);
-      if (op == 32)
-      {
-        EmitLoadBE32(body, 1);
-      }
-      else
-      {
-        body.push_back(kLocalGet);
-        PutU32(body, 1);
-        body.push_back(kI32Load8U);
-        PutU32(body, 0);
-        PutU32(body, 0);
-      }
+      LoadGpr(body, layout, RA(ins));
+      body.push_back(kI32Const);
+      PutI32(body, SIMM(ins));
+      body.push_back(kI32Mul);
       EndStoreGpr(body, layout, RS(ins));
-      used_locals = 2;
       handled = true;
       break;
-    }
 
-    case 36:  // stw rS, d(rA)
-    case 38:  // stb rS, d(rA)
+    // ── integer loads and stores, displacement form ──
+    case 32: case 33: case 34: case 35: case 40: case 41: case 42: case 43:
+    case 36: case 37: case 38: case 39: case 44: case 45:
     {
-      const uint32_t this_pc = start_pc + n * 4;
-      EmitEffectiveAddress(body, layout, RA(ins), SIMM(ins), 1);
-      EmitGuard(body, layout, 1, this_pc, n);
-      EmitToHostAddress(body, layout, 1);
-      // Keep the value in a local: a byte-order store reads it four times,
-      // and the wasm stack cannot be indexed.
-      LoadGpr(body, layout, RS(ins));
-      body.push_back(kLocalSet);
-      PutU32(body, 2);
-      if (op == 36)
+      struct Form { int size; bool store, sign, update; };
+      Form form{};
+      switch (op)
       {
-        for (int byte = 0; byte < 4; ++byte)
-        {
-          body.push_back(kLocalGet);
-          PutU32(body, 1);
-          body.push_back(kLocalGet);
-          PutU32(body, 2);
-          const int shift = 24 - byte * 8;
-          if (shift)
-          {
-            body.push_back(kI32Const);
-            PutI32(body, shift);
-            body.push_back(kI32ShrU);
-          }
-          body.push_back(kI32Store8);
-          PutU32(body, 0);
-          PutU32(body, static_cast<uint32_t>(byte));
-        }
+      case 32: form = {4, false, false, false}; break;  // lwz
+      case 33: form = {4, false, false, true};  break;  // lwzu
+      case 34: form = {1, false, false, false}; break;  // lbz
+      case 35: form = {1, false, false, true};  break;  // lbzu
+      case 40: form = {2, false, false, false}; break;  // lhz
+      case 41: form = {2, false, false, true};  break;  // lhzu
+      case 42: form = {2, false, true,  false}; break;  // lha
+      case 43: form = {2, false, true,  true};  break;  // lhau
+      case 36: form = {4, true,  false, false}; break;  // stw
+      case 37: form = {4, true,  false, true};  break;  // stwu
+      case 38: form = {1, true,  false, false}; break;  // stb
+      case 39: form = {1, true,  false, true};  break;  // stbu
+      case 44: form = {2, true,  false, false}; break;  // sth
+      case 45: form = {2, true,  false, true};  break;  // sthu
+      default: break;
       }
-      else
-      {
-        body.push_back(kLocalGet);
-        PutU32(body, 1);
-        body.push_back(kLocalGet);
-        PutU32(body, 2);
-        body.push_back(kI32Store8);
-        PutU32(body, 0);
-        PutU32(body, 0);
-      }
-      used_locals = 3;
+      // An update form with rA == 0 has no register to write back.
+      if (form.update && RA(ins) == 0)
+        break;
+      EmitMemOp(body, layout, start_pc + n * 4, n, RA(ins), 0, SIMM(ins), false, RS(ins),
+                form.size, form.store, form.sign, form.update);
+      used_locals = used_locals < 4 ? 4 : used_locals;
       handled = true;
       break;
     }
