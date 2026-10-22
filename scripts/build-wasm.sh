@@ -10,7 +10,6 @@ cd "$(dirname "$0")/.."
   echo "Emscripten not found; expected ~/emsdk/emsdk_env.sh" >&2; exit 1; }
 
 BUILD_DIR=dolphin-web/build-wasm
-TARGET="${1:-common}"
 
 # Apply the wasm port patches. Reverse-check first so re-runs are idempotent.
 for p in dolphin-web/patches/000[23456]-*.patch; do
@@ -50,6 +49,10 @@ emcmake cmake -S dolphin -B "$BUILD_DIR" -G Ninja \
   -DUSE_MGBA=OFF -DUSE_RETRO_ACHIEVEMENTS=OFF -DUSE_DISCORD_PRESENCE=OFF \
   -DENABLE_VULKAN=OFF -DENABLE_SDL=OFF
 
-ninja -C "$BUILD_DIR" "$TARGET"
+# Several targets, not one. "all" is NOT usable here: it includes
+# dolphin-tool, an executable that does not link for wasm32 -- libusb has
+# no backend and Thread.cpp wants pthread_setname_np. The libraries build
+# fine; it is only the executables that do not.
+ninja -C "$BUILD_DIR" "${@:-common}"
 echo
 ls -la "$BUILD_DIR"/Source/Core/*/lib*.a 2>/dev/null || true

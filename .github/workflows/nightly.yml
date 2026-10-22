@@ -167,13 +167,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
       - name: build Dolphin for wasm32
-        # "all", explicitly. scripts/build-wasm.sh takes a ninja target and
-        # DEFAULTS TO `common`, which is the right default for someone
-        # iterating on the port and the wrong one here: link.sh names a
-        # fixed list of static archives, and the first run of this job died
-        # on "libcore.a: No such file or directory" having built exactly
-        # one library.
-        run: scripts/build-wasm.sh all
+        # The libraries link.sh names, by target, and NOT `all`.
+        #
+        # scripts/build-wasm.sh defaults to `common`, which is right for
+        # someone iterating on the port and wrong here -- the first run of
+        # this job died on "libcore.a: No such file or directory" having
+        # built one library. `all` was the obvious correction and is also
+        # wrong: it includes dolphin-tool, an executable that does not link
+        # for wasm32 because libusb has no backend and Thread.cpp wants
+        # pthread_setname_np. The libraries build; only the executables do
+        # not, and nothing here needs an executable.
+        run: >-
+          scripts/build-wasm.sh core videocommon videonull videosoftware
+          videoogl audiocommon inputcommon discio uicommon common
 
       - name: the four differentials
         # run-jitdiff.sh builds jitdiff.cpp against those libraries and runs
