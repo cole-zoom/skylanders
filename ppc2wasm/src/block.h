@@ -52,6 +52,10 @@ struct BlockResult
   // with no table and no PC compare.
   Bytes body;
   uint32_t locals = 0;
+  // 64-bit scratch locals, declared after the i32 ones. Non-zero only for
+  // blocks with floating-point or multi-word forms, and then the i32 count
+  // is always 8 so that these are locals 9 and 10.
+  uint32_t locals_i64 = 0;
   uint32_t instructions;  // PowerPC instructions translated
   uint32_t end_pc;        // where the interpreter should resume
   const char* stopped_on; // why the block ended, for diagnostics
@@ -146,6 +150,55 @@ struct StateLayout
   // state with the interpreter, so it has to produce that same encoding --
   // and the least error-prone way is to use the very same table rather than
   // re-deriving it.
+  // ── more of the address space than MEM1 ──
+  //
+  // When non-zero, the host address of a 128-entry table of u32 host bases
+  // indexed by the top seven bits of a guest address (32 MB granules). An
+  // access translates as table[ea >> 25] + (ea & 0x01FFFFFF), and a zero
+  // entry means "not memory this code may touch" and bails exactly as the
+  // MEM1 guard did. One table load replaces one compare, and the same code
+  // now reaches MEM1, MEM2 and both of their uncached mirrors, which is
+  // where a Wii game keeps its thread stacks and most of its heap.
+  //
+  // Measured with idle loops skipped, 21 of 40 million interpreted
+  // instructions were loads and stores to MEM2, interpreted forever
+  // because the block holding them refused on its first instruction and
+  // was retired. This is what that measurement asked for.
+  //
+  // Zero keeps the MEM1-only guard, which the existing differentials were
+  // written against.
+  uint32_t region_table = 0;
+  uint32_t xer_ca_offset = 0;    // offsetof(PowerPCState, xer_ca)
+  uint32_t xer_stringctrl_offset = 0;  // offsetof(PowerPCState, xer_stringctrl)
+  // Floating point. ps[] is 32 PairedSingle of two u64 each (ps0 at +0,
+  // ps1 at +8); fpscr is the 32-bit status register. Zero disables every
+  // floating-point form, since 0 is the PC's offset.
+  uint32_t ps_offset = 0;
+  uint32_t fpscr_offset = 0;
+  // The reservation lwarx sets and stwcx. tests: a bool and a u32 in guest
+  // state. Zero disables both forms.
+  uint32_t reserve_offset = 0;
+  uint32_t reserve_address_offset = 0;
+  // The time base, for mftb. Four host addresses into CoreTiming's Globals
+  // struct, read at run time: the value is start_value + (ticks -
+  // start_ticks) / 12, where ticks = global_timer + slice_length -
+  // downcount, exactly as CoreTiming::GetTicks and SystemTimers::
+  // GetFakeTimeBase compute it. This assumes the CPU overclock factor is
+  // 1.0, which is what DowncountToCycles multiplies by; the caller leaves
+  // these zero when it is not, and mftb goes to the interpreter.
+  uint32_t tb_global_timer_addr = 0;
+  uint32_t tb_slice_length_addr = 0;
+  uint32_t tb_start_value_addr = 0;
+  uint32_t tb_start_ticks_addr = 0;
+  // When the data cache is being emulated, dcbz and the cache-control
+  // instructions go through Dolphin's cache model and are left to the
+  // interpreter. When it is not, dcbf/dcbst/dcbi/dcbt are no-ops here,
+  // exactly as they are in the interpreter, and dcbz zeroes 32 bytes.
+  bool dcache_enabled = false;
+  // Dolphin's "low dcbz hack" turns dcbz into a no-op below 0x80008000.
+  // A game-specific option; when it is on, dcbz is left to the interpreter.
+  bool low_dcbz_hack = false;
+
   uint32_t cr_offset = 0;        // offsetof(PowerPCState, cr)
   uint32_t xer_so_ov_offset = 0; // offsetof(PowerPCState, xer_so_ov)
   uint32_t cr_table_base = 0;    // host address of ConditionRegister::s_crTable
@@ -196,6 +249,82 @@ struct StateLayout
   // matches" from "the budget runs out" -- three different causes with three
   // different fixes.
   uint32_t link_stats_addr = 0;
+
+  // ── mtmsr without leaving the chain ──
+  //
+  // Measured over an 800M-instruction boot, 24.4 million of 32.5 million
+  // dispatcher round-trips were mtmsr exits: the OS toggles MSR[EE] around
+  // every critical section, and each toggle used to cost a full trip
+  // through C++ -- MSRUpdated, CheckExceptions, the cache lookup and a
+  // fresh indirect call -- at roughly 25 ns each, which is more than the
+  // instructions around it cost to run.
+  //
+  // Almost none of those trips did anything. What the interpreter does
+  // after the write only MATTERS when (a) a bit that changes address
+  // translation or FP exception mode flipped, (b) EE was enabled while an
+  // interrupt is pending, or (c) a page table update is waiting on DR.
+  // With this set, the block tests exactly those three things and only
+  // exits when one holds; otherwise the chain carries on. The dispatcher
+  // still does the full fix-up on the exits that remain.
+  bool mtmsr_continue = false;
+  uint32_t exceptions_offset = 0;         // offsetof(PowerPCState, Exceptions)
+  uint32_t pagetable_pending_offset = 0;  // offsetof(PowerPCState, pagetable_update_pending)
+
+  // ── idle loops ──
+  //
+  // The 800M-instruction boot ends in `lwz r0,0x248(r13); cmpwi r0,0;
+  // beq -8`, and that loop is about half of everything executed. Nothing
+  // inside it can change its own outcome: only an interrupt can set the
+  // flag, and interrupts only arrive when the chain returns and the
+  // emulated clock advances. Spinning until the budget runs out is
+  // therefore pure waste, and every emulator skips it -- Dolphin's
+  // IsBusyWaitLoop is the rule copied here.
+  //
+  // When set, a block whose closing conditional branch targets its own
+  // first instruction, and whose body is loads and integer arithmetic
+  // that never write a register they read first, takes a different taken
+  // edge: it writes 1 to this address and returns its own PC. The
+  // dispatcher then hands the rest of the slice to CoreTiming::Idle, so
+  // the next event fires immediately instead of after a few hundred more
+  // iterations of a loop whose result is already known.
+  uint32_t idle_flag_addr = 0;
+
+  // ── the interpreter, in place ──
+  //
+  // When set, an instruction this compiler has no translation for does not
+  // end the block: the block calls an imported host function,
+  //
+  //   env.ppc_interp_op(state, instruction, pc) -> i32
+  //
+  // which runs the interpreter's own handler for that one instruction on
+  // the shared guest state, exactly as Interpreter::SingleStepInner would,
+  // and returns non-zero when control did not simply fall through -- an
+  // exception was taken, or the instruction branched. The block then
+  // leaves with whatever PC the interpreter set. Otherwise the block
+  // carries on as if it had translated the instruction itself.
+  //
+  // Measured over 3 billion instructions with the game past its boot, 52
+  // million instructions were interpreted, each one ending a block, going
+  // through the dispatcher and paying the interpreter's full per-step
+  // overhead. Most were floating point, and all of them run through this
+  // call instead -- with the interpreter's semantics, bit for bit, because
+  // it IS the interpreter.
+  //
+  // The import is function index 0, so every direct call between blocks
+  // must add one (ModuleBuilder::ImportCount) to the index it patches in.
+  // Branches, mtmsr and the forms translated inline never take this path.
+  bool interp_hatch = false;
+  uint32_t pc_offset = 0;  // offsetof(PowerPCState, pc)
+  // With the hatch, a load or store whose address is in the hardware
+  // register space -- 0xCC00xxxx and 0xCD00xxxx, above all the GX
+  // write-gather pipe at 0xCC008000 that every graphics command goes
+  // through -- runs through the interpreter in place instead of bailing.
+  // Other addresses outside RAM still bail. A bail ended the chain
+  // and, on the first instruction of a block, retired the block for good:
+  // measured past the boot, the stores to the gather pipe were a third
+  // of everything still interpreted. Off, the bail stays, which the chain
+  // differential relies on to exercise that path.
+  bool hatch_mmio = false;
 };
 
 namespace detail
@@ -338,6 +467,163 @@ inline void EmitToHostAddress(Bytes& b, const StateLayout& l, uint32_t ea_local)
   b.push_back(kI32And);
   b.push_back(kI32Const);
   PutI32(b, static_cast<int32_t>(l.ram_base));
+  b.push_back(kI32Add);
+  b.push_back(kLocalSet);
+  PutU32(b, ea_local);
+}
+
+// Emit: push 1 if the guest address in ea_local is in the hardware
+// register space -- 0xCC00xxxx, 0xCD00xxxx or 0xCD80xxxx -- which is the
+// only space outside RAM the interpreter can be handed an access to. The
+// EFB (0xC8000000) needs a video backend, and an address in the gaps
+// between the device blocks indexes the MMIO handler table out of bounds
+// in a release build. The hatch takes the first; everything else bails.
+inline void EmitIsMmio(Bytes& b, uint32_t ea_local)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, ea_local);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(0xFF7F0000u));  // 0xCC00xxxx and 0xCD00xxxx share this mask
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(0xCC000000u));
+  b.push_back(kI32Eq);
+  b.push_back(kLocalGet);
+  PutU32(b, ea_local);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(0xFFFF0000u));
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(0xCD800000u));
+  b.push_back(kI32Eq);
+  b.push_back(kI32Or);
+}
+
+// Call the interpreter for `ins` at `pc` (StateLayout::interp_hatch) and,
+// if control did not simply advance, charge the budget and leave with the
+// PC the interpreter set. Leaves nothing on the stack.
+inline void EmitHatchCall(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc,
+                          uint32_t insts_before)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(ins));
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(pc));
+  b.push_back(kCall);
+  PutU32(b, 0);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  if (l.enable_linking)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.downcount_offset);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(insts_before + 1));
+    b.push_back(kI32Sub);
+    b.push_back(kI32Store);
+    PutU32(b, 2);
+    PutU32(b, l.downcount_offset);
+  }
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.pc_offset);
+  b.push_back(kReturn);
+  b.push_back(kEnd);
+}
+
+// Check the guest address in ea_local and replace it with the host address,
+// through the region table when there is one and the MEM1 guard otherwise.
+//
+// When `ins` is non-zero and the hatch handles MMIO, an address outside RAM
+// runs the whole instruction through the interpreter and then branches
+// `skip_depth` levels out -- past the rest of the instruction's own code,
+// which the caller has wrapped in a block for the purpose.
+// `scratch_local` holds the table entry for a moment; it may be any local
+// the caller is not using yet.
+inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
+                          uint32_t scratch_local, uint32_t bail_pc, uint32_t insts_before,
+                          uint32_t ins = 0, uint32_t skip_depth = 0)
+{
+  const bool via_hatch = l.interp_hatch && l.hatch_mmio && ins != 0;
+  if (!l.region_table)
+  {
+    // The MEM1-only guard, with the same choice of what to do on a miss.
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.guard_mask));
+    b.push_back(kI32And);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.guard_value));
+    b.push_back(kI32Ne);
+    b.push_back(kIf);
+    b.push_back(kVoid);
+    if (via_hatch)
+    {
+      EmitIsMmio(b, ea_local);
+      b.push_back(kIf);
+      b.push_back(kVoid);
+      EmitHatchCall(b, l, ins, bail_pc, insts_before);
+      b.push_back(kBr);
+      PutU32(b, skip_depth + 2);  // out of this if, the outer if, and the caller's block
+      b.push_back(kEnd);
+    }
+    EmitBailBody(b, l, bail_pc, insts_before);
+    b.push_back(kEnd);
+    EmitToHostAddress(b, l, ea_local);
+    return;
+  }
+  // base = table[ea >> 25]
+  b.push_back(kLocalGet);
+  PutU32(b, ea_local);
+  b.push_back(kI32Const);
+  PutI32(b, 25);
+  b.push_back(kI32ShrU);
+  b.push_back(kI32Const);
+  PutI32(b, 2);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.region_table));
+  b.push_back(kI32Add);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, 0);
+  b.push_back(kLocalTee);
+  PutU32(b, scratch_local);
+  b.push_back(kI32Eqz);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  if (via_hatch)
+  {
+    // The hardware registers go to the interpreter; anything else outside
+    // RAM still bails, exactly as without the hatch.
+    EmitIsMmio(b, ea_local);
+    b.push_back(kIf);
+    b.push_back(kVoid);
+    EmitHatchCall(b, l, ins, bail_pc, insts_before);
+    b.push_back(kBr);
+    PutU32(b, skip_depth + 2);  // out of this if, the outer if, and the caller's block
+    b.push_back(kEnd);
+  }
+  EmitBailBody(b, l, bail_pc, insts_before);
+  b.push_back(kEnd);
+  // ea = base + (ea & 0x01FFFFFF)
+  b.push_back(kLocalGet);
+  PutU32(b, scratch_local);
+  b.push_back(kLocalGet);
+  PutU32(b, ea_local);
+  b.push_back(kI32Const);
+  PutI32(b, 0x01FFFFFF);
+  b.push_back(kI32And);
   b.push_back(kI32Add);
   b.push_back(kLocalSet);
   PutU32(b, ea_local);
@@ -614,7 +900,7 @@ inline void EmitUpdateCR0(Bytes& b, const StateLayout& l, uint32_t reg)
 inline int RcDestination(uint32_t ins)
 {
   const uint32_t op = Opcode(ins);
-  if (op == 21)  // rlwinm
+  if (op == 21 || op == 20 || op == 23)  // rlwinm, rlwimi, rlwnm
     return static_cast<int>(RA(ins));
   if (op != 31)
     return -1;
@@ -624,6 +910,16 @@ inline int RcDestination(uint32_t ins)
   case 40:   // subf
   case 235:  // mullw
   case 104:  // neg
+  case 10:   // addc
+  case 8:    // subfc
+  case 138:  // adde
+  case 136:  // subfe
+  case 202:  // addze
+  case 200:  // subfze
+  case 491:  // divw
+  case 459:  // divwu
+  case 75:   // mulhw
+  case 11:   // mulhwu
     return static_cast<int>(RS(ins));
   case 28:   // and
   case 444:  // or
@@ -638,10 +934,31 @@ inline int RcDestination(uint32_t ins)
   case 954:  // extsb
   case 922:  // extsh
   case 26:   // cntlzw
+  case 824:  // srawi
+  case 792:  // sraw
     return static_cast<int>(RA(ins));
   default:
     return -1;
   }
+}
+
+// Store a 0/1 already on the stack into XER[CA]. The address must have been
+// pushed BEFORE the value, so callers emit `local.get 0` first, then the
+// value, then this.
+inline void EmitEndStoreCA(Bytes& b, const StateLayout& l)
+{
+  b.push_back(kI32Store8);
+  PutU32(b, 0);
+  PutU32(b, l.xer_ca_offset);
+}
+
+inline void EmitLoadCA(Bytes& b, const StateLayout& l)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load8U);
+  PutU32(b, 0);
+  PutU32(b, l.xer_ca_offset);
 }
 
 // Store a value into an SPR (used for the link register).
@@ -1008,6 +1325,580 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
   PutU32(b, 4);
 }
 
+// Byte-swap the i32 in `local`, leaving the result on the stack. See the
+// note in EmitMemOp for the rotate trick.
+inline void EmitBswap32(Bytes& b, uint32_t local)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI32Const);
+  PutI32(b, 0x00FF00FF);
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, 8);
+  b.push_back(kI32Rotr);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(0xFF00FF00u));
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, 8);
+  b.push_back(kI32Rotl);
+  b.push_back(kI32Or);
+}
+
+// Byte-swap the i64 in `local`, leaving the result on the stack: swap
+// adjacent bytes, then adjacent halfwords, then the two words.
+inline void EmitBswap64(Bytes& b, uint32_t local)
+{
+  auto step = [&](int64_t mask, int32_t shift) {
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI64Const);
+    PutI64(b, mask);
+    b.push_back(kI64And);
+    b.push_back(kI64Const);
+    PutI64(b, shift);
+    b.push_back(kI64Shl);
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI64Const);
+    PutI64(b, shift);
+    b.push_back(kI64ShrU);
+    b.push_back(kI64Const);
+    PutI64(b, mask);
+    b.push_back(kI64And);
+    b.push_back(kI64Or);
+    b.push_back(kLocalSet);
+    PutU32(b, local);
+  };
+  step(static_cast<int64_t>(0x00FF00FF00FF00FFull), 8);
+  step(static_cast<int64_t>(0x0000FFFF0000FFFFull), 16);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI64Const);
+  PutI64(b, 32);
+  b.push_back(kI64Rotl);
+}
+
+// Dolphin's ConvertToDouble (Interpreter_FPUtils.h), the PowerPC rule for
+// loading a single: the i32 in `local` becomes the i64 bit pattern of the
+// double on the stack. Not f64.promote_f32 -- that would quiet a
+// signalling NaN, and the guest keeps it signalling. Uses i32 locals 5 and
+// 6 as scratch; they belong to the link epilogue and are dead here.
+inline void EmitConvertToDouble(Bytes& b, uint32_t local)
+{
+  // exp -> local 5, frac -> local 6
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI32Const);
+  PutI32(b, 23);
+  b.push_back(kI32ShrU);
+  b.push_back(kI32Const);
+  PutI32(b, 0xFF);
+  b.push_back(kI32And);
+  b.push_back(kLocalSet);
+  PutU32(b, 5);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI32Const);
+  PutI32(b, 0x007FFFFF);
+  b.push_back(kI32And);
+  b.push_back(kLocalSet);
+  PutU32(b, 6);
+  // subnormal: exp == 0 && frac != 0
+  b.push_back(kLocalGet);
+  PutU32(b, 5);
+  b.push_back(kI32Eqz);
+  b.push_back(kLocalGet);
+  PutU32(b, 6);
+  b.push_back(kI32Const);
+  PutI32(b, 0);
+  b.push_back(kI32Ne);
+  b.push_back(kI32And);
+  b.push_back(kIf);
+  b.push_back(kI64);
+  {
+    // shift = clz(frac) - 8 brings the leading one to bit 23, which is
+    // what the interpreter's loop does one bit at a time.
+    b.push_back(kLocalGet);
+    PutU32(b, 6);
+    b.push_back(kI32Clz);
+    b.push_back(kI32Const);
+    PutI32(b, 8);
+    b.push_back(kI32Sub);
+    b.push_back(kLocalSet);
+    PutU32(b, 5);
+    // ((x & 0x80000000) << 32)
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(0x80000000u));
+    b.push_back(kI32And);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 32);
+    b.push_back(kI64Shl);
+    // | ((897 - shift) << 52)
+    b.push_back(kI32Const);
+    PutI32(b, 897);
+    b.push_back(kLocalGet);
+    PutU32(b, 5);
+    b.push_back(kI32Sub);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 52);
+    b.push_back(kI64Shl);
+    b.push_back(kI64Or);
+    // | (((frac << shift) & 0x7fffff) << 29)
+    b.push_back(kLocalGet);
+    PutU32(b, 6);
+    b.push_back(kLocalGet);
+    PutU32(b, 5);
+    b.push_back(kI32Shl);
+    b.push_back(kI32Const);
+    PutI32(b, 0x007FFFFF);
+    b.push_back(kI32And);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 29);
+    b.push_back(kI64Shl);
+    b.push_back(kI64Or);
+  }
+  b.push_back(kElse);
+  {
+    // ((x & 0xc0000000) << 32) | (y * 0x3800000000000000) | ((x & 0x3fffffff) << 29)
+    // with y = (exp == 255) | (1 <= exp <= 127): the interpreter's !(exp >> 7)
+    // for normals and exp >> 7 for the zero/inf/NaN exponents.
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(0xC0000000u));
+    b.push_back(kI32And);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 32);
+    b.push_back(kI64Shl);
+    b.push_back(kLocalGet);
+    PutU32(b, 5);
+    b.push_back(kI32Const);
+    PutI32(b, 255);
+    b.push_back(kI32Eq);
+    b.push_back(kLocalGet);
+    PutU32(b, 5);
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32Sub);
+    b.push_back(kI32Const);
+    PutI32(b, 127);
+    b.push_back(kI32LtU);
+    b.push_back(kI32Or);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, static_cast<int64_t>(0x3800000000000000ull));
+    b.push_back(kI64Mul);
+    b.push_back(kI64Or);
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI32Const);
+    PutI32(b, 0x3FFFFFFF);
+    b.push_back(kI32And);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 29);
+    b.push_back(kI64Shl);
+    b.push_back(kI64Or);
+  }
+  b.push_back(kEnd);
+}
+
+// Dolphin's ConvertToSingle: the i64 double bit pattern in `local` (an i64
+// local) becomes the i32 single bit pattern on the stack. Truncation, not
+// rounding -- stfs on this CPU drops the extra mantissa bits -- with the
+// denormal-single range handled the way hardware tests say it is. Uses i32
+// local 5 as scratch.
+inline void EmitConvertToSingle(Bytes& b, uint32_t local)
+{
+  // exp -> local 5
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI64Const);
+  PutI64(b, 52);
+  b.push_back(kI64ShrU);
+  b.push_back(kI32WrapI64);
+  b.push_back(kI32Const);
+  PutI32(b, 0x7FF);
+  b.push_back(kI32And);
+  b.push_back(kLocalSet);
+  PutU32(b, 5);
+  // denormal single: 874 <= exp <= 896, and not (plus or minus) zero
+  b.push_back(kLocalGet);
+  PutU32(b, 5);
+  b.push_back(kI32Const);
+  PutI32(b, 874);
+  b.push_back(kI32Sub);
+  b.push_back(kI32Const);
+  PutI32(b, 23);
+  b.push_back(kI32LtU);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI64Const);
+  PutI64(b, 0x7FFFFFFFFFFFFFFFll);
+  b.push_back(kI64And);
+  b.push_back(kI64Eqz);
+  b.push_back(kI32Eqz);
+  b.push_back(kI32And);
+  b.push_back(kIf);
+  b.push_back(kI32);
+  {
+    // t = (0x80000000 | ((x & FRAC) >> 21)) >> (905 - exp); t |= sign
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI64Const);
+    PutI64(b, 0x000FFFFFFFFFFFFFll);
+    b.push_back(kI64And);
+    b.push_back(kI64Const);
+    PutI64(b, 21);
+    b.push_back(kI64ShrU);
+    b.push_back(kI32WrapI64);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(0x80000000u));
+    b.push_back(kI32Or);
+    b.push_back(kI32Const);
+    PutI32(b, 905);
+    b.push_back(kLocalGet);
+    PutU32(b, 5);
+    b.push_back(kI32Sub);
+    b.push_back(kI32ShrU);
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI64Const);
+    PutI64(b, 32);
+    b.push_back(kI64ShrU);
+    b.push_back(kI32WrapI64);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(0x80000000u));
+    b.push_back(kI32And);
+    b.push_back(kI32Or);
+  }
+  b.push_back(kElse);
+  {
+    // ((x >> 32) & 0xc0000000) | ((x >> 29) & 0x3fffffff)
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI64Const);
+    PutI64(b, 32);
+    b.push_back(kI64ShrU);
+    b.push_back(kI32WrapI64);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(0xC0000000u));
+    b.push_back(kI32And);
+    b.push_back(kLocalGet);
+    PutU32(b, local);
+    b.push_back(kI64Const);
+    PutI64(b, 29);
+    b.push_back(kI64ShrU);
+    b.push_back(kI32WrapI64);
+    b.push_back(kI32Const);
+    PutI32(b, 0x3FFFFFFF);
+    b.push_back(kI32And);
+    b.push_back(kI32Or);
+  }
+  b.push_back(kEnd);
+}
+
+// CR1 after a floating-point Rc form: FPSCR[FX, FEX, VX, OX], which are the
+// top four bits of FPSCR, through s_crTable (PowerPCState::UpdateCR1).
+inline void EmitUpdateCR1(Bytes& b, const StateLayout& l)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.fpscr_offset);
+  b.push_back(kI32Const);
+  PutI32(b, 28);
+  b.push_back(kI32ShrU);
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.cr_table_base));
+  b.push_back(kI32Add);
+  b.push_back(kI64Load);
+  PutU32(b, 3);
+  PutU32(b, 0);
+  b.push_back(kI64Store);
+  PutU32(b, 3);
+  PutU32(b, l.cr_offset + 8);
+}
+
+// Emit: if (!MSR[FP]) bail. Once per block, before its first floating-point
+// instruction: the Wii's OS switches FP contexts lazily, clearing MSR[FP]
+// on a thread switch and letting the first FP instruction trap, so the
+// bit is genuinely clear sometimes and the interpreter must take that
+// exception. FP is also one of the bits an in-chain mtmsr may not change,
+// so one check per block covers every FP instruction after it.
+inline void EmitFpAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
+                            uint32_t insts_before)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.msr_offset);
+  b.push_back(kI32Const);
+  PutI32(b, 1 << 13);
+  b.push_back(kI32And);
+  b.push_back(kI32Eqz);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  EmitBailBody(b, l, bail_pc, insts_before);
+  b.push_back(kEnd);
+}
+
+// Emit: if (!HID2[PSE]) bail, for the paired-single forms, which are
+// illegal instructions while that bit is clear
+// (Interpreter::IsInvalidPairedSingleExecution). HID2 is SPR 920 and PSE
+// is bit 29.
+inline void EmitPseAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
+                             uint32_t insts_before)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.spr_offset + 920 * 4);
+  b.push_back(kI32Const);
+  PutI32(b, 1 << 29);
+  b.push_back(kI32And);
+  b.push_back(kI32Eqz);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  EmitBailBody(b, l, bail_pc, insts_before);
+  b.push_back(kEnd);
+}
+
+// Floating-point loads and stores. Alignment is checked as the
+// interpreter checks it (a misaligned address is an alignment exception,
+// so the block bails and the interpreter raises it); the data is a word
+// or doubleword in guest byte order; a single is converted on the way in
+// and out with the CPU's own rules; an update form writes the guest
+// address back to rA. stfiwx stores the low word of the register as is.
+//
+// Locals: 1 the address, 2 an i32 scratch, 3 the guest address for an
+// update form, 9 and 10 the i64 scratch.
+inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t insts_before,
+                        uint32_t ra, uint32_t rb, int32_t disp, bool indexed, uint32_t freg,
+                        bool is_double, bool is_store, bool update, bool as_integer,
+                        uint32_t ins = 0)
+{
+  b.push_back(kBlock);
+  b.push_back(kVoid);
+  LoadGprOrZero(b, l, ra);
+  if (indexed)
+  {
+    LoadGpr(b, l, rb);
+    b.push_back(kI32Add);
+  }
+  else if (disp)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, disp);
+    b.push_back(kI32Add);
+  }
+  b.push_back(kLocalSet);
+  PutU32(b, 1);
+  // (ea & 3) != 0 -> alignment exception, the interpreter's business
+  b.push_back(kLocalGet);
+  PutU32(b, 1);
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32And);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  EmitBailBody(b, l, this_pc, insts_before);
+  b.push_back(kEnd);
+  if (update)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kLocalSet);
+    PutU32(b, 3);
+  }
+  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, 0);
+
+  const uint32_t ps0 = l.ps_offset + freg * 16;
+  if (is_store)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 1);  // the address, under the value
+    if (as_integer)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kI32Load);
+      PutU32(b, 2);
+      PutU32(b, ps0);  // the low word of ps0, which is where the host keeps it
+      b.push_back(kLocalSet);
+      PutU32(b, 2);
+      EmitBswap32(b, 2);
+      b.push_back(kI32Store);
+      PutU32(b, 0);
+      PutU32(b, 0);
+    }
+    else if (is_double)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kI64Load);
+      PutU32(b, 3);
+      PutU32(b, ps0);
+      b.push_back(kLocalSet);
+      PutU32(b, 9);
+      EmitBswap64(b, 9);
+      b.push_back(kI64Store);
+      PutU32(b, 0);
+      PutU32(b, 0);
+    }
+    else
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kI64Load);
+      PutU32(b, 3);
+      PutU32(b, ps0);
+      b.push_back(kLocalSet);
+      PutU32(b, 9);
+      EmitConvertToSingle(b, 9);
+      b.push_back(kLocalSet);
+      PutU32(b, 2);
+      EmitBswap32(b, 2);
+      b.push_back(kI32Store);
+      PutU32(b, 0);
+      PutU32(b, 0);
+    }
+  }
+  else if (is_double)
+  {
+    // lfd writes ps0 only.
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kI64Load);
+    PutU32(b, 0);
+    PutU32(b, 0);
+    b.push_back(kLocalSet);
+    PutU32(b, 9);
+    EmitBswap64(b, 9);
+    b.push_back(kI64Store);
+    PutU32(b, 3);
+    PutU32(b, ps0);
+  }
+  else
+  {
+    // lfs fills BOTH halves with the converted double.
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kI32Load);
+    PutU32(b, 0);
+    PutU32(b, 0);
+    b.push_back(kLocalSet);
+    PutU32(b, 2);
+    EmitBswap32(b, 2);
+    b.push_back(kLocalSet);
+    PutU32(b, 2);
+    EmitConvertToDouble(b, 2);
+    b.push_back(kLocalSet);
+    PutU32(b, 9);
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 9);
+    b.push_back(kI64Store);
+    PutU32(b, 3);
+    PutU32(b, ps0);
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 9);
+    b.push_back(kI64Store);
+    PutU32(b, 3);
+    PutU32(b, ps0 + 8);
+  }
+
+  if (update)
+  {
+    BeginStoreGpr(b);
+    b.push_back(kLocalGet);
+    PutU32(b, 3);
+    EndStoreGpr(b, l, ra);
+  }
+  b.push_back(kEnd);
+}
+
+// lmw / stmw: registers rD..r31 to or from consecutive words. One
+// alignment check and one translation for the whole run; the interpreter
+// also refuses a misaligned address, and a run that crossed out of its
+// region would be a guest bug this does not try to emulate.
+inline void EmitLoadStoreMultiple(Bytes& b, const StateLayout& l, uint32_t this_pc,
+                                  uint32_t insts_before, uint32_t ra, int32_t disp, uint32_t rd,
+                                  bool is_store)
+{
+  LoadGprOrZero(b, l, ra);
+  if (disp)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, disp);
+    b.push_back(kI32Add);
+  }
+  b.push_back(kLocalSet);
+  PutU32(b, 1);
+  b.push_back(kLocalGet);
+  PutU32(b, 1);
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32And);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  EmitBailBody(b, l, this_pc, insts_before);
+  b.push_back(kEnd);
+  EmitTranslate(b, l, 1, 2, this_pc, insts_before);
+  for (uint32_t r = rd; r < 32; ++r)
+  {
+    const uint32_t off = (r - rd) * 4;
+    if (is_store)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 1);
+      LoadGpr(b, l, r);
+      b.push_back(kLocalSet);
+      PutU32(b, 2);
+      EmitBswap32(b, 2);
+      b.push_back(kI32Store);
+      PutU32(b, 0);
+      PutU32(b, off);
+    }
+    else
+    {
+      BeginStoreGpr(b);
+      b.push_back(kLocalGet);
+      PutU32(b, 1);
+      b.push_back(kI32Load);
+      PutU32(b, 0);
+      PutU32(b, off);
+      b.push_back(kLocalSet);
+      PutU32(b, 2);
+      EmitBswap32(b, 2);
+      EndStoreGpr(b, l, r);
+    }
+  }
+}
+
 // One emitter for every integer load and store.
 //
 // PowerPC spells these many ways -- displacement or indexed addressing, one
@@ -1020,8 +1911,12 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
 // update form.
 inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t insts_before,
                       uint32_t ra, uint32_t rb, int32_t disp, bool indexed, uint32_t reg,
-                      int size, bool is_store, bool sign_extend, bool update)
+                      int size, bool is_store, bool sign_extend, bool update, uint32_t ins = 0)
 {
+  // Everything after the address computation sits in a block, so that a
+  // translation miss handled by the interpreter can skip it.
+  b.push_back(kBlock);
+  b.push_back(kVoid);
   // Effective address.
   LoadGprOrZero(b, l, ra);
   if (indexed)
@@ -1038,20 +1933,56 @@ inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t
   b.push_back(kLocalSet);
   PutU32(b, 1);
 
-  EmitGuard(b, l, 1, this_pc, insts_before);
-
   if (update)
   {
-    // The GUEST address is written back, not the host one.
+    // The GUEST address is written back, not the host one. Parking it in
+    // a local changes no guest state, so it is safe to do before the
+    // translation decides whether this access bails.
     b.push_back(kLocalGet);
     PutU32(b, 1);
     b.push_back(kLocalSet);
     PutU32(b, 3);
   }
 
-  EmitToHostAddress(b, l, 1);
+  // Local 2 is the value, which is not loaded until after translation, so
+  // it is free to hold the table entry here.
+  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, 0);
 
-  if (is_store)
+  // Words go through ONE load or store and a byte swap built from two
+  // rotates. A 32-bit byte swap is rotr(x & 0x00FF00FF, 8) | rotl(x &
+  // 0xFF00FF00, 8): the even bytes rotate one way, the odd bytes the
+  // other, and each lands where the guest's byte order puts it. Twelve
+  // wasm instructions and one memory access, against fifteen and four
+  // when it was assembled from bytes -- and lwz alone is 17% of the
+  // instruction stream. The alignment hint is 1, which is a hint: an
+  // unaligned address is simply slower, never wrong.
+  auto emit_bswap32_of_local2 = [&]() { EmitBswap32(b, 2); };
+  if (size == 4 && is_store)
+  {
+    LoadGpr(b, l, reg);
+    b.push_back(kLocalSet);
+    PutU32(b, 2);
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    emit_bswap32_of_local2();
+    b.push_back(kI32Store);
+    PutU32(b, 0);  // alignment hint 2^0
+    PutU32(b, 0);
+  }
+  else if (size == 4)
+  {
+    BeginStoreGpr(b);
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kI32Load);
+    PutU32(b, 0);
+    PutU32(b, 0);
+    b.push_back(kLocalSet);
+    PutU32(b, 2);
+    emit_bswap32_of_local2();
+    EndStoreGpr(b, l, reg);
+  }
+  else if (is_store)
   {
     LoadGpr(b, l, reg);
     b.push_back(kLocalSet);
@@ -1114,6 +2045,88 @@ inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t
     PutU32(b, 3);
     EndStoreGpr(b, l, ra);
   }
+  b.push_back(kEnd);
+}
+
+// Which general-purpose registers an instruction reads and writes, for the
+// busy-wait rule -- and whether the instruction is allowed in a busy-wait
+// body at all.
+//
+// Only forms CompileBlockFetch translates need an answer, and the answer
+// is deliberately conservative: anything with a side effect outside the
+// register file (a store, an SPR move, MSR, a branch) is not idle, because
+// skipping the loop would skip the effect.
+//
+// Returns false for "not eligible". `in` and `out` are bitmasks of GPRs.
+inline bool IdleClassify(uint32_t ins, uint32_t* in, uint32_t* out)
+{
+  *in = 0;
+  *out = 0;
+  const auto reg = [](uint32_t r) { return 1u << r; };
+  const uint32_t op = Opcode(ins);
+  switch (op)
+  {
+  case 14: case 15:  // addi, addis -- rA == 0 is literal zero
+    if (RA(ins)) *in |= reg(RA(ins));
+    *out |= reg(RS(ins));
+    return true;
+  case 24: case 25: case 26: case 27:  // ori, oris, xori, xoris
+  case 21:                             // rlwinm
+    *in |= reg(RS(ins));
+    *out |= reg(RA(ins));
+    return true;
+  case 7:  // mulli
+    *in |= reg(RA(ins));
+    *out |= reg(RS(ins));
+    return true;
+  case 10: case 11:  // cmpli, cmpi
+    *in |= reg(RA(ins));
+    return true;
+  case 32: case 34: case 40: case 42:  // lwz, lbz, lhz, lha
+  case 33: case 35: case 41: case 43:  // ... and the update forms
+    if (RA(ins)) *in |= reg(RA(ins));
+    *out |= reg(RS(ins));
+    if (op & 1) *out |= reg(RA(ins));
+    return true;
+  case 31:
+  {
+    const uint32_t xo = XO(ins);
+    switch (xo)
+    {
+    case 0: case 32:  // cmp, cmpl
+      *in |= reg(RA(ins)) | reg(RB(ins));
+      return true;
+    case 23: case 87: case 279: case 343:    // lwzx, lbzx, lhzx, lhax
+    case 55: case 119: case 311: case 375:   // ... update forms
+      if (RA(ins)) *in |= reg(RA(ins));
+      *in |= reg(RB(ins));
+      *out |= reg(RS(ins));
+      if (xo == 55 || xo == 119 || xo == 311 || xo == 375) *out |= reg(RA(ins));
+      return true;
+    case 266: case 40: case 235:  // add, subf, mullw
+      *in |= reg(RA(ins)) | reg(RB(ins));
+      *out |= reg(RS(ins));
+      return true;
+    case 104:  // neg
+      *in |= reg(RA(ins));
+      *out |= reg(RS(ins));
+      return true;
+    case 28: case 444: case 316: case 476: case 124: case 60: case 412: case 284:
+    case 24: case 536:  // and, or, xor, nand, nor, andc, orc, eqv, slw, srw
+      *in |= reg(RS(ins)) | reg(RB(ins));
+      *out |= reg(RA(ins));
+      return true;
+    case 954: case 922: case 26:  // extsb, extsh, cntlzw
+      *in |= reg(RS(ins));
+      *out |= reg(RA(ins));
+      return true;
+    default:
+      return false;  // stores, SPR and MSR moves, anything else
+    }
+  }
+  default:
+    return false;  // stores, branches, everything not listed
+  }
 }
 }  // namespace detail
 
@@ -1166,10 +2179,58 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
   // relationship, and every place that used to say start_pc + n * 4 now
   // says this_pc instead.
   uint32_t cur_pc = start_pc;
+  // The busy-wait rule, tracked as the block is emitted: a register read
+  // before it is written in the loop may never be written in the loop. A
+  // loop that fails it changes its own inputs and is doing real work.
+  bool idle_ok = layout.idle_flag_addr != 0 && layout.enable_linking;
+  uint32_t idle_written = 0, idle_disallowed = 0;
+  // Floating point: whether this block has checked MSR[FP] (and HID2[PSE]
+  // for paired singles) yet, and whether it needs the two i64 locals.
+  bool fp_checked = false, pse_checked = false;
+  uint32_t used_i64 = 0;
+  // The two instructions compiled before the current one, for the mtmsr
+  // peephole below. Zero when there is none.
+  uint32_t prev_ins = 0, prev2_ins = 0;
+  const bool fp_ok = layout.ps_offset != 0 && layout.fpscr_offset != 0;
+  auto need_fp = [&](uint32_t pc, uint32_t before) {
+    if (!fp_checked)
+      EmitFpAvailable(body, layout, pc, before);
+    fp_checked = true;
+    used_i64 = 2;
+  };
+  auto need_pse = [&](uint32_t pc, uint32_t before) {
+    need_fp(pc, before);
+    if (!pse_checked)
+      EmitPseAvailable(body, layout, pc, before);
+    pse_checked = true;
+  };
   while (n < max_insts)
   {
     const uint32_t this_pc = cur_pc;
     const uint32_t ins = fetch(this_pc);
+    // Classify for the idle rule BEFORE the instruction is emitted, since
+    // the switch below `break`s out of several nested scopes.
+    if (idle_ok && ins != 0x60000000u)  // nop is `ori r0,r0,0` and would fail the rule
+    {
+      uint32_t idle_in = 0, idle_out = 0;
+      if (Opcode(ins) == 16 || !IdleClassify(ins, &idle_in, &idle_out))
+      {
+        // A conditional branch is only fine as the CLOSING branch, which is
+        // decided where it is emitted; any other branch, or any form with
+        // side effects, disqualifies the block. The flag is checked at the
+        // branch before this update lands, so the closing branch itself
+        // does not trip it.
+        if (Opcode(ins) != 16)
+          idle_ok = false;
+      }
+      else
+      {
+        idle_disallowed |= idle_in & ~idle_written;
+        if (idle_out & idle_disallowed)
+          idle_ok = false;
+        idle_written |= idle_out;
+      }
+    }
     // Set by a handler that FOLLOWED a transfer: it has advanced n and
     // cur_pc itself, and the block carries on at the target.
     bool followed = false;
@@ -1237,13 +2298,292 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       break;
     }
 
+    // ── the carry forms with an immediate ──
+    //
+    // XER[CA] lives in its own byte of guest state (xer_ca), and the
+    // interpreter's Helper_Carry(a, b) is "a + b overflows", which is the
+    // unsigned test (a + b) < a. Each form below computes the result into
+    // a local first so the carry can be derived from it.
+    //
+    // Measured with idle loops skipped: subfic was 6.2 million interpreted
+    // instructions and addic. 1.8 million, the first and third largest
+    // lines of what the interpreter was left holding.
+    case 12:  // addic  rD, rA, SIMM
+    case 13:  // addic. -- the Rc is implicit, NOT bit 0 of the instruction
+    {
+      if (!layout.xer_ca_offset)
+        break;
+      LoadGpr(body, layout, RA(ins));
+      body.push_back(kLocalSet);
+      PutU32(body, 1);
+      BeginStoreGpr(body);
+      body.push_back(kLocalGet);
+      PutU32(body, 1);
+      body.push_back(kI32Const);
+      PutI32(body, SIMM(ins));
+      body.push_back(kI32Add);
+      body.push_back(kLocalTee);
+      PutU32(body, 2);
+      EndStoreGpr(body, layout, RS(ins));
+      // CA = result <u a
+      body.push_back(kLocalGet);
+      PutU32(body, 0);
+      body.push_back(kLocalGet);
+      PutU32(body, 2);
+      body.push_back(kLocalGet);
+      PutU32(body, 1);
+      body.push_back(kI32LtU);
+      EmitEndStoreCA(body, layout);
+      if (op == 13)
+        EmitUpdateCR0(body, layout, RS(ins));
+      used_locals = used_locals < 3 ? 3 : used_locals;
+      handled = true;
+      break;
+    }
+
+    case 8:  // subfic rD, rA, SIMM -- rD = SIMM - rA
+    {
+      if (!layout.xer_ca_offset)
+        break;
+      LoadGpr(body, layout, RA(ins));
+      body.push_back(kLocalSet);
+      PutU32(body, 1);
+      BeginStoreGpr(body);
+      body.push_back(kI32Const);
+      PutI32(body, SIMM(ins));
+      body.push_back(kLocalGet);
+      PutU32(body, 1);
+      body.push_back(kI32Sub);
+      body.push_back(kLocalTee);
+      PutU32(body, 2);
+      EndStoreGpr(body, layout, RS(ins));
+      // CA = (a == 0) | (result <u (0 - a)), which is the interpreter's
+      // (a == 0) || Helper_Carry(0 - a, imm) written as the overflow test.
+      body.push_back(kLocalGet);
+      PutU32(body, 0);
+      body.push_back(kLocalGet);
+      PutU32(body, 1);
+      body.push_back(kI32Eqz);
+      body.push_back(kLocalGet);
+      PutU32(body, 2);
+      body.push_back(kI32Const);
+      PutI32(body, 0);
+      body.push_back(kLocalGet);
+      PutU32(body, 1);
+      body.push_back(kI32Sub);
+      body.push_back(kI32LtU);
+      body.push_back(kI32Or);
+      EmitEndStoreCA(body, layout);
+      used_locals = used_locals < 3 ? 3 : used_locals;
+      handled = true;
+      break;
+    }
+
+    case 20:  // rlwimi rA, rS, SH, MB, ME -- insert under mask
+    {
+      const uint32_t mask = Mask(MB(ins), ME(ins));
+      BeginStoreGpr(body);
+      LoadGpr(body, layout, RA(ins));
+      body.push_back(kI32Const);
+      PutI32(body, static_cast<int32_t>(~mask));
+      body.push_back(kI32And);
+      LoadGpr(body, layout, RS(ins));
+      if (SH(ins))
+      {
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(SH(ins)));
+        body.push_back(kI32Rotl);
+      }
+      body.push_back(kI32Const);
+      PutI32(body, static_cast<int32_t>(mask));
+      body.push_back(kI32And);
+      body.push_back(kI32Or);
+      EndStoreGpr(body, layout, RA(ins));
+      handled = true;
+      break;
+    }
+
+    case 23:  // rlwnm rA, rS, rB, MB, ME -- rotate by a register
+    {
+      BeginStoreGpr(body);
+      LoadGpr(body, layout, RS(ins));
+      LoadGpr(body, layout, RB(ins));
+      body.push_back(kI32Const);
+      PutI32(body, 31);
+      body.push_back(kI32And);
+      body.push_back(kI32Rotl);
+      body.push_back(kI32Const);
+      PutI32(body, static_cast<int32_t>(Mask(MB(ins), ME(ins))));
+      body.push_back(kI32And);
+      EndStoreGpr(body, layout, RA(ins));
+      handled = true;
+      break;
+    }
+
+    case 46:  // lmw
+    case 47:  // stmw
+      EmitLoadStoreMultiple(body, layout, this_pc, n, RA(ins), SIMM(ins), RS(ins), op == 47);
+      touches_memory = true;
+      used_locals = used_locals < 3 ? 3 : used_locals;
+      handled = true;
+      break;
+
+    // ── floating-point loads and stores, displacement form ──
+    case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55:
+    {
+      if (!fp_ok)
+        break;
+      const bool is_double = (op == 50 || op == 51 || op == 54 || op == 55);
+      const bool is_store = op >= 52;
+      const bool update = (op & 1) != 0;
+      if (update && RA(ins) == 0)
+        break;
+      need_fp(this_pc, n);
+      EmitFpMemOp(body, layout, this_pc, n, RA(ins), 0, SIMM(ins), false, RS(ins), is_double,
+                  is_store, update, false, ins);
+      touches_memory = true;
+      used_locals = used_locals < 4 ? 4 : used_locals;
+      handled = true;
+      break;
+    }
+
+    // ── floating-point moves, which touch no flags ──
+    //
+    // fmr, fneg, fabs, fnabs and fsel are bit operations on ps0; the
+    // paired forms in opcode 4 do the same to both halves, and the merges
+    // shuffle halves between two registers. Every source is read into an
+    // i64 local before any destination is written, since D may equal A or B.
+    case 63:
+    case 4:
+    {
+      if (!fp_ok)
+        break;
+      const uint32_t xo = XO(ins);
+      const bool paired = (op == 4);
+      const bool is_move = (xo == 72 || xo == 40 || xo == 264 || xo == 136);
+      const bool is_merge = paired && (xo == 528 || xo == 560 || xo == 592 || xo == 624);
+      // fsel/ps_sel use the A-form: the five-bit XO is 23 and the rest of
+      // the ten-bit field is frC. The X-form moves above match on all ten
+      // bits, and no A-form opcode has 8 or 16 in its low five, so the two
+      // tests cannot both be true.
+      const bool is_sel = ((ins >> 1) & 0x1F) == 23;
+      if (!is_move && !is_merge && !is_sel)
+        break;
+      const uint32_t fd = RS(ins), fa = RA(ins), fb = RB(ins), fc = (ins >> 6) & 0x1F;
+      if (paired)
+        need_pse(this_pc, n);
+      else
+        need_fp(this_pc, n);
+      const uint32_t pd = layout.ps_offset + fd * 16;
+      const uint32_t pa = layout.ps_offset + fa * 16;
+      const uint32_t pb = layout.ps_offset + fb * 16;
+      const uint32_t pc_ = layout.ps_offset + fc * 16;
+      auto load64 = [&](uint32_t off) {
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI64Load);
+        PutU32(body, 3);
+        PutU32(body, off);
+      };
+      auto store64_from_local = [&](uint32_t off, uint32_t local) {
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kLocalGet);
+        PutU32(body, local);
+        body.push_back(kI64Store);
+        PutU32(body, 3);
+        PutU32(body, off);
+      };
+      auto apply = [&](uint32_t xo_) {
+        // The value is on the stack; apply the move's bit operation.
+        if (xo_ == 40)  // neg: flip the sign
+        {
+          body.push_back(kI64Const);
+          PutI64(body, static_cast<int64_t>(0x8000000000000000ull));
+          body.push_back(kI64Xor);
+        }
+        else if (xo_ == 264)  // abs: clear the sign
+        {
+          body.push_back(kI64Const);
+          PutI64(body, 0x7FFFFFFFFFFFFFFFll);
+          body.push_back(kI64And);
+        }
+        else if (xo_ == 136)  // nabs: set the sign
+        {
+          body.push_back(kI64Const);
+          PutI64(body, static_cast<int64_t>(0x8000000000000000ull));
+          body.push_back(kI64Or);
+        }
+      };
+      if (is_sel)
+      {
+        // d = (a >= -0.0) ? c : b, per half for ps_sel. NaN compares false
+        // and selects b, as the interpreter's C++ does.
+        for (int half = 0; half < (paired ? 2 : 1); ++half)
+        {
+          const uint32_t h = half * 8;
+          load64(pc_ + h);
+          load64(pb + h);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kF64Load);
+          PutU32(body, 3);
+          PutU32(body, pa + h);
+          body.push_back(kF64Const);
+          for (int k = 0; k < 8; ++k)
+            body.push_back(k == 7 ? 0x80 : 0x00);  // -0.0
+          body.push_back(kF64Ge);
+          body.push_back(kSelect);
+          body.push_back(kLocalSet);
+          PutU32(body, 9 + half);
+        }
+        for (int half = 0; half < (paired ? 2 : 1); ++half)
+          store64_from_local(pd + half * 8, 9 + half);
+      }
+      else if (is_merge)
+      {
+        const bool a_hi = (xo == 592 || xo == 624);
+        const bool b_hi = (xo == 560 || xo == 624);
+        load64(pa + (a_hi ? 8 : 0));
+        body.push_back(kLocalSet);
+        PutU32(body, 9);
+        load64(pb + (b_hi ? 8 : 0));
+        body.push_back(kLocalSet);
+        PutU32(body, 10);
+        store64_from_local(pd, 9);
+        store64_from_local(pd + 8, 10);
+      }
+      else
+      {
+        load64(pb);
+        apply(xo);
+        body.push_back(kLocalSet);
+        PutU32(body, 9);
+        if (paired)
+        {
+          load64(pb + 8);
+          apply(xo);
+          body.push_back(kLocalSet);
+          PutU32(body, 10);
+        }
+        store64_from_local(pd, 9);
+        if (paired)
+          store64_from_local(pd + 8, 10);
+      }
+      if (Rc(ins))
+        EmitUpdateCR1(body, layout);
+      handled = true;
+      break;
+    }
+
     case 31:  // the extended-opcode space
     {
       // Rc is allowed only for the forms whose destination register is
-      // known. For everything else in this opcode space -- memory, SPR
-      // moves, mtmsr -- bit 0 is reserved, and a set bit means an encoding
-      // this does not understand.
-      if (Rc(ins) && RcDestination(ins) < 0)
+      // known, plus stwcx., whose Rc bit is always set and whose CR0 write
+      // is part of the instruction. For everything else in this opcode
+      // space -- memory, SPR moves, mtmsr -- bit 0 is reserved, and a set
+      // bit means an encoding this does not understand.
+      if (Rc(ins) && RcDestination(ins) < 0 && XO(ins) != 150)
         break;
       const uint32_t xo = XO(ins);
 
@@ -1270,13 +2610,229 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       // an interrupt, writing a BAT changes address translation -- and a
       // compiled block that moved those around without telling the rest of
       // the emulator would be wrong in ways no register comparison catches.
+      // mftb: the time base, computed from CoreTiming's globals exactly as
+      // the interpreter computes it, and written to TL and TU as
+      // WriteFullTimeBaseValue does before the requested half is copied.
+      if (xo == 371 && layout.tb_global_timer_addr && layout.ps_offset)
+      {
+        const uint32_t tbr = ((ins >> 16) & 0x1F) | (((ins >> 11) & 0x1F) << 5);
+        if (tbr != 268 && tbr != 269)
+          break;
+        used_i64 = 2;
+        // ticks = global_timer + (slice_length - downcount)
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(layout.tb_global_timer_addr));
+        body.push_back(kI64Load);
+        PutU32(body, 3);
+        PutU32(body, 0);
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(layout.tb_slice_length_addr));
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, 0);
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.downcount_offset);
+        body.push_back(kI32Sub);
+        body.push_back(kI64ExtendI32S);
+        body.push_back(kI64Add);
+        // tb = start_value + (ticks - start_ticks) / 12
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(layout.tb_start_ticks_addr));
+        body.push_back(kI64Load);
+        PutU32(body, 3);
+        PutU32(body, 0);
+        body.push_back(kI64Sub);
+        body.push_back(kI64Const);
+        PutI64(body, 12);
+        body.push_back(kI64DivU);
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(layout.tb_start_value_addr));
+        body.push_back(kI64Load);
+        PutU32(body, 3);
+        PutU32(body, 0);
+        body.push_back(kI64Add);
+        body.push_back(kLocalSet);
+        PutU32(body, 9);
+        // spr[TL] = low word, spr[TU] = high word
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kLocalGet);
+        PutU32(body, 9);
+        body.push_back(kI32WrapI64);
+        body.push_back(kI32Store);
+        PutU32(body, 2);
+        PutU32(body, layout.spr_offset + 268 * 4);
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kLocalGet);
+        PutU32(body, 9);
+        body.push_back(kI64Const);
+        PutI64(body, 32);
+        body.push_back(kI64ShrU);
+        body.push_back(kI32WrapI64);
+        body.push_back(kI32Store);
+        PutU32(body, 2);
+        PutU32(body, layout.spr_offset + 269 * 4);
+        // rD = the half asked for
+        BeginStoreGpr(body);
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.spr_offset + tbr * 4);
+        EndStoreGpr(body, layout, RS(ins));
+        handled = true;
+        break;
+      }
+
+      // ── floating-point loads and stores, indexed form ──
+      if (fp_ok)
+      {
+        struct FForm { bool is_double, store, update, as_int; };
+        FForm ff{};
+        bool is_fmem = true;
+        switch (xo)
+        {
+        case 535: ff = {false, false, false, false}; break;  // lfsx
+        case 567: ff = {false, false, true,  false}; break;  // lfsux
+        case 599: ff = {true,  false, false, false}; break;  // lfdx
+        case 631: ff = {true,  false, true,  false}; break;  // lfdux
+        case 663: ff = {false, true,  false, false}; break;  // stfsx
+        case 695: ff = {false, true,  true,  false}; break;  // stfsux
+        case 727: ff = {true,  true,  false, false}; break;  // stfdx
+        case 759: ff = {true,  true,  true,  false}; break;  // stfdux
+        case 983: ff = {false, true,  false, true};  break;  // stfiwx
+        default: is_fmem = false; break;
+        }
+        if (is_fmem)
+        {
+          if (ff.update && RA(ins) == 0)
+            break;
+          need_fp(this_pc, n);
+          EmitFpMemOp(body, layout, this_pc, n, RA(ins), RB(ins), 0, true, RS(ins), ff.is_double,
+                      ff.store, ff.update, ff.as_int, ins);
+          touches_memory = true;
+          used_locals = used_locals < 4 ? 4 : used_locals;
+          handled = true;
+          break;
+        }
+      }
+
       if (xo == 339 || xo == 467)
       {
         // The SPR field is SPLIT and the halves are swapped, which is the
         // classic way to decode this one wrong.
         const uint32_t spr = ((ins >> 16) & 0x1F) | (((ins >> 11) & 0x1F) << 5);
-        if (spr != layout.lr_index && spr != layout.ctr_index)
+
+        // XER is kept in three fields of guest state and reassembled or
+        // split here as PowerPCState::GetXER / SetXER do.
+        if (spr == 1 && layout.xer_ca_offset && layout.xer_stringctrl_offset)
+        {
+          if (xo == 339)
+          {
+            BeginStoreGpr(body);
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(0x2F);  // i32.load16_u
+            PutU32(body, 1);
+            PutU32(body, layout.xer_stringctrl_offset);
+            EmitLoadCA(body, layout);
+            body.push_back(kI32Const);
+            PutI32(body, 29);
+            body.push_back(kI32Shl);
+            body.push_back(kI32Or);
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(kI32Load8U);
+            PutU32(body, 0);
+            PutU32(body, layout.xer_so_ov_offset);
+            body.push_back(kI32Const);
+            PutI32(body, 30);
+            body.push_back(kI32Shl);
+            body.push_back(kI32Or);
+            EndStoreGpr(body, layout, RS(ins));
+          }
+          else
+          {
+            LoadGpr(body, layout, RS(ins));
+            body.push_back(kLocalSet);
+            PutU32(body, 1);
+            // stringctrl = BYTE_COUNT | BYTE_CMP << 8 = xer & 0xFF7F
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(kLocalGet);
+            PutU32(body, 1);
+            body.push_back(kI32Const);
+            PutI32(body, 0xFF7F);
+            body.push_back(kI32And);
+            body.push_back(0x3B);  // i32.store16
+            PutU32(body, 1);
+            PutU32(body, layout.xer_stringctrl_offset);
+            // ca = bit 29
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(kLocalGet);
+            PutU32(body, 1);
+            body.push_back(kI32Const);
+            PutI32(body, 29);
+            body.push_back(kI32ShrU);
+            body.push_back(kI32Const);
+            PutI32(body, 1);
+            body.push_back(kI32And);
+            EmitEndStoreCA(body, layout);
+            // so_ov = (SO << 1) | OV = bits 31 and 30
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(kLocalGet);
+            PutU32(body, 1);
+            body.push_back(kI32Const);
+            PutI32(body, 30);
+            body.push_back(kI32ShrU);
+            body.push_back(kI32Const);
+            PutI32(body, 3);
+            body.push_back(kI32And);
+            body.push_back(kI32Store8);
+            PutU32(body, 0);
+            PutU32(body, layout.xer_so_ov_offset);
+            used_locals = used_locals < 2 ? 2 : used_locals;
+          }
+          handled = true;
           break;
+        }
+
+        // Plain moves: registers the interpreter reads and writes with no
+        // side effect (Interpreter_SystemRegisters.cpp's default cases).
+        // Everything else -- DEC, HID0, the BATs, WPAR, the performance
+        // monitor -- has one, and stays with the interpreter.
+        const bool user_spr = (spr == layout.lr_index || spr == layout.ctr_index);
+        const bool plain_spr = user_spr || spr == 26 || spr == 27 ||        // SRR0, SRR1
+                               spr == 18 || spr == 19 ||                    // DSISR, DAR
+                               (spr >= 272 && spr <= 275) ||                // SPRG0-3
+                               (spr >= 912 && spr <= 919);                  // GQR0-7
+        const bool read_only_plain = (xo == 339) && (spr == 287 || spr == 1008 ||  // PVR, HID0
+                                                     spr == 920 || spr == 1011);   // HID2, HID4
+        if (!plain_spr && !read_only_plain)
+          break;
+        if (!user_spr)
+        {
+          // Privileged: in user mode the interpreter raises a program
+          // exception, so the block refuses there.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+          body.push_back(kI32Const);
+          PutI32(body, 1 << 14);
+          body.push_back(kI32And);
+          body.push_back(kIf);
+          body.push_back(kVoid);
+          EmitBailBody(body, layout, this_pc, n);
+          body.push_back(kEnd);
+        }
         if (xo == 339)  // mfspr rD, SPR
         {
           BeginStoreGpr(body);
@@ -1337,12 +2893,535 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           if (xf.update && RA(ins) == 0)
             break;
           EmitMemOp(body, layout, this_pc, n, RA(ins), RB(ins), 0, true, RS(ins),
-                    xf.size, xf.store, xf.sign, xf.update);
+                    xf.size, xf.store, xf.sign, xf.update, ins);
       touches_memory = true;
           used_locals = used_locals < 4 ? 4 : used_locals;
           handled = true;
           break;
         }
+      }
+
+      // ── the reservation ──
+      //
+      // lwarx loads a word and records the address; stwcx. stores only if
+      // the reservation is still held for that address, and reports which
+      // in CR0 (Interpreter_LoadStore.cpp lwarx / stwcxd). Nothing else in
+      // compiled code clears the reservation; the interpreter's own
+      // stwcx. does, and an exception path does not, which matches.
+      if ((xo == 20 || xo == 150) && layout.reserve_offset)
+      {
+        LoadGprOrZero(body, layout, RA(ins));
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kI32Add);
+        body.push_back(kLocalTee);
+        PutU32(body, 1);
+        body.push_back(kLocalSet);
+        PutU32(body, 3);  // the guest address, kept for the reservation
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kI32Const);
+        PutI32(body, 3);
+        body.push_back(kI32And);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        EmitBailBody(body, layout, this_pc, n);
+        body.push_back(kEnd);
+        if (xo == 20)  // lwarx
+        {
+          EmitTranslate(body, layout, 1, 2, this_pc, n);
+          BeginStoreGpr(body);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32Load);
+          PutU32(body, 0);
+          PutU32(body, 0);
+          body.push_back(kLocalSet);
+          PutU32(body, 2);
+          EmitBswap32(body, 2);
+          EndStoreGpr(body, layout, RS(ins));
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 3);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.reserve_address_offset);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Const);
+          PutI32(body, 1);
+          body.push_back(kI32Store8);
+          PutU32(body, 0);
+          PutU32(body, layout.reserve_offset);
+        }
+        else  // stwcx.
+        {
+          // CR0 = s_crTable[(stored ? 2 : 0) | XER[SO]], and the address
+          // for that store goes under everything else.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          // held = reserve && reserve_address == ea
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load8U);
+          PutU32(body, 0);
+          PutU32(body, layout.reserve_offset);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.reserve_address_offset);
+          body.push_back(kLocalGet);
+          PutU32(body, 3);
+          body.push_back(kI32Eq);
+          body.push_back(kI32And);
+          body.push_back(kIf);
+          body.push_back(kI32);
+          {
+            EmitTranslate(body, layout, 1, 2, this_pc, n);
+            body.push_back(kLocalGet);
+            PutU32(body, 1);
+            LoadGpr(body, layout, RS(ins));
+            body.push_back(kLocalSet);
+            PutU32(body, 2);
+            EmitBswap32(body, 2);
+            body.push_back(kI32Store);
+            PutU32(body, 0);
+            PutU32(body, 0);
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(kI32Const);
+            PutI32(body, 0);
+            body.push_back(kI32Store8);
+            PutU32(body, 0);
+            PutU32(body, layout.reserve_offset);
+            body.push_back(kI32Const);
+            PutI32(body, 2);
+          }
+          body.push_back(kElse);
+          body.push_back(kI32Const);
+          PutI32(body, 0);
+          body.push_back(kEnd);
+          // | XER[SO]
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load8U);
+          PutU32(body, 0);
+          PutU32(body, layout.xer_so_ov_offset);
+          body.push_back(kI32Const);
+          PutI32(body, 1);
+          body.push_back(kI32ShrU);
+          body.push_back(kI32Const);
+          PutI32(body, 1);
+          body.push_back(kI32And);
+          body.push_back(kI32Or);
+          body.push_back(kI32Const);
+          PutI32(body, 3);
+          body.push_back(kI32Shl);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(layout.cr_table_base));
+          body.push_back(kI32Add);
+          body.push_back(kI64Load);
+          PutU32(body, 3);
+          PutU32(body, 0);
+          body.push_back(kI64Store);
+          PutU32(body, 3);
+          PutU32(body, layout.cr_offset);
+        }
+        touches_memory = true;
+        used_locals = used_locals < 4 ? 4 : used_locals;
+        handled = true;
+        break;
+      }
+
+      // ── cache control and barriers ──
+      //
+      // Without data cache emulation, the interpreter's dcbf, dcbst and
+      // dcbi do nothing but poke a JIT interface that has no JIT behind
+      // it; dcbt, dcbtst, sync and eieio do nothing at all. Measured with
+      // idle loops skipped, dcbi and dcbf together were 1.45 million
+      // interpreted instructions, each one ending a block.
+      if (xo == 278 || xo == 246 || xo == 598 || xo == 854)  // dcbt, dcbtst, sync, eieio
+      {
+        handled = true;
+        break;
+      }
+      if ((xo == 54 || xo == 86 || xo == 470) && !layout.dcache_enabled)  // dcbst, dcbf, dcbi
+      {
+        if (xo == 470)
+        {
+          // dcbi is privileged; in user mode it is a program exception,
+          // which the interpreter raises.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+          body.push_back(kI32Const);
+          PutI32(body, 1 << 14);
+          body.push_back(kI32And);
+          body.push_back(kIf);
+          body.push_back(kVoid);
+          EmitBailBody(body, layout, this_pc, n);
+          body.push_back(kEnd);
+        }
+        handled = true;
+        break;
+      }
+
+      // dcbz: zero the 32-byte line holding the address.
+      //
+      // Refused when HID0[DCE] is clear, where the interpreter raises an
+      // alignment exception instead (Interpreter_LoadStore.cpp), and left
+      // to the interpreter entirely when the data cache is emulated or
+      // the low-memory hack is on. Measured over the boot: 2.34 million
+      // interpreted instructions, the largest single line before MEM2.
+      if (xo == 1014 && !layout.dcache_enabled && !layout.low_dcbz_hack)
+      {
+        // HID0[DCE] is bit 14 of SPR 1008.
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.spr_offset + 1008 * 4);
+        body.push_back(kI32Const);
+        PutI32(body, 1 << 14);
+        body.push_back(kI32And);
+        body.push_back(kI32Eqz);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        EmitBailBody(body, layout, this_pc, n);
+        body.push_back(kEnd);
+        // ea = (rA|0 + rB) & ~31
+        LoadGprOrZero(body, layout, RA(ins));
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kI32Add);
+        body.push_back(kI32Const);
+        PutI32(body, -32);
+        body.push_back(kI32And);
+        body.push_back(kLocalSet);
+        PutU32(body, 1);
+        EmitTranslate(body, layout, 1, 2, this_pc, n);
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kI32Const);
+        PutI32(body, 0);
+        body.push_back(kI32Const);
+        PutI32(body, 32);
+        body.push_back(kPrefixFC);
+        PutU32(body, kMemoryFill);
+        body.push_back(0x00);  // memory index
+        touches_memory = true;
+        used_locals = used_locals < 3 ? 3 : used_locals;
+        handled = true;
+        break;
+      }
+
+      // ── the carry forms with a register operand ──
+      //
+      // OE (bit 10) forms also set XER[OV] and are left to the interpreter.
+      if ((xo == 10 || xo == 8 || xo == 138 || xo == 136 || xo == 202 || xo == 200) &&
+          layout.xer_ca_offset && !(ins & (1u << 10)))
+      {
+        // local 1 = the first operand as the carry test sees it: a for the
+        // add forms, ~a for the subtract-from forms, which the interpreter
+        // computes as ~a + b + carry.
+        LoadGpr(body, layout, RA(ins));
+        if (xo == 136 || xo == 200)
+        {
+          body.push_back(kI32Const);
+          PutI32(body, -1);
+          body.push_back(kI32Xor);
+        }
+        body.push_back(kLocalSet);
+        PutU32(body, 1);
+
+        if (xo == 10)  // addc: r = a + b, CA = r <u a
+        {
+          BeginStoreGpr(body);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32Add);
+          body.push_back(kLocalTee);
+          PutU32(body, 2);
+          EndStoreGpr(body, layout, RS(ins));
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32LtU);
+          EmitEndStoreCA(body, layout);
+        }
+        else if (xo == 8)  // subfc: r = b - a, CA = (a == 0) | (r <u (0 - a))
+        {
+          BeginStoreGpr(body);
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32Sub);
+          body.push_back(kLocalTee);
+          PutU32(body, 2);
+          EndStoreGpr(body, layout, RS(ins));
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32Eqz);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          body.push_back(kI32Const);
+          PutI32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32Sub);
+          body.push_back(kI32LtU);
+          body.push_back(kI32Or);
+          EmitEndStoreCA(body, layout);
+        }
+        else if (xo == 138 || xo == 136)  // adde, subfe: t = x + b; r = t + ca
+        {
+          // CA = (t <u x) | (r <u t): either addition can carry, never both.
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32Add);
+          body.push_back(kLocalSet);
+          PutU32(body, 2);
+          BeginStoreGpr(body);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          EmitLoadCA(body, layout);
+          body.push_back(kI32Add);
+          body.push_back(kLocalTee);
+          PutU32(body, 3);
+          EndStoreGpr(body, layout, RS(ins));
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32LtU);
+          body.push_back(kLocalGet);
+          PutU32(body, 3);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          body.push_back(kI32LtU);
+          body.push_back(kI32Or);
+          EmitEndStoreCA(body, layout);
+        }
+        else  // addze, subfze: r = x + ca, CA = r <u x
+        {
+          BeginStoreGpr(body);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          EmitLoadCA(body, layout);
+          body.push_back(kI32Add);
+          body.push_back(kLocalTee);
+          PutU32(body, 2);
+          EndStoreGpr(body, layout, RS(ins));
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 2);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32LtU);
+          EmitEndStoreCA(body, layout);
+        }
+        used_locals = used_locals < 4 ? 4 : used_locals;
+        handled = true;
+        break;
+      }
+
+      // ── divide and high multiply ──
+      //
+      // WebAssembly traps on division by zero and on INT_MIN / -1; PowerPC
+      // defines both (Interpreter_Integer.cpp), so the cases are tested
+      // first and the division only runs when it cannot trap.
+      if ((xo == 491 || xo == 459) && !(ins & (1u << 10)))
+      {
+        BeginStoreGpr(body);
+        if (xo == 459)  // divwu: b == 0 ? 0 : a / b
+        {
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32Eqz);
+          body.push_back(kIf);
+          body.push_back(kI32);
+          body.push_back(kI32Const);
+          PutI32(body, 0);
+          body.push_back(kElse);
+          LoadGpr(body, layout, RA(ins));
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32DivU);
+          body.push_back(kEnd);
+        }
+        else  // divw: overflow ? (a < 0 ? -1 : 0) : a / b
+        {
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32Eqz);
+          LoadGpr(body, layout, RA(ins));
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(0x80000000u));
+          body.push_back(kI32Eq);
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32Const);
+          PutI32(body, -1);
+          body.push_back(kI32Eq);
+          body.push_back(kI32And);
+          body.push_back(kI32Or);
+          body.push_back(kIf);
+          body.push_back(kI32);
+          LoadGpr(body, layout, RA(ins));
+          body.push_back(kI32Const);
+          PutI32(body, 31);
+          body.push_back(kI32ShrS);
+          body.push_back(kElse);
+          LoadGpr(body, layout, RA(ins));
+          LoadGpr(body, layout, RB(ins));
+          body.push_back(kI32DivS);
+          body.push_back(kEnd);
+        }
+        EndStoreGpr(body, layout, RS(ins));
+        handled = true;
+        break;
+      }
+      if (xo == 75 || xo == 11)  // mulhw, mulhwu: the high word of the product
+      {
+        BeginStoreGpr(body);
+        LoadGpr(body, layout, RA(ins));
+        body.push_back(xo == 75 ? kI64ExtendI32S : kI64ExtendI32U);
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(xo == 75 ? kI64ExtendI32S : kI64ExtendI32U);
+        body.push_back(kI64Mul);
+        body.push_back(kI64Const);
+        PutI32(body, 32);
+        body.push_back(xo == 75 ? kI64ShrS : kI64ShrU);
+        body.push_back(kI32WrapI64);
+        EndStoreGpr(body, layout, RS(ins));
+        handled = true;
+        break;
+      }
+
+      // ── arithmetic shifts right, which set the carry ──
+      //
+      // CA is set when the value was negative and ones were shifted out
+      // (Interpreter_Integer.cpp srawix/srawx), and for a count of 32 or
+      // more the result is the sign fill and CA is simply the sign.
+      if (xo == 824 && layout.xer_ca_offset)  // srawi rA, rS, SH
+      {
+        const uint32_t sh = SH(ins);
+        LoadGpr(body, layout, RS(ins));
+        body.push_back(kLocalSet);
+        PutU32(body, 1);
+        BeginStoreGpr(body);
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        if (sh)
+        {
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(sh));
+          body.push_back(kI32ShrS);
+        }
+        EndStoreGpr(body, layout, RA(ins));
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        if (sh == 0)
+        {
+          body.push_back(kI32Const);
+          PutI32(body, 0);
+        }
+        else
+        {
+          // (rS >> 31) & ((rS << (32 - sh)) != 0)
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32Const);
+          PutI32(body, 31);
+          body.push_back(kI32ShrU);
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(32 - sh));
+          body.push_back(kI32Shl);
+          body.push_back(kI32Const);
+          PutI32(body, 0);
+          body.push_back(kI32Ne);
+          body.push_back(kI32And);
+        }
+        EmitEndStoreCA(body, layout);
+        used_locals = used_locals < 2 ? 2 : used_locals;
+        handled = true;
+        break;
+      }
+      if (xo == 792 && layout.xer_ca_offset)  // sraw rA, rS, rB
+      {
+        LoadGpr(body, layout, RS(ins));
+        body.push_back(kLocalSet);
+        PutU32(body, 1);
+        LoadGpr(body, layout, RB(ins));
+        body.push_back(kI32Const);
+        PutI32(body, 63);
+        body.push_back(kI32And);
+        body.push_back(kLocalSet);
+        PutU32(body, 2);
+        // rA = rS >>s min(amount, 31): a count of 32 or more is the sign fill.
+        BeginStoreGpr(body);
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        body.push_back(kI32Const);
+        PutI32(body, 31);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        body.push_back(kI32Const);
+        PutI32(body, 32);
+        body.push_back(kI32LtU);
+        body.push_back(kSelect);
+        body.push_back(kI32ShrS);
+        EndStoreGpr(body, layout, RA(ins));
+        // CA = (rS >> 31) & (amount != 0) & ((amount >= 32) | ((rS << (32 - amount)) != 0))
+        // -- wasm masks the shift count to five bits, which for amounts in
+        // 1..31 is exactly 32 - amount.
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kI32Const);
+        PutI32(body, 31);
+        body.push_back(kI32ShrU);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        body.push_back(kI32Const);
+        PutI32(body, 0);
+        body.push_back(kI32Ne);
+        body.push_back(kI32And);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        body.push_back(kI32Const);
+        PutI32(body, 32);
+        body.push_back(kI32GeU);
+        body.push_back(kLocalGet);
+        PutU32(body, 1);
+        body.push_back(kI32Const);
+        PutI32(body, 32);
+        body.push_back(kLocalGet);
+        PutU32(body, 2);
+        body.push_back(kI32Sub);
+        body.push_back(kI32Shl);
+        body.push_back(kI32Const);
+        PutI32(body, 0);
+        body.push_back(kI32Ne);
+        body.push_back(kI32Or);
+        body.push_back(kI32And);
+        EmitEndStoreCA(body, layout);
+        used_locals = used_locals < 3 ? 3 : used_locals;
+        handled = true;
+        break;
       }
 
       // ── single-operand and complement forms ──
@@ -1501,6 +3580,155 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         body.push_back(kVoid);
         EmitBailBody(body, layout, this_pc, n);
         body.push_back(kEnd);
+
+        // ── the OS's interrupt toggles ──
+        //
+        // OSDisableInterrupts is `mfmsr rX; rlwinm rY,rX,0,17,15; mtmsr rY`
+        // and OSEnableInterrupts is `mfmsr rX; ori rY,rX,0x8000; mtmsr rY`.
+        // Measured over the boot they are the two hottest blocks after the
+        // idle loop, called 40 million times between them. When the
+        // previous two instructions are exactly that, the value written is
+        // provably the old MSR with only EE changed: no sensitive bit can
+        // have flipped, so the general check below is replaced by the one
+        // or two loads that can still matter. The PR test is skipped too --
+        // the mfmsr two instructions ago already made it.
+        if (layout.mtmsr_continue && layout.enable_linking && Opcode(prev2_ins) == 31 &&
+            XO(prev2_ins) == 83 && !Rc(prev2_ins) && RS(prev_ins) == RS(prev2_ins) &&
+            RA(prev_ins) == RS(ins) &&
+            ((Opcode(prev_ins) == 21 && !Rc(prev_ins) && SH(prev_ins) == 0 &&
+              MB(prev_ins) == 17 && ME(prev_ins) == 15) ||
+             (Opcode(prev_ins) == 24 && UIMM(prev_ins) == 0x8000)))
+        {
+          const bool enabling = Opcode(prev_ins) == 24;
+          // msr = gpr[rY]
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          LoadGpr(body, layout, RS(ins));
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+          // Leave if a page table update is waiting, or -- when enabling --
+          // if an interrupt is pending behind EE.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load8U);
+          PutU32(body, 0);
+          PutU32(body, layout.pagetable_pending_offset);
+          if (enabling)
+          {
+            body.push_back(kLocalGet);
+            PutU32(body, 0);
+            body.push_back(kI32Load);
+            PutU32(body, 2);
+            PutU32(body, layout.exceptions_offset);
+            body.push_back(kI32Or);
+          }
+          body.push_back(kIf);
+          body.push_back(kVoid);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(n + 1));
+          body.push_back(kI32Sub);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>((this_pc + 4) | 2u));
+          body.push_back(kReturn);
+          body.push_back(kEnd);
+          handled = true;
+          break;
+        }
+
+        if (layout.mtmsr_continue && layout.enable_linking)
+        {
+          // Keep the old value, write the new one, and leave only if the
+          // write has a consequence this code cannot deliver itself. See
+          // StateLayout::mtmsr_continue for the three cases.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+          body.push_back(kLocalSet);
+          PutU32(body, 1);
+
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          LoadGpr(body, layout, RS(ins));
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+
+          // (old ^ new) & (PR | FP | IR | DR | FE0 | FE1) -- FP because a
+          // block checks it once, before its first FP instruction
+          body.push_back(kLocalGet);
+          PutU32(body, 1);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+          body.push_back(kI32Xor);
+          body.push_back(kI32Const);
+          PutI32(body, (1 << 14) | (1 << 13) | (1 << 5) | (1 << 4) | (1 << 11) | (1 << 8));
+          body.push_back(kI32And);
+          // | (Exceptions * new.EE) -- an interrupt pending behind EE
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.exceptions_offset);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.msr_offset);
+          body.push_back(kI32Const);
+          PutI32(body, 15);
+          body.push_back(kI32ShrU);
+          body.push_back(kI32Const);
+          PutI32(body, 1);
+          body.push_back(kI32And);
+          body.push_back(kI32Mul);
+          body.push_back(kI32Or);
+          // | pagetable_update_pending
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load8U);
+          PutU32(body, 0);
+          PutU32(body, layout.pagetable_pending_offset);
+          body.push_back(kI32Or);
+          body.push_back(kIf);
+          body.push_back(kVoid);
+          // downcount -= n + 1: this instruction ran.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(n + 1));
+          body.push_back(kI32Sub);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>((this_pc + 4) | 2u));
+          body.push_back(kReturn);
+          body.push_back(kEnd);
+          used_locals = used_locals < 2 ? 2 : used_locals;
+          handled = true;
+          break;
+        }
 
         // msr = gpr[rS]
         body.push_back(kLocalGet);
@@ -1706,19 +3934,62 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         // edges still go exactly where they went.
         const bool follow_taken = layout.trace_backward && target < this_pc;
 
+        // A busy-wait loop closes here: the branch goes back to the block's
+        // own first instruction, tests the condition register and not CTR,
+        // and nothing in the body could have changed the outcome. The
+        // taken edge then idles instead of looping -- see
+        // StateLayout::idle_flag_addr.
+        const bool idle_exit = idle_ok && !link && !follow_taken && target == start_pc &&
+                               (bo & 0x04) != 0 && (bo & 0x10) == 0 && n > 0;
+
         EmitBranchTaken(body, layout, bo, bi);
         if (follow_taken)
           body.push_back(kI32Eqz);  // exit on NOT taken instead
         body.push_back(kIf);
         body.push_back(kVoid);
-        // bcl writes LR only when it branches, so the write belongs on
-        // whichever edge is the taken one: inside the if normally, and
-        // after it when the taken edge is the one being followed.
-        if (link && !follow_taken)
-          EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
-        // 0 is the if, 1 the enclosing block
-        EmitStaticExit(body, layout, follow_taken ? this_pc + 4 : target, n + 1, 1, fixups, 6);
+        if (idle_exit)
+        {
+          // downcount -= n + 1, as any exit charges what ran ...
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(n + 1));
+          body.push_back(kI32Sub);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          // ... then tell the dispatcher the rest of the slice is idle ...
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(layout.idle_flag_addr));
+          body.push_back(kI32Const);
+          PutI32(body, 1);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, 0);
+          // ... and come back here when time has moved on.
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(start_pc));
+          body.push_back(kReturn);
+        }
+        else
+        {
+          // bcl writes LR only when it branches, so the write belongs on
+          // whichever edge is the taken one: inside the if normally, and
+          // after it when the taken edge is the one being followed.
+          if (link && !follow_taken)
+            EmitSetSpr(body, layout, layout.lr_index, this_pc + 4);
+          // 0 is the if, 1 the enclosing block
+          EmitStaticExit(body, layout, follow_taken ? this_pc + 4 : target, n + 1, 1, fixups, 6);
+        }
         body.push_back(kEnd);
+        // Whatever this branch was, a loop closing AFTER it would contain a
+        // branch, which the busy-wait rule forbids.
+        idle_ok = false;
 
         if (follow_taken)
         {
@@ -1757,6 +4028,11 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
 
     case 19:  // bclr (return) and bcctr (indirect branch)
     {
+      if (XO(ins) == 150)  // isync: nothing to do, as in the interpreter
+      {
+        handled = true;
+        break;
+      }
       const bool via_ctr = (XO(ins) == 528);
       if (XO(ins) != 16 && !via_ctr)
         break;
@@ -1858,7 +4134,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       if (form.update && RA(ins) == 0)
         break;
       EmitMemOp(body, layout, this_pc, n, RA(ins), 0, SIMM(ins), false, RS(ins),
-                form.size, form.store, form.sign, form.update);
+                form.size, form.store, form.sign, form.update, ins);
       touches_memory = true;
       used_locals = used_locals < 4 ? 4 : used_locals;
       handled = true;
@@ -1869,6 +4145,64 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       break;
     }
 
+    if (!handled && layout.interp_hatch)
+    {
+      // Everything except the transfers of control this compiler owns.
+      // mtmsr is inline above; a branch form it refused (bcctr that
+      // decrements CTR) is fine here, since the helper reports a changed
+      // PC and the block leaves with it.
+      const bool transfer = (op == 16 || op == 18 ||
+                             (op == 19 && (XO(ins) == 16 || XO(ins) == 528)) ||
+                             (op == 31 && XO(ins) == 146));
+      if (!transfer)
+      {
+        // The interpreter's handler does not check that floating point is
+        // available -- SingleStepInner does that around it -- so the block
+        // does, once, as for any FP instruction it translates itself.
+        if (op == 4)
+          need_pse(this_pc, n);
+        else if ((op >= 48 && op <= 63) || op == 4)
+          need_fp(this_pc, n);
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(ins));
+        body.push_back(kI32Const);
+        PutI32(body, static_cast<int32_t>(this_pc));
+        body.push_back(kCall);
+        PutU32(body, 0);
+        body.push_back(kIf);
+        body.push_back(kVoid);
+        if (layout.enable_linking)
+        {
+          // The instruction ran; charge it with the rest of the block.
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kLocalGet);
+          PutU32(body, 0);
+          body.push_back(kI32Load);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+          body.push_back(kI32Const);
+          PutI32(body, static_cast<int32_t>(n + 1));
+          body.push_back(kI32Sub);
+          body.push_back(kI32Store);
+          PutU32(body, 2);
+          PutU32(body, layout.downcount_offset);
+        }
+        // Leave with the PC the interpreter set. Unmarked: nothing is
+        // left for the dispatcher to do.
+        body.push_back(kLocalGet);
+        PutU32(body, 0);
+        body.push_back(kI32Load);
+        PutU32(body, 2);
+        PutU32(body, layout.pc_offset);
+        body.push_back(kReturn);
+        body.push_back(kEnd);
+        touches_memory = true;
+        handled = true;
+      }
+    }
     if (!handled)
     {
       stopped = "unsupported instruction";
@@ -1876,6 +4210,8 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     }
     if (followed)
       continue;
+    prev2_ins = prev_ins;
+    prev_ins = ins;
     ++n;
     cur_pc = this_pc + 4;
     // The dot forms set CR0 from the result they just wrote. Emitted after
@@ -1999,7 +4335,12 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     PutI32(body, static_cast<int32_t>(r.end_pc));
   }
 
+  // The i64 locals are 9 and 10 by construction, so a block that uses them
+  // declares all eight i32 locals whether or not it needs them.
+  if (used_i64)
+    used_locals = 8;
   r.locals = used_locals;
+  r.locals_i64 = used_i64;
   r.fixups = std::move(fixups);
   if (!emit_module)
   {
@@ -2012,7 +4353,9 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
   mb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
   if (layout.enable_linking)
     mb.ImportTable();
-  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals);
+  if (layout.interp_hatch)
+    mb.ImportFunction("env", "ppc_interp_op", {kI32, kI32, kI32}, {kI32});
+  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals, used_i64);
   r.module = mb.Build();
   return r;
 }

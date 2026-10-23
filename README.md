@@ -5,9 +5,10 @@ figures available through an emulated Portal of Power.
 
 No streaming. No server-side emulation. The game runs in the tab.
 
-> **Status: Phase 0.** Nothing works yet. Phase 0 is three spikes that decide whether this is
-> buildable at all — if they miss their gates, the project stops. See
-> [docs/PLAN.md](docs/PLAN.md).
+> **Status: Phase 3.** The game boots and runs its first seconds in a browser at 150% of real
+> time through the recompiler, with floating point still going through the interpreter in place.
+> See [docs/PHASE3-FINDINGS.md](docs/PHASE3-FINDINGS.md) for the current state and
+> [docs/PLAN.md](docs/PLAN.md) for the plan.
 
 ## The idea
 
@@ -26,8 +27,9 @@ C++ and ports for free.
 | Path | What |
 |---|---|
 | `docs/PLAN.md` | The engineering plan — feasibility audit, bets, roadmap, risks |
-| `docs/PHASE2-PROFILE.md` | Where the recompiler's time actually goes. **The current state.** |
-| `docs/PHASE3-DENSITY.md` | The plan that follows from it — code density, staged |
+| `docs/PHASE2-PROFILE.md` | Where the recompiler's time was thought to go at 195 MIPS, and the three negative results |
+| `docs/PHASE3-DENSITY.md` | The plan that followed from it — code density, staged. Superseded by the next row |
+| `docs/PHASE3-FINDINGS.md` | What was actually slow, why the density plan would not have found it, and what moved the number to 150%+ of real time. **The current state.** |
 | `docs/PHASE2-HANDOFF.md` | Written at 54 MIPS; its methodology and landmines still hold |
 | `docs/ARCHITECTURE.md` | Component map |
 | `docs/COMMIT_CONVENTION.md` | Every commit explains its own reasoning. Required. |

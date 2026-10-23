@@ -81,6 +81,8 @@ inline void PutSection(Bytes& out, uint8_t id, const Bytes& payload)
 enum : uint8_t
 {
   kI32 = 0x7F,
+  kI64 = 0x7E,
+  kF64 = 0x7C,
   kFuncType = 0x60,
 
   kBlock = 0x02,
@@ -100,6 +102,7 @@ enum : uint8_t
   kVoid = 0x40,  // block type: no result
   kLocalGet = 0x20,
   kLocalSet = 0x21,
+  kCall = 0x10,
   kI32Const = 0x41,
   kI32Load = 0x28,
   kI32Load8U = 0x2D,
@@ -128,7 +131,60 @@ enum : uint8_t
   kI64Load = 0x29,
   kI64Store = 0x37,
   kI32Rotr = 0x78,
+
+  kSelect = 0x1B,
+  kBrIf = 0x0D,
+  kLoop = 0x03,
+  kI32GeU = 0x4F,
+  kI32LeU = 0x4D,
+  kI32GeS = 0x4E,
+  kI32DivS = 0x6D,
+  kI32DivU = 0x6E,
+  kI64Const = 0x42,
+  kI64Mul = 0x7E,
+  kI64ShrS = 0x87,
+  kI64ShrU = 0x88,
+  kI64ExtendI32S = 0xAC,
+  kI64ExtendI32U = 0xAD,
+  kI32WrapI64 = 0xA7,
+  // Prefix byte for the bulk-memory instructions; memory.fill is 0x0B.
+  kPrefixFC = 0xFC,
+  kMemoryFill = 0x0B,
+
+  kI64Eqz = 0x50,
+  kI64Eq = 0x51,
+  kI64Ne = 0x52,
+  kI64LtU = 0x54,
+  kI64Add = 0x7C,
+  kI64Sub = 0x7D,
+  kI64DivU = 0x80,
+  kI64And = 0x83,
+  kI64Or = 0x84,
+  kI64Xor = 0x85,
+  kI64Shl = 0x86,
+  kI64Rotl = 0x89,
+  kI64Load32U = 0x35,
+  kF64Load = 0x2B,
+  kF64Store = 0x39,
+  kF64Const = 0x44,
+  kF64Ge = 0x66,
 };
+
+// Signed LEB128 for i64.const.
+inline void PutI64(Bytes& out, int64_t v)
+{
+  bool more = true;
+  while (more)
+  {
+    uint8_t b = v & 0x7F;
+    v >>= 7;
+    if ((v == 0 && !(b & 0x40)) || (v == -1 && (b & 0x40)))
+      more = false;
+    else
+      b |= 0x80;
+    out.push_back(b);
+  }
+}
 
 // Builds a module exporting one function, optionally importing linear memory
 // from "env" so the emitted code can reach guest state.
@@ -152,6 +208,19 @@ public:
     m_mem_shared = shared;
   }
 
+  // Import a function from the host. Imported functions take the LOW
+  // function indices, in the order they are added, and every defined
+  // function shifts up by ImportCount(): a direct call between blocks must
+  // add that offset, or it is valid wasm that calls the wrong function.
+  // Each import gets its own type, after type 0 (the block signature).
+  uint32_t ImportFunction(const std::string& module, const std::string& name,
+                          const std::vector<uint8_t>& params, const std::vector<uint8_t>& results)
+  {
+    m_func_imports.push_back({module, name, params, results});
+    return static_cast<uint32_t>(m_func_imports.size() - 1);
+  }
+  uint32_t ImportCount() const { return static_cast<uint32_t>(m_func_imports.size()); }
+
   // params/results describe the signature EVERY function in the module
   // shares. A compiled block is always (i32 state) -> i32, so one type
   // serves all of them and a direct call between two of them needs no
@@ -162,12 +231,13 @@ public:
   // computations need somewhere to keep the effective address, since wasm's
   // stack cannot be indexed twice without recomputing.
   void SetFunction(const std::vector<uint8_t>& params, const std::vector<uint8_t>& results,
-                   const Bytes& body, const std::string& export_name, uint32_t i32_locals = 0)
+                   const Bytes& body, const std::string& export_name, uint32_t i32_locals = 0,
+                   uint32_t i64_locals = 0)
   {
     m_params = params;
     m_results = results;
     m_funcs.clear();
-    AddFunction(body, export_name, i32_locals);
+    AddFunction(body, export_name, i32_locals, i64_locals);
   }
 
   // Add one more function to the module, returning its index.
@@ -178,10 +248,13 @@ public:
   // module and not per block. The index returned is also a wasm function
   // index, which is what a direct call between two blocks in the same
   // module needs.
+  // i64_locals follow the i32 locals: with one parameter and N i32 locals,
+  // the first i64 local is index N + 1. Floating-point blocks use them for
+  // 64-bit register values and byte swaps.
   uint32_t AddFunction(const Bytes& body, const std::string& export_name,
-                       uint32_t i32_locals = 0)
+                       uint32_t i32_locals = 0, uint32_t i64_locals = 0)
   {
-    m_funcs.push_back({body, export_name, i32_locals});
+    m_funcs.push_back({body, export_name, i32_locals, i64_locals});
     return static_cast<uint32_t>(m_funcs.size() - 1);
   }
 
@@ -194,30 +267,46 @@ public:
 
   uint32_t FunctionCount() const { return static_cast<uint32_t>(m_funcs.size()); }
 
+  // Give function `index` a name in the module's custom "name" section.
+  // Engines show it in profiles and stack traces; it has no other effect.
+  // Costs the bytes of the name per function, so it is opt-in.
+  void SetFunctionName(uint32_t index, const std::string& name)
+  {
+    if (index < m_funcs.size())
+      m_funcs[index].debug_name = name;
+  }
+
   Bytes Build() const
   {
     Bytes out{0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00};
 
-    // Type section: one signature.
+    // Type section: the block signature, then one type per imported
+    // function.
     {
       Bytes p;
-      PutU32(p, 1);
-      p.push_back(kFuncType);
-      PutU32(p, static_cast<uint32_t>(m_params.size()));
-      for (uint8_t t : m_params)
-        p.push_back(t);
-      PutU32(p, static_cast<uint32_t>(m_results.size()));
-      for (uint8_t t : m_results)
-        p.push_back(t);
+      PutU32(p, 1 + static_cast<uint32_t>(m_func_imports.size()));
+      auto put_type = [&](const std::vector<uint8_t>& params, const std::vector<uint8_t>& results) {
+        p.push_back(kFuncType);
+        PutU32(p, static_cast<uint32_t>(params.size()));
+        for (uint8_t t : params)
+          p.push_back(t);
+        PutU32(p, static_cast<uint32_t>(results.size()));
+        for (uint8_t t : results)
+          p.push_back(t);
+      };
+      put_type(m_params, m_results);
+      for (const FuncImport& fi : m_func_imports)
+        put_type(fi.params, fi.results);
       PutSection(out, 1, p);
     }
 
-    // Import section: linear memory, and the function table when the block
-    // links onward.
-    if (m_import_memory || m_import_table)
+    // Import section: linear memory, the function table when the block
+    // links onward, and any host functions.
+    if (m_import_memory || m_import_table || !m_func_imports.empty())
     {
       Bytes p;
-      PutU32(p, (m_import_memory ? 1u : 0u) + (m_import_table ? 1u : 0u));
+      PutU32(p, (m_import_memory ? 1u : 0u) + (m_import_table ? 1u : 0u) +
+                    static_cast<uint32_t>(m_func_imports.size()));
       if (m_import_memory)
       {
         PutName(p, "env");
@@ -237,14 +326,19 @@ public:
         p.push_back(0x00);  // limits: minimum only
         PutU32(p, 0);
       }
+      for (size_t i = 0; i < m_func_imports.size(); ++i)
+      {
+        PutName(p, m_func_imports[i].module);
+        PutName(p, m_func_imports[i].name);
+        p.push_back(0x00);  // func
+        PutU32(p, static_cast<uint32_t>(1 + i));  // its type
+      }
       PutSection(out, 2, p);
     }
 
     // Function section: every function uses type 0.
     //
-    // There are no imported FUNCTIONS -- the imports above are a memory and
-    // a table -- so defined function k is also wasm function index k, and a
-    // direct call can name it without an offset.
+    // Defined function k is wasm function index ImportCount() + k.
     {
       Bytes p;
       PutU32(p, static_cast<uint32_t>(m_funcs.size()));
@@ -261,7 +355,7 @@ public:
       {
         PutName(p, m_funcs[i].export_name);
         p.push_back(0x00);  // func
-        PutU32(p, static_cast<uint32_t>(i));
+        PutU32(p, static_cast<uint32_t>(m_func_imports.size() + i));
       }
       PutSection(out, 7, p);
     }
@@ -273,15 +367,17 @@ public:
       for (const Func& f : m_funcs)
       {
         Bytes body;
+        const uint32_t groups = (f.locals ? 1u : 0u) + (f.locals_i64 ? 1u : 0u);
+        PutU32(body, groups);
         if (f.locals)
         {
-          PutU32(body, 1);       // one local-type group
           PutU32(body, f.locals);  // how many
           body.push_back(kI32);
         }
-        else
+        if (f.locals_i64)
         {
-          PutU32(body, 0);
+          PutU32(body, f.locals_i64);
+          body.push_back(kI64);
         }
         PutBytes(body, f.body);
         body.push_back(kEnd);
@@ -290,6 +386,35 @@ public:
         PutBytes(p, body);
       }
       PutSection(out, 10, p);
+    }
+
+    // Name section, only when some function has a name. A custom section:
+    // id 0, the name "name", then subsection 1 (function names) holding a
+    // vector of (index, name) pairs in index order.
+    bool any_named = false;
+    for (const Func& f : m_funcs)
+      any_named |= !f.debug_name.empty();
+    if (any_named)
+    {
+      Bytes names;
+      uint32_t count = 0;
+      for (uint32_t i = 0; i < m_funcs.size(); ++i)
+      {
+        if (m_funcs[i].debug_name.empty())
+          continue;
+        PutU32(names, static_cast<uint32_t>(m_func_imports.size()) + i);
+        PutName(names, m_funcs[i].debug_name);
+        ++count;
+      }
+      Bytes sub;
+      PutU32(sub, count);
+      PutBytes(sub, names);
+      Bytes p;
+      PutName(p, "name");
+      p.push_back(1);  // subsection: function names
+      PutU32(p, static_cast<uint32_t>(sub.size()));
+      PutBytes(p, sub);
+      PutSection(out, 0, p);
     }
 
     return out;
@@ -301,8 +426,16 @@ private:
     Bytes body;
     std::string export_name;
     uint32_t locals = 0;
+    uint32_t locals_i64 = 0;
+    std::string debug_name;
   };
 
+  struct FuncImport
+  {
+    std::string module, name;
+    std::vector<uint8_t> params, results;
+  };
+  std::vector<FuncImport> m_func_imports;
   bool m_import_memory = false;
   bool m_import_table = false;
   uint32_t m_mem_initial = 0, m_mem_max = 0;
