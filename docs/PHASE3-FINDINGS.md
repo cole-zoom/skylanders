@@ -185,6 +185,27 @@ seconds (title to tutorial level, pressing A) and its last 90 seconds:
 | the retirement list: the skinning loop's loads and stores at `0xE0000000` bailed on every iteration; the locked L1 cache translated; the `0xCC00`/`0xCD00` MMIO mask fixed; `mfcr`/`mtcrf`/`fcmpu`/`fcmpo` inline; the FP program exception after an `mtmsr` exit | **74.0%** | **59.0%** | interpreted singly 462M → 3.5M, bails 226M → 1.2M, retired 47 → 0; hatch 1.7B (0.62%), 55% of it the fused multiply-adds |
 | a CPU profile of the window: 44% compiled blocks, 42% VideoCommon on the emulation thread (texture hashing 28%), 9% interpreter; `--dual-core` runs the GPU on its own thread as Core.cpp does (`EmulatorState(true)` is the line without which the loop sleeps) | **87.9%** | **70.4%** | same frames and draws; guest instructions 267B → 127B, the GPU-wait spinning gone |
 | `--dual-core --no-sync-idle`: the CPU not waiting for the GPU thread at each skipped idle loop (Dolphin's "Sync on skip idle" off) | 251% | 275% | **not comparable**: 11,754 frames instead of 23,249 and 15.9 per emulated second in the window -- the GPU falls behind and the game drops frames. Different work, so not a speed |
+| texture-hash counters by call site (`texhash` with `--jit-stats`), which found every hash unsampled: video set up as `Core.cpp` does it (`PopulateBackendInfo`: `g_Config.Refresh()`, `InitBackendInfo`, `VerifyValidity`) plus `SSP.ini`'s line, instead of `ActivateBackend` alone; dual core | **108.8%** | **89.9%** | hashes 528 a frame, 40.8 MB → 0.85 MB read; GPU thread 1.17 → 0.71 s and the hash 0.53 → 0.01 s per emulated second; same frames and draws. `--tex-samples=128` alone: 108.4% / 88.8% |
+| the same, single core | **97.2%** | **80.3%** | against 73.5% / 58.5% with `--no-dolphin-video-config` in the same session; **280,060,345,494 executed instructions both ways**, same hatch count, frames and draws: identical guest work |
+
+The video config, in more detail. The harness never called
+`g_Config.Refresh()`, so every `VideoConfig` field was its C++ member
+default; about thirty differ from Dolphin's (among them hash samples 0
+against 128, skip EFB/XFB copy to RAM, deferred EFB copies, fast depth,
+EFB scale) and `g_backend_info` was empty of what Null reports (geometry
+shaders, bounding box, dual-source blend). Of those only the hash samples
+changed the cost: `--tex-samples=128` alone measured the same as the
+whole setup. The skip-copy settings change nothing on Null, which has no
+copy to VRAM, so every EFB and XFB copy goes to RAM in native Dolphin too.
+The hashes that remain at 128 samples are mostly the one XFB a frame that
+Dolphin always hashes in full (`should_force_safe_hashing`).
+
+The GX capture of the full-setup dual-core run in the A/B session began
+mid-draw (`9f 00 04` and its vertices), and the decoder lost sync at byte
+0. Decoded from its first register write it matched the default run's
+register writes exactly, 28,873 draws plus the one cut off: a
+capture-timing artifact. The profiler cost about 10% of speed in these
+runs (70.4% → 63.0% in the window), more than the 5% assumed before.
 
 The native build of the harness was also repaired (`compile_region` had
 been left outside the Emscripten guard), the differential grew checks for

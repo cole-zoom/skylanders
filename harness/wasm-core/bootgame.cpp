@@ -724,7 +724,7 @@ int main(int argc, char** argv)
   bool want_l1 = true;
   bool want_dual_core = false;
   int tex_samples = -1;  // --tex-samples=N: the texture cache's hash samples, -1 = untouched
-  bool want_dolphin_video_config = false;
+  bool want_dolphin_video_config = true;
   bool want_sync_idle = true;
   bool want_nunchuk = true;
   bool want_disc_files = false;
@@ -878,19 +878,17 @@ int main(int argc, char** argv)
     else if (std::strcmp(argv[i], "--dual-core") == 0)
       want_dual_core = true;
     // --tex-samples=N: how many points of each texture the texture cache
-    // hashes; 0 hashes every byte. Dolphin's own default is 128, but the
-    // harness never calls g_Config.Refresh(), so without this flag (or
-    // --dolphin-video-config) it runs with VideoConfig's member default of 0.
+    // hashes; 0 hashes every byte. Dolphin's default, and so the harness's,
+    // is 128.
     else if (std::strncmp(argv[i], "--tex-samples=", 14) == 0)
       tex_samples = std::atoi(argv[i] + 14);
-    // --dolphin-video-config: set up video the way Core.cpp does, through
-    // VideoBackendBase::PopulateBackendInfo -- g_Config.Refresh() from the
-    // config system, the backend's InitBackendInfo, VerifyValidity -- instead
-    // of ActivateBackend alone, which leaves g_Config and g_backend_info at
-    // their C++ member defaults. Also sets the one line of this game's
-    // GameSettings/SSP.ini, which the harness has no Sys directory to load.
-    else if (std::strcmp(argv[i], "--dolphin-video-config") == 0)
-      want_dolphin_video_config = true;
+    // --no-dolphin-video-config: the harness as it was before video was set
+    // up the way Core.cpp does it -- ActivateBackend alone, g_Config and
+    // g_backend_info left at their C++ member defaults, which hash every
+    // byte of every texture. For A/B runs only: 70% of real time in the
+    // gameplay window against 88%, with the same frames and draws.
+    else if (std::strcmp(argv[i], "--no-dolphin-video-config") == 0)
+      want_dolphin_video_config = false;
     // --no-sync-idle: with --dual-core, the CPU does not wait for the GPU
     // thread to drain the FIFO each time an idle loop is skipped
     // (Dolphin's "Sync on skip idle", on by default). The game still
@@ -1435,6 +1433,16 @@ int main(int argc, char** argv)
   // thing HW::Init does) is what wires the CP and PE register blocks, and the
   // backend expects that to have happened.
   INIT_MARK("video backend");
+  // As Core.cpp does it: PopulateBackendInfo is g_Config.Refresh() from the
+  // config system, ActivateBackend, the backend's InitBackendInfo and
+  // VerifyValidity. ActivateBackend alone -- what the harness did until
+  // --no-dolphin-video-config became the exception -- leaves g_Config and
+  // g_backend_info at their C++ member defaults, among them hash samples 0:
+  // a whole-texture hash on every bind, half the GPU thread in gameplay.
+  //
+  // Dolphin also layers the game's GameSettings INI over the base config
+  // (SConfig::SetRunningGameMetadata). The harness has no Sys directory to
+  // load it from, so this game's one line is set here by hand.
   if (want_dolphin_video_config)
   {
     // GameSettings/SSP.ini: "Properly emulates the blur in the pause screen."
