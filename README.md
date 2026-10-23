@@ -9,8 +9,9 @@ No streaming. No server-side emulation. The game runs in the tab.
 > takes it from the title into the tutorial level with the character on screen, at 70% of real
 > time in gameplay and 88% over the first 390 emulated seconds with the GPU on its own thread
 > (59% and 74% single-core), CPU-side with nothing drawn.
-> See [docs/PHASE3-FINDINGS.md](docs/PHASE3-FINDINGS.md) for the current state and
-> [docs/PLAN.md](docs/PLAN.md) for the plan.
+> See [docs/PHASE3-HANDOFF.md](docs/PHASE3-HANDOFF.md) for what to do next,
+> [docs/PHASE3-FINDINGS.md](docs/PHASE3-FINDINGS.md) for the evidence and
+> [docs/PLAN.md](docs/PLAN.md) for the project.
 
 ## The idea
 
@@ -31,7 +32,8 @@ C++ and ports for free.
 | `docs/PLAN.md` | The engineering plan — feasibility audit, bets, roadmap, risks |
 | `docs/PHASE2-PROFILE.md` | Where the recompiler's time was thought to go at 195 MIPS, and the three negative results |
 | `docs/PHASE3-DENSITY.md` | The plan that followed from it — code density, staged. Superseded by the next row |
-| `docs/PHASE3-FINDINGS.md` | What was actually slow, why the density plan would not have found it, what moved the boot to 145% of real time and gameplay to 70%, and the facts about gameplay speed. **The current state.** |
+| `docs/PHASE3-FINDINGS.md` | What was actually slow, why the density plan would not have found it, what moved the boot to 145% of real time and gameplay to 70%, and the facts about gameplay speed. **The evidence.** |
+| `docs/PHASE3-HANDOFF.md` | Where the time goes now, thread by thread; the measurement to take first; the ranked work with kill gates; the landmines. **Start here.** |
 | `docs/PHASE2-HANDOFF.md` | Written at 54 MIPS; its methodology and landmines still hold |
 | `docs/ARCHITECTURE.md` | Component map |
 | `docs/COMMIT_CONVENTION.md` | Every commit explains its own reasoning. Required. |

@@ -22,7 +22,10 @@ B=dolphin-web/build-wasm
 # than they did to libcore -- MachineContext.h in particular falls through to
 # "#error No context definition for OS" instead of taking its generic path,
 # and anything that compiled would be an ODR hazard rather than a build error.
-em++ -std=c++23 -O2 -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
+# PROFILING=1 keeps the function names in the wasm (a name section, no
+# code change) so a CPU profile reads VertexLoader::RunVertices rather
+# than wasm-function[4117]. Only profile.mjs needs it.
+em++ -std=c++23 -O2 ${PROFILING:+--profiling-funcs} -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
   -D_M_GENERIC=1 -D_ARCH_32=1 \
   -sASSERTIONS=1 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
   -sFETCH=1 -sUSE_BZIP2=1 \

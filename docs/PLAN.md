@@ -512,14 +512,16 @@ contended** — that is the generalisable part, and it applies to every later br
 >
 > Documents, in this order:
 >
-> 1. **[PHASE3-FINDINGS.md](PHASE3-FINDINGS.md)** — the current state: the profile, the
->    disagreement with the density plan and the evidence, what was built, what is next.
->    Start here.
-> 2. **[PHASE2-PROFILE.md](PHASE2-PROFILE.md)** — the earlier budget at 195 MIPS and the
+> 1. **[PHASE3-HANDOFF.md](PHASE3-HANDOFF.md)** — the plan from here: where the time goes
+>    thread by thread, the measurement to take first, the ranked work with kill gates, the
+>    landmines. Start here.
+> 2. **[PHASE3-FINDINGS.md](PHASE3-FINDINGS.md)** — the evidence: the profiles, the
+>    disagreement with the density plan, what was built and what each step measured.
+> 3. **[PHASE2-PROFILE.md](PHASE2-PROFILE.md)** — the earlier budget at 195 MIPS and the
 >    three negative results. Its ranking is superseded; its landmines are not.
-> 3. **[PHASE3-DENSITY.md](PHASE3-DENSITY.md)** — the density plan. Not pursued, for the
+> 4. **[PHASE3-DENSITY.md](PHASE3-DENSITY.md)** — the density plan. Not pursued, for the
 >    reasons in the findings document; kept for its working rules.
-> 4. **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** — written at 54 MIPS; its methodology and
+> 5. **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** — written at 54 MIPS; its methodology and
 >    landmine sections have not gone stale.
 
 The longest and least certain phase. A full Broadway decoder including paired singles, lazy

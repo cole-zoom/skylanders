@@ -15,11 +15,19 @@
 # installation is a ONE-OFF cost of about 22 us per block, so a short run
 # reports a speed dominated by compilation rather than by execution: the same
 # build measures 54.7 MIPS over 200M instructions and 117.0 MIPS over 800M.
+#
+# PROFILE=<dir> runs the same thing under V8's sampling profiler, attached to
+# every worker, and writes <dir>/summary.txt (self time by function),
+# <dir>/threads.txt (each busy thread's time by category -- compiled blocks,
+# VideoCommon, interpreter, dispatcher), the raw .cpuprofile files and the
+# run's output. PROF_DELAY_MS=N starts sampling N ms after stepping begins,
+# so a late phase (gameplay) is profiled on its own. Add --jit-names so the
+# compiled blocks appear as b_<pc>.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 STEPS="${1:?usage: run-jit.sh <steps> [flags...]}"; shift || true
 
-harness/wasm-core/link.sh harness/wasm-core/bootgame.cpp /tmp/bootgame.js >/dev/null
+PROFILING="${PROFILE:+1}" harness/wasm-core/link.sh harness/wasm-core/bootgame.cpp /tmp/bootgame.js >/dev/null
 mkdir -p /tmp/bootweb && cp /tmp/bootgame.js /tmp/bootgame.wasm /tmp/bootweb/
 
 ARGS=""
@@ -45,4 +53,8 @@ var Module = {
 </script>
 <script src="bootgame.js"></script>
 HTML
+if [ -n "${PROFILE:-}" ]; then
+  mkdir -p "$PROFILE"
+  exec node harness/wasm-core/profile.mjs "$PROFILE"
+fi
 exec node harness/wasm-core/run-boot-browser.mjs
