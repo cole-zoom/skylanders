@@ -23,6 +23,8 @@
 #include <future>
 #include <thread>
 #include <map>
+#include <mutex>
+#include <unordered_set>
 #include <tuple>
 #include <unordered_map>
 #include <memory>
@@ -589,6 +591,24 @@ static void PrintTexHash(const char* label, const TexHashSnapshot& from, u64 fra
               hashes / f, hashes / e, work / f, work / e / 1e6);
 }
 
+// Every distinct shader VideoCommon created (--dump-shaders), as
+// (stage, source), from the Null backend's hook. Under --dual-core the hook
+// runs on the GPU thread; the list is read after that thread has stopped.
+static bool g_dump_shaders = false;
+static std::mutex g_shader_mutex;
+static std::unordered_set<std::string> g_shader_seen;
+static std::vector<std::pair<int, std::string>> g_shaders;
+
+extern "C" void harness_shader_source(int stage, const char* source, unsigned long size)
+{
+  if (!g_dump_shaders)
+    return;
+  std::string text(source, size);
+  std::lock_guard<std::mutex> lock(g_shader_mutex);
+  if (g_shader_seen.insert(std::to_string(stage) + text).second)
+    g_shaders.emplace_back(stage, std::move(text));
+}
+
 static void InitMark(const char* msg)
 {
   std::size_t i = 0;
@@ -727,6 +747,7 @@ int main(int argc, char** argv)
   bool want_dual_core = false;
   int tex_samples = -1;  // --tex-samples=N: the texture cache's hash samples, -1 = untouched
   bool want_dolphin_video_config = true;
+  bool want_dump_shaders = false;
   bool want_sync_idle = true;
   bool want_nunchuk = true;
   bool want_disc_files = false;
@@ -899,6 +920,13 @@ int main(int argc, char** argv)
     // gameplay window against 88%, with the same frames and draws.
     else if (std::strcmp(argv[i], "--no-dolphin-video-config") == 0)
       want_dolphin_video_config = false;
+    // --dump-shaders: report a WebGPU backend's capabilities instead of the
+    // Null backend's, so VideoCommon generates the shaders that backend
+    // would get, and print every distinct one at the end as "SHADER <stage>
+    // <base64>". For docs/PHASE3-WEBGPU.md spike S2; the run still draws
+    // nothing.
+    else if (std::strcmp(argv[i], "--dump-shaders") == 0)
+      want_dump_shaders = true;
     // --no-sync-idle: with --dual-core, the CPU does not wait for the GPU
     // thread to drain the FIFO each time an idle loop is skipped
     // (Dolphin's "Sync on skip idle", on by default). The game still
@@ -1464,6 +1492,45 @@ int main(int argc, char** argv)
     VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
   }
   check(g_video_backend != nullptr, "Null video backend activated");
+  if (want_dump_shaders)
+  {
+    // What a WebGPU backend can honestly claim, written against Metal's
+    // PopulateBackendInfo (MTLUtil.mm) -- the template backend, whose GLSL
+    // dialect (APIType::Metal: Vulkan-style bindings, through glslang to
+    // SPIR-V) is the one the translation starts from. Different from Metal
+    // where core WebGPU has less: no dynamic indexing of sampler arrays,
+    // no subgroup operations, and no bounding box until it is shown to be
+    // needed.
+    BackendInfo& bi = g_backend_info;
+    bi.api_type = APIType::Metal;
+    bi.bUsesLowerLeftOrigin = false;
+    bi.bSupportsDualSourceBlend = true;
+    bi.bSupportsPrimitiveRestart = true;
+    bi.bSupportsGeometryShaders = false;
+    bi.bSupportsComputeShaders = true;
+    bi.bSupportsEarlyZ = true;
+    bi.bSupportsBindingLayout = true;
+    bi.bSupportsBBox = false;
+    bi.bSupportsGSInstancing = false;
+    bi.bSupportsPaletteConversion = true;
+    bi.bSupportsClipControl = true;
+    bi.bSupportsFragmentStoresAndAtomics = true;
+    bi.bSupportsReversedDepthRange = false;
+    bi.bSupportsLogicOp = false;
+    bi.bSupportsGPUTextureDecoding = true;
+    bi.bSupportsCopyToVram = true;
+    bi.bSupportsBitfield = true;
+    bi.bSupportsDynamicSamplerIndexing = false;
+    bi.bSupportsFramebufferFetch = false;
+    bi.bSupportsLargePoints = false;
+    bi.bSupportsPartialDepthCopies = true;
+    bi.bSupportsDepthReadback = true;
+    bi.bSupportsTextureQueryLevels = true;
+    bi.bSupportsLodBiasInSampler = false;
+    bi.bSupportsDynamicVertexLoader = true;
+    bi.bSupportsVSLinePointExpand = true;
+    g_dump_shaders = true;
+  }
   if (tex_samples >= 0)
     g_Config.iSafeTextureCache_ColorSamples = tex_samples;
   // InitializeShared copies g_Config to g_ActiveConfig, so this is what the
@@ -2916,6 +2983,26 @@ int main(int argc, char** argv)
     // CPU wrote last.
     system.GetFifo().ExitGpuLoop();
     gpu_thread.join();
+  }
+  if (g_dump_shaders)
+  {
+    std::lock_guard<std::mutex> lock(g_shader_mutex);
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (const auto& [stage, text] : g_shaders)
+    {
+      std::string line = "SHADER " + std::to_string(stage) + " ";
+      for (size_t k = 0; k < text.size(); k += 3)
+      {
+        const u32 v = (u8(text[k]) << 16) | (k + 1 < text.size() ? u8(text[k + 1]) << 8 : 0) |
+                      (k + 2 < text.size() ? u8(text[k + 2]) : 0);
+        line += T[(v >> 18) & 63];
+        line += T[(v >> 12) & 63];
+        line += k + 1 < text.size() ? T[(v >> 6) & 63] : '=';
+        line += k + 2 < text.size() ? T[v & 63] : '=';
+      }
+      std::printf("%s\n", line.c_str());
+    }
+    std::printf("  shaders   %zu distinct\n", g_shaders.size());
   }
   if (g_texhash_on)
   {

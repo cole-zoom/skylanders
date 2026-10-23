@@ -3,3 +3,4 @@
 
 dolphin  https://github.com/dolphin-emu/dolphin.git  38d619b07691231f54e6f037fcf30a3b64fdd5a5  # version 2609a
 rea      https://github.com/morluto/rea.git          bb212ffecb47e129cc569b9867b2b6e7c9b65685
+dawn     https://github.com/google/dawn.git          b975919dfb45406ca17162e4d44c74a650caa679  # v20260423.175430, the emdawnwebgpu release Emscripten 6.0.12 pins; for Tint

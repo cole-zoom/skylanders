@@ -1,0 +1,33 @@
+<!doctype html><meta charset=utf8><title>S2 validate</title>
+<pre id=out>running</pre>
+<script type=module>
+// Every WGSL module the translation produced, through Chrome's own compiler:
+// createShaderModule on a device with the features the backend will ask for,
+// then getCompilationInfo for errors and warnings.
+const out = document.getElementById('out');
+const log = [];
+try {
+  const shaders = await (await fetch('out/game-rw/all.json')).json();
+  const adapter = await navigator.gpu.requestAdapter();
+  const want = ['dual-source-blending', 'texture-compression-bc', 'clip-distances'].filter(f => adapter.features.has(f));
+  const device = await adapter.requestDevice({ requiredFeatures: want });
+  log.push(`features ${want.join(', ')}`);
+  let ok = 0, bad = 0, warn = 0, ms = 0;
+  for (const [name, code] of Object.entries(shaders)) {
+    device.pushErrorScope('validation');
+    const t = performance.now();
+    const module = device.createShaderModule({ code });
+    const info = await module.getCompilationInfo();
+    ms += performance.now() - t;
+    const err = await device.popErrorScope();
+    const errors = info.messages.filter(m => m.type === 'error');
+    warn += info.messages.filter(m => m.type === 'warning').length;
+    if (errors.length || err) {
+      bad++;
+      if (bad <= 8) log.push(`FAIL ${name}: ${(errors[0]?.message ?? err.message).slice(0, 200)}`);
+    } else ok++;
+  }
+  log.push(`${ok} valid, ${bad} rejected, ${warn} warnings; ${(ms / Object.keys(shaders).length).toFixed(2)} ms each to create and report`);
+} catch (e) { log.push('ERROR ' + e); }
+out.textContent = log.join('\n') + '\nDONE';
+</script>
