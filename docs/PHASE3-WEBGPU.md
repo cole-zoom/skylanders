@@ -119,6 +119,15 @@ and Tint for wasm; translate the shaders this game actually creates
 *Gate:* all of them translate and validate; the size added to the wasm and
 the time per shader are measured.
 
+*Done, gate met* (`spikes/webgpu-shaders/FINDINGS.md`). The 390-s run
+creates 349 shaders. After four changes to what VideoCommon emits for
+WebGPU — eight sampler bindings instead of `samp[8]` (every TEV pixel
+shader), a bit-test `isnan`, no forced early-Z (`bSupportsEarlyZ = false`),
+32-bit palette words — all 346 that reach SPIR-V translate and are valid in
+Chrome. Tint in wasm: 5.9 ms a shader, byte-identical to native, +1.15 MB
+gzip. The device needs `dual-source-blending`, `clip-distances` and
+`texture-compression-bc`. **Tint it is**; Naga is not needed.
+
 **M1 — the backend skeleton, first pixels.** `VideoBackends/WebGPU`
 registered, `InitBackendInfo` honest, the EFB as a render target, XFB
 presentation, clears. *Gate:* the game's frame appears in a canvas — the

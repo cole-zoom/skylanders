@@ -1,0 +1,41 @@
+diff --git a/Source/Core/VideoBackends/Null/NullGfx.cpp b/Source/Core/VideoBackends/Null/NullGfx.cpp
+index 7d67b9c..20071bb 100644
+--- a/Source/Core/VideoBackends/Null/NullGfx.cpp
++++ b/Source/Core/VideoBackends/Null/NullGfx.cpp
+@@ -10,6 +10,23 @@
+ #include "VideoCommon/NativeVertexFormat.h"
+ #include "VideoCommon/VideoConfig.h"
+ 
++// Harness instrumentation hook (weak).
++//
++// Every shader VideoCommon asks this backend to create, as (stage, source).
++// The Null backend compiles nothing, so this is the one place the
++// generated source of every shader a run needs passes by -- which is what
++// a new backend's shader translation has to be tested against.
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_shader_source(int stage, const char* source,
++                                                            unsigned long size)
++{
++  (void)stage;
++  (void)source;
++  (void)size;
++}
++
+ namespace Null
+ {
+ // Init functions
+@@ -52,10 +69,11 @@ public:
+ };
+ 
+ std::unique_ptr<AbstractShader>
+-NullGfx::CreateShaderFromSource(ShaderStage stage, std::string_view /* source */,
++NullGfx::CreateShaderFromSource(ShaderStage stage, std::string_view source,
+                                 VideoCommon::ShaderIncluder* /* shader_includer */,
+                                 std::string_view /* name */)
+ {
++  harness_shader_source(static_cast<int>(stage), source.data(), source.size());
+   return std::make_unique<NullShader>(stage);
+ }
+ 
