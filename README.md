@@ -26,6 +26,9 @@ C++ and ports for free.
 | Path | What |
 |---|---|
 | `docs/PLAN.md` | The engineering plan — feasibility audit, bets, roadmap, risks |
+| `docs/PHASE2-PROFILE.md` | Where the recompiler's time actually goes. **The current state.** |
+| `docs/PHASE3-DENSITY.md` | The plan that follows from it — code density, staged |
+| `docs/PHASE2-HANDOFF.md` | Written at 54 MIPS; its methodology and landmines still hold |
 | `docs/ARCHITECTURE.md` | Component map |
 | `docs/COMMIT_CONVENTION.md` | Every commit explains its own reasoning. Required. |
 | `ppc2wasm/` | Rust crate. PowerPC (Broadway) → WebAssembly. Built native (AOT) and `wasm32` (JIT tier). |
