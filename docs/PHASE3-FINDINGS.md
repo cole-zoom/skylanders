@@ -353,8 +353,30 @@ work (0.76 s per emulated second, texture hashing above all) and the
 frame-by-frame hand-off between the two threads are what the 70% is
 made of.
 
+The same window profiled under `--dual-core`, both threads, sampling the
+last 122 s of the run (82 emulated seconds; the profiler costs ~5%, the
+window ran at 67% instead of 70%):
+
+| | GPU thread | CPU thread |
+|---|---|---|
+| busy, share of the sampled wall clock | 74% | 73% |
+| waiting for the other thread | 26% | 27% |
+| busy time per emulated second | 1.11 s | 1.09 s |
+| the lines | VideoCommon 0.92 s (`GetMurmurHash3` 0.49, `SetCPStatusFromGPU` 0.13, vertex loading ~0.15, XFB decode 0.03), JS glue on the wait path 0.16 | compiled blocks 0.81 s (12,451 sampled, top 500 = 46%), interpreter 0.18 s (all the fused multiply-adds), gather-pipe flush 0.04, dispatcher 0.04 |
+
+Neither thread is saturated and neither is under real time: each needs
+~1.1 s of work per emulated second, which caps a perfectly overlapped
+run near 90%, and a quarter of the wall clock on each side is spent
+waiting for the other. The hottest compiled blocks are real work (a
+single-precision `lfs`/`fmuls`/`fadds`/`stfs` loop at `0x8037ab50`, a
+`psq_l`/`ps_muls0`/`ps_madds1` matrix routine at `0x80138160`), not the
+GPU-wait spin, which the idle rule catches in dual core. The plan that
+follows from this is `docs/PHASE3-HANDOFF.md`; the ranking below is the
+one it refines.
+
 1. **VideoCommon's CPU-side cost**, 42% of the emulation thread in
-   gameplay, texture hashing above all. A GPU thread takes it off the
+   single-core gameplay and 0.92 s per emulated second of the GPU thread
+   in dual core, texture hashing above all. A GPU thread takes it off the
    CPU's critical path but does not make it cheaper, and a WebGPU backend
    will carry the same vertex loading and texture cache. Worth its own
    profile once there is a backend to profile it against.
@@ -444,7 +466,11 @@ past the boot with input are not comparable across builds at a fixed
 instruction count: presses are scheduled by instruction count, so timing
 changes what the game does.
 
-A CPU profile attributes samples to `b_<pc>` functions with `--jit-names`;
-the profiler runner used for this document attaches `Profiler.start` to
-every worker target over the DevTools protocol and aggregates self time
-(it lives outside the repo; the approach is a page of node).
+A CPU profile attributes samples to `b_<pc>` functions with `--jit-names`.
+`PROFILE=<dir> harness/wasm-core/run-jit.sh …` runs the same command under
+V8's sampling profiler, attached to every worker over the DevTools
+protocol (`profile.mjs`), and writes the run's output, the raw profiles,
+a self-time summary and `threads.txt` -- each busy thread by category,
+which under `--dual-core` is the CPU thread and the GPU thread side by
+side (`profile-threads.mjs`). `PROF_DELAY_MS=N` starts sampling N ms
+after stepping begins, so a late phase can be profiled on its own.
