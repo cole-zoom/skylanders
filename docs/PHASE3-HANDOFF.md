@@ -9,7 +9,27 @@ the kill gates, and the traps that have already cost time.
 Everything below was true on 2026-10-23 at commit `bbcaa3d` (#85), all four
 recompiler differentials passing (`harness/wasm-core/run-jitdiff.sh`, every
 hand-written and randomised case) and the native trace differential
-matching.
+matching — **except where the update below supersedes it.**
+
+### Update, the same day: the video config
+
+The first step of §4.1, counting the texture hashes, found the harness
+itself was the cost. `bootgame.cpp` set up video with `ActivateBackend`
+alone where `Core.cpp` calls `VideoBackendBase::PopulateBackendInfo`, so
+`g_Config.Refresh()` and the backend's `InitBackendInfo` never ran and
+every video setting was a C++ member default. Among them
+`iSafeTextureCache_ColorSamples` = 0: every texture lookup hashed the
+whole texture, 528 hashes and 40.8 MB a frame in gameplay. Video is now
+set up as `Core.cpp` does it, plus the one line of this game's
+`GameSettings/SSP.ini`; `--no-dolphin-video-config` restores the old
+setup for A/B runs.
+
+Same frames (23,249), same draws (28,874 at 390 s), and in single core
+the same 280,060,345,494 executed instructions either way — the game does
+identical work, only the GPU thread's cost changed. The hash went from
+0.53 s per emulated second on the GPU thread to 0.01 s. §1's table is
+updated; §2's profiles and §4.1 are the old setup and kept as the
+record; §3's ranking is revised.
 
 ---
 
@@ -17,22 +37,23 @@ matching.
 
 CPU-side, Null video backend, nothing drawn. Chrome 155, Apple M4.
 
-| | real-time speed |
-|---|---|
-| boot, first 2.0 emulated seconds | 141–145% |
-| 390 emulated s, title to tutorial level, pressing A, single core | 74% |
-| the gameplay window (300–390 s, character on screen, 3D scene), single core | 59% |
-| the same 390 s with the GPU on its own thread (`--dual-core`) | **88%** |
-| the gameplay window, dual core | **70%** |
+| | before (`--no-dolphin-video-config`) | now |
+|---|---|---|
+| boot, first 2.0 emulated seconds | 139–145% | 141% |
+| 390 emulated s, title to tutorial level, pressing A, single core | 74% | **97%** |
+| the gameplay window (300–390 s, character on screen, 3D scene), single core | 59% | **80%** |
+| the same 390 s with the GPU on its own thread (`--dual-core`) | 88% | **109%** |
+| the gameplay window, dual core | 70% | **89–90%** |
 
 The game runs its frame loop at 59.6 frames per emulated second
-throughout, so 70% is about 42 frames a wall second in the level. Single
+throughout, so 90% is about 54 frames a wall second in the level. Single
 and dual core render the same 23,249 frames and the same 28,874 draws in
 the GX capture at 390 s, so the game takes the same path either way.
 
 **The Phase 2 gate is not met.** `docs/PLAN.md` asks for 100% with the
-Null backend before graphics are added. The gap is 30 percentage points
-in gameplay, and the rest of this document is about where they are.
+Null backend before graphics are added. The gap is now about 10
+percentage points in gameplay, dual core, and it is on the CPU thread
+(§3).
 
 What the recompiler does today: compiled blocks are 99.9% of executed
 instructions; the hatch (an untranslated instruction calling the
@@ -93,28 +114,50 @@ idle rule and the CPU thread blocks in `SyncOnSkipIdle` rather than
 spinning; the 127 billion instructions it executes over 390 s are the
 game's work.
 
+Both profiles above are the old video setup, whole-texture hashing.
+**With Dolphin's video config, dual core**, the same window (profiler
+from 15 s into it; the window at 80.6% under the profiler, 88–90%
+without):
+
+| | GPU thread | CPU thread |
+|---|---|---|
+| busy, share of the sampled wall clock | 57% | **91%** |
+| waiting for the other thread | 43% | 9% |
+| busy time per emulated second | 0.71 s | **1.13 s** |
+| of which | VideoCommon 0.50 s: `SetCPStatusFromGPU` 0.15 s, vertex loading ~0.11 s, `RefreshPeekCache` 0.04 s, XFB decode 0.03 s, `GetMurmurHash3` ~0.01 s; JS glue (`js-to-wasm`) 0.17 s | compiled blocks 0.84 s (12,748 blocks, top 500 = 47%); interpreter 0.18 s, the fused multiply-adds as before; gather-pipe flush 0.05 s; dispatcher 0.04 s |
+
+The CPU thread binds. It needs 1.13 s of work per emulated second, so it
+cannot reach real time however fast the GPU thread gets.
+
 ---
 
 ## 3. What that decides
 
-There is no single bottleneck. Three costs of the same order, and all
-three have to move for 100%:
+*Revised for the video config.* The GPU thread's cost was mostly the
+harness's whole-texture hashing and is gone (§4.1). What remains, in
+order:
 
-1. **The GPU thread's VideoCommon work**, 0.92 s per emulated second, half
-   of it one hash function. The biggest single line in either thread and
-   the smallest change (§4.1).
-2. **The CPU thread's emitted code and its interpreter remainder**, 0.81 +
-   0.18 s per emulated second. The interpreter part is one instruction
-   family with an exact inline form (§4.2); the compiled part is flat and
-   needs the general shape of the emitted code to improve (§4.3).
-3. **The hand-off**: 0.4 s per emulated second of waiting on each side
-   (§4.4). As the first two shrink, this one's share grows.
+1. **The CPU thread's emitted code and its interpreter remainder**, 0.84 +
+   0.18 s per emulated second, and now the binding thread. The
+   interpreter part is one instruction family with an exact inline form
+   (§4.2), about 0.15 s; the compiled part is flat and needs the general
+   shape of the emitted code to improve (§4.3). Getting to 1.0 s means
+   taking about 0.13 s off this thread.
+2. **The GPU thread's remaining VideoCommon work**, 0.50 s per emulated
+   second, with 43% of its time spent waiting. Not on the critical path
+   until the CPU thread drops below it; `SetCPStatusFromGPU` (§4.1 item 4)
+   is its largest line.
+3. **The hand-off** (§4.4): the CPU thread waits 9% of the time now, so
+   this is small until item 1 moves.
 
 Reproduce the measurement before acting on it — it is one profile of one
-window on one machine, and the profiler costs about 5% of speed:
+window on one machine, and the profiler costs about 10% of speed (70.4%
+→ 63.0% and 88.8% → 79.0% in the window). Set `PROF_DELAY_MS` so that
+sampling starts inside the window: with the video config the window
+opens about 265 s into the run in dual core, not 330 s.
 
 ```sh
-PROFILE=/tmp/prof-dual PROF_DELAY_MS=345000 harness/wasm-core/run-jit.sh 300000000000 \
+PROFILE=/tmp/prof-dual PROF_DELAY_MS=280000 harness/wasm-core/run-jit.sh 300000000000 \
   --jit --jit-stats --jit-names --dual-core --input=A --skylander \
   --ticks=291600000000 --speed-from=218700000000
 cat /tmp/prof-dual/threads.txt
@@ -131,7 +174,19 @@ alone will under-report it while the GPU thread is this heavy.
 
 ## 4. The work, ranked
 
-### 4.1 VideoCommon's cost per frame
+### 4.1 VideoCommon's cost per frame — items 1–3 done or moot
+
+*Outcome.* Item 1 was done and found the premise below wrong: the
+harness was not running at 128 sample points but at 0, because it never
+loaded Dolphin's video config (see the update at the top). Measured with
+`--jit-stats`, gameplay window: 528 hashes a frame, not ~3,000 — 430
+texture lookups, 98 re-checks of bound textures, no palettes, and 112
+binds reused from TMEM with no hash. At 128 samples they read 0.85 MB a
+frame, most of it the one XFB a frame Dolphin always hashes in full
+(`should_force_safe_hashing`), and the hash is ~1% of the GPU thread.
+Items 2 (a cheaper hash) and 3 (hash less) are not worth doing at that
+size. Item 4 is still open and is the GPU thread's largest line. The
+original text follows as the record.
 
 Texture hashing is half of it. Every texture a draw binds is hashed
 on every use (`TextureCacheBase::LoadImpl`, `TCacheEntry::CalculateHash`,
@@ -188,6 +243,10 @@ it does not fall by most of the hash's share, the work is wrong
 somewhere. If it falls and the dual-core speed does not rise, the CPU
 thread (1.09 s) or the hand-off (§4.4) is now the limit, which the same
 `threads.txt` shows.
+
+*Met by the video config:* 1.17 s → 0.71 s re-measured, the hash 0.53 s
+→ 0.01 s; the dual-core window rose 70% → 89–90%, and the CPU thread, at
+1.13 s, is now the limit.
 
 ### 4.2 The fused multiply-adds inline
 
@@ -391,6 +450,23 @@ Each of these cost at least an hour this phase.
 - **Build with `harness/wasm-core/link.sh`**, not `link-jit.sh` (no Dolphin
   includes). `compile_region` must stay inside the Emscripten guard or the
   native build breaks.
+- **Check the video config before profiling VideoCommon.** The harness
+  sets Dolphin's subsystems up by hand, and a step `Core.cpp` takes that
+  the harness skips leaves its settings at C++ member defaults without a
+  word of warning: the missing `PopulateBackendInfo` was 0.53 s of the GPU
+  thread per emulated second. The `video` line at startup prints the
+  settings that matter; anything else Dolphin sets up from its config is
+  worth the same suspicion.
+- **The game's GameSettings INI is not loaded.** The browser build has no
+  Sys directory; `SSP.ini`'s one line is set by hand in `bootgame.cpp`. A
+  different game, or a Dolphin update that changes `SSP.ini`, needs that
+  line revisited.
+- **`ninja` in `dolphin-web/build-wasm` fails re-running CMake** ("The
+  selection for BZip2 changed from 'Bundled' to 'System'") since
+  emsdk's sysroot gained a `libbz2`. For a one-file change, take the
+  compile line from `ninja -t commands Source/Core/<Lib>/lib<lib>.a`, run
+  it under `emsdk_env.sh`, and `emar r` the object into the archive; a
+  real reconfigure wants `-DUSE_SYSTEM_BZIP2=OFF`.
 - **Commits need all five numbered sections** or CI rejects the PR.
   `docs/COMMIT_CONVENTION.md`; the template is `.gitmessage`.
 
@@ -410,9 +486,11 @@ harness/wasm-core/run-jit.sh 300000000000 --jit --jit-stats --dual-core --input=
   --ticks=291600000000 --speed-from=218700000000 --capture-gx=3000000 --gx-from=284310000000
 python3 -I harness/src/decode_capture.py <that run's output>        # what the GX stream draws
 
-# the same run under the profiler, sampling from the 300-s mark (345 s of
-# wall clock in dual core; 380000 for single core)
-PROFILE=/tmp/prof PROF_DELAY_MS=345000 harness/wasm-core/run-jit.sh 300000000000 \
+# the same run under the profiler, sampling from inside the window: it
+# opens ~260 s into the run in dual core and ~290 s in single core, so
+# 280000 and 305000; re-derive them (total ms minus window ms) whenever
+# the speed changes, or the profile covers the wrong stretch
+PROFILE=/tmp/prof PROF_DELAY_MS=280000 harness/wasm-core/run-jit.sh 300000000000 \
   --jit --jit-stats --jit-names --dual-core --input=A --skylander \
   --ticks=291600000000 --speed-from=218700000000
 cat /tmp/prof/threads.txt                                           # each busy thread by category
@@ -422,17 +500,23 @@ harness/wasm-core/run-jit.sh 800000000 --jit --disasm=8037ac20,12   # read a hot
 
 **The recompiler's own number in gameplay** is the CPU thread's busy
 seconds per emulated second, by category, from `threads.txt` and the
-window's emulated seconds on the `window` line (1.09 s today: compiled
-0.81, interpreter 0.18, the rest 0.10). Report recompiler changes against
+window's emulated seconds on the `window` line (1.13 s today: compiled
+0.84, interpreter 0.18, the rest 0.11). Busy seconds per emulated second
+is the thread's busy share divided by the window's speed under the
+profiler. Report recompiler changes against
 that; the dual-core wall number moves only when the slower thread or the
 waiting does.
 
 A/B flags: `--jit-no-idle`, `--jit-no-mtmsr`, `--jit-no-hatch`,
 `--jit-no-phys`, `--jit-no-gp`, `--jit-no-psq`, `--jit-no-l1`,
-`--jit-threshold=1`, `--jit-no-link`, `--no-sync-idle`, `--dual-core`.
+`--jit-threshold=1`, `--jit-no-link`, `--no-sync-idle`, `--dual-core`,
+`--no-dolphin-video-config` (video as it was set up before: member
+defaults, whole-texture hashing), `--tex-samples=N` (hash samples alone;
+0 = every byte).
 Input: `--input=A`, `--skylander`, `--pointer=X,Y`, `--period-ms`,
 `--press-ms`, `--no-nunchuk` (the game will not leave its first screen
-without a Nunchuk). Diagnostics: `--jit-stats`, `--jit-names`,
+without a Nunchuk). Diagnostics: `--jit-stats` (with the `texhash`
+lines: the texture cache's hashes by call site), `--jit-names`,
 `--disasm=ADDR,N`, `--xfb-every=T`, `--disc-files`, `--capture-gx=N`,
 `--gx-from=T`, `--speed-from=T`.
 

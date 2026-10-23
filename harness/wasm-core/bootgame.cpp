@@ -53,6 +53,8 @@
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/VideoBackendBase.h"
+#include "VideoCommon/VideoConfig.h"
+#include "Core/Config/GraphicsSettings.h"
 #include "Core/HW/GCKeyboard.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/Wiimote.h"
@@ -486,6 +488,107 @@ extern "C" void harness_core_event(const char* name, long long scheduled, long l
               static_cast<unsigned long long>(g_cur_step));
 }
 
+// The texture cache's hashes, by call site (see the hook's comment in
+// TextureCacheBase.cpp for the five sites). Counted only with --jit-stats.
+//
+// With --dual-core the hook runs on the GPU thread and the report on the CPU
+// thread, so the counters are atomics; the window snapshot is taken while the
+// GPU thread runs, which is exact to within the hashes of one draw.
+//
+// "work" is what GetMurmurHash3, the hash a wasm build uses, actually reads:
+// it steps through len/8 eight-byte blocks (len/4)/samples at a time, plus a
+// tail under eight bytes. With samples at 128 that caps a hash near 64
+// blocks however large the texture; with samples at 0 (forced safe hashing)
+// it reads every byte.
+static constexpr int kTexHashSites = 5;
+static bool g_texhash_on = false;
+struct TexHashCount
+{
+  std::atomic<u64> calls{0}, rows{0}, bytes{0}, work{0}, full{0};
+};
+static TexHashCount g_texhash[kTexHashSites];
+
+static u64 MurmurWork(u32 len, u32 samples)
+{
+  const u32 nblocks = len / 8;
+  u32 step = len / 4;
+  if (samples == 0)
+    samples = std::max(step, 1u);
+  step = std::max(step / samples, 1u);
+  return 8ull * ((nblocks + step - 1) / step) + (len & 7);
+}
+
+extern "C" void harness_texture_hash(int site, u32 len, u32 samples, u32 rows)
+{
+  if (!g_texhash_on || site < 0 || site >= kTexHashSites)
+    return;
+  TexHashCount& c = g_texhash[site];
+  c.calls.fetch_add(1, std::memory_order_relaxed);
+  if (rows == 0)
+    return;
+  c.rows.fetch_add(rows, std::memory_order_relaxed);
+  c.bytes.fetch_add(static_cast<u64>(len) * rows, std::memory_order_relaxed);
+  c.work.fetch_add(MurmurWork(len, samples) * rows, std::memory_order_relaxed);
+  if (samples == 0)
+    c.full.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct TexHashSnapshot
+{
+  u64 calls[kTexHashSites], rows[kTexHashSites], bytes[kTexHashSites], work[kTexHashSites],
+      full[kTexHashSites];
+};
+
+static TexHashSnapshot TexHashNow()
+{
+  TexHashSnapshot s;
+  for (int i = 0; i < kTexHashSites; ++i)
+  {
+    s.calls[i] = g_texhash[i].calls.load(std::memory_order_relaxed);
+    s.rows[i] = g_texhash[i].rows.load(std::memory_order_relaxed);
+    s.bytes[i] = g_texhash[i].bytes.load(std::memory_order_relaxed);
+    s.work[i] = g_texhash[i].work.load(std::memory_order_relaxed);
+    s.full[i] = g_texhash[i].full.load(std::memory_order_relaxed);
+  }
+  return s;
+}
+
+// One line per site, per frame and per emulated second, over a span that
+// started at snapshot `from`.
+static void PrintTexHash(const char* label, const TexHashSnapshot& from, u64 frames,
+                         double emu_s)
+{
+  static const char* names[kTexHashSites] = {"load: TMEM reuse, no hash",
+                                             "load: bound re-check",
+                                             "GetTexture: data", "GetTexture: palette",
+                                             "CalculateHash"};
+  const TexHashSnapshot now = TexHashNow();
+  const double f = frames ? static_cast<double>(frames) : 1.0;
+  const double e = emu_s > 0 ? emu_s : 1.0;
+  std::printf("  texhash   %s: %llu frames, %.3f emulated s\n", label,
+              static_cast<unsigned long long>(frames), emu_s);
+  u64 hashes = 0, work = 0;
+  for (int i = 0; i < kTexHashSites; ++i)
+  {
+    const u64 calls = now.calls[i] - from.calls[i];
+    const u64 rows = now.rows[i] - from.rows[i];
+    const u64 bytes = now.bytes[i] - from.bytes[i];
+    const u64 w = now.work[i] - from.work[i];
+    const u64 full = now.full[i] - from.full[i];
+    if (i == 2 || i == 3 || i == 4)
+    {
+      hashes += rows;
+      work += w;
+    }
+    std::printf("  texhash   %-26s %8.1f /frame %10.0f /s  rows %8.1f /frame  "
+                "len %8.0f B/frame  read %8.0f B/frame  unsampled %llu\n",
+                names[i], calls / f, calls / e, rows / f, bytes / f, w / f,
+                static_cast<unsigned long long>(full));
+  }
+  std::printf("  texhash   GetHash64 calls %.1f /frame, %.0f /s; %.0f B read /frame, %.1f MB/s\n",
+              hashes / f, hashes / e, work / f, work / e / 1e6);
+}
+
 static void InitMark(const char* msg)
 {
   std::size_t i = 0;
@@ -620,6 +723,8 @@ int main(int argc, char** argv)
   bool want_psq = true;
   bool want_l1 = true;
   bool want_dual_core = false;
+  int tex_samples = -1;  // --tex-samples=N: the texture cache's hash samples, -1 = untouched
+  bool want_dolphin_video_config = true;
   bool want_sync_idle = true;
   bool want_nunchuk = true;
   bool want_disc_files = false;
@@ -772,6 +877,18 @@ int main(int argc, char** argv)
     // differentials against the native oracle.
     else if (std::strcmp(argv[i], "--dual-core") == 0)
       want_dual_core = true;
+    // --tex-samples=N: how many points of each texture the texture cache
+    // hashes; 0 hashes every byte. Dolphin's default, and so the harness's,
+    // is 128.
+    else if (std::strncmp(argv[i], "--tex-samples=", 14) == 0)
+      tex_samples = std::atoi(argv[i] + 14);
+    // --no-dolphin-video-config: the harness as it was before video was set
+    // up the way Core.cpp does it -- ActivateBackend alone, g_Config and
+    // g_backend_info left at their C++ member defaults, which hash every
+    // byte of every texture. For A/B runs only: 70% of real time in the
+    // gameplay window against 88%, with the same frames and draws.
+    else if (std::strcmp(argv[i], "--no-dolphin-video-config") == 0)
+      want_dolphin_video_config = false;
     // --no-sync-idle: with --dual-core, the CPU does not wait for the GPU
     // thread to drain the FIFO each time an idle loop is skipped
     // (Dolphin's "Sync on skip idle", on by default). The game still
@@ -1316,8 +1433,37 @@ int main(int argc, char** argv)
   // thing HW::Init does) is what wires the CP and PE register blocks, and the
   // backend expects that to have happened.
   INIT_MARK("video backend");
-  VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
+  // As Core.cpp does it: PopulateBackendInfo is g_Config.Refresh() from the
+  // config system, ActivateBackend, the backend's InitBackendInfo and
+  // VerifyValidity. ActivateBackend alone -- what the harness did until
+  // --no-dolphin-video-config became the exception -- leaves g_Config and
+  // g_backend_info at their C++ member defaults, among them hash samples 0:
+  // a whole-texture hash on every bind, half the GPU thread in gameplay.
+  //
+  // Dolphin also layers the game's GameSettings INI over the base config
+  // (SConfig::SetRunningGameMetadata). The harness has no Sys directory to
+  // load it from, so this game's one line is set here by hand.
+  if (want_dolphin_video_config)
+  {
+    // GameSettings/SSP.ini: "Properly emulates the blur in the pause screen."
+    Config::SetCurrent(Config::GFX_HACK_EFB_EMULATE_FORMAT_CHANGES, true);
+    VideoBackendBase::PopulateBackendInfo(wsi);
+  }
+  else
+  {
+    VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
+  }
   check(g_video_backend != nullptr, "Null video backend activated");
+  if (tex_samples >= 0)
+    g_Config.iSafeTextureCache_ColorSamples = tex_samples;
+  // InitializeShared copies g_Config to g_ActiveConfig, so this is what the
+  // backend will run with.
+  std::printf("  video     %s; hash samples %d, copy to VRAM %d, EFB format changes %d, "
+              "geometry shaders %d, bbox %d\n",
+              want_dolphin_video_config ? "Dolphin's config" : "member defaults",
+              g_Config.iSafeTextureCache_ColorSamples, g_backend_info.bSupportsCopyToVram,
+              g_Config.bEFBEmulateFormatChanges, g_backend_info.bSupportsGeometryShaders,
+              g_backend_info.bSupportsBBox);
 
   // Single core: the GPU runs on this thread. Both of these are what
   // Core.cpp does inside its init_video lambda; passthrough means AsyncRequests
@@ -1558,6 +1704,7 @@ int main(int argc, char** argv)
   g_hatch_ppc = &ppc;
   g_hatch_state = &state;
   g_hatch_stats = want_jit_stats;
+  g_texhash_on = want_jit_stats;
   JitImportsInit();
   jit_layout.reserve_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve));
   jit_layout.reserve_address_offset =
@@ -2466,6 +2613,8 @@ int main(int argc, char** argv)
   u64 window_exec0 = 0;
   s64 window_ticks0 = 0;
   u64 window_frames0 = 0;
+  TexHashSnapshot window_texhash0{};
+  const TexHashSnapshot run_texhash0 = TexHashNow();
   u64 frames = 0;
   u32 last_xfb = 0;
   g_gx_armed = (gx_from == 0);
@@ -2681,6 +2830,7 @@ int main(int argc, char** argv)
         window_exec0 = executed;
         window_ticks0 = system.GetCoreTiming().GetTicks();
         window_frames0 = frames;
+        window_texhash0 = TexHashNow();
       }
     }
 
@@ -2754,6 +2904,15 @@ int main(int argc, char** argv)
     // CPU wrote last.
     system.GetFifo().ExitGpuLoop();
     gpu_thread.join();
+  }
+  if (g_texhash_on)
+  {
+    const s64 ticks_now = system.GetCoreTiming().GetTicks();
+    PrintTexHash("whole run", run_texhash0, frames,
+                 static_cast<double>(ticks_now - ticks_at_step_start) / 729e6);
+    if (window_open)
+      PrintTexHash("window", window_texhash0, frames - window_frames0,
+                   static_cast<double>(ticks_now - window_ticks0) / 729e6);
   }
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
   std::printf("  pc range  0x%08x .. 0x%08x (started 0x%08x, now 0x%08x)\n", min_pc, max_pc,

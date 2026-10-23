@@ -1,0 +1,79 @@
+diff --git a/Source/Core/VideoCommon/TextureCacheBase.cpp b/Source/Core/VideoCommon/TextureCacheBase.cpp
+index 0282914..359f4dd 100644
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -59,6 +59,31 @@
+ #include "VideoCommon/VideoCommon.h"
+ #include "VideoCommon/VideoConfig.h"
+ 
++// Harness instrumentation hook (weak).
++//
++// Reports every texture hash the cache takes, and every bound-texture reuse
++// that skipped one, as (site, length, samples, rows). On wasm the hash is the
++// scalar MurmurHash3 fallback rather than a CRC32 instruction, and it is a
++// quarter of a thread's time in gameplay; what that costs depends on how many
++// hashes a frame takes and from where, which only the call sites know.
++//
++//   0  LoadImpl: bound texture reused from TMEM, no hash
++//   1  LoadImpl: bound texture re-checked (the hash itself is reported as 4)
++//   2  GetTexture: the texture's data
++//   3  GetTexture: its palette
++//   4  TCacheEntry::CalculateHash, from any caller; rows > 1 when strided
++//
++// Weak DEFINITION, not a weak declaration -- an undefined weak declaration
++// resolves to null on ELF and wasm but fails the link on Mach-O.
++extern "C" __attribute__((weak)) void harness_texture_hash(int site, u32 len, u32 samples,
++                                                           u32 rows)
++{
++  (void)site;
++  (void)len;
++  (void)samples;
++  (void)rows;
++}
++
+ static const u64 TEXHASH_INVALID = 0;
+ // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
+ static const int TEXTURE_KILL_THRESHOLD = 64;
+@@ -1389,11 +1414,13 @@ RcTcacheEntry TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
+     // in it's bloom effect, which breaks without giving it the invalidated texture.
+     if (TMEM::IsCached(stage))
+     {
++      harness_texture_hash(0, 0, 0, 0);
+       return entry;
+     }
+ 
+     // Otherwise, hash the backing memory and check it's unchanged.
+     // FIXME: this doesn't correctly handle textures from tmem.
++    harness_texture_hash(1, 0, 0, 0);
+     if (!entry->invalidated && entry->base_hash == entry->CalculateHash())
+     {
+       return entry;
+@@ -1466,10 +1493,12 @@ RcTcacheEntry TextureCacheBase::GetTexture(const int textureCacheSafetyColorSamp
+   // from the low tmem bank than it should)
+   base_hash = Common::GetHash64(texture_info.GetData(), texture_info.GetTextureSize(),
+                                 textureCacheSafetyColorSampleSize);
++  harness_texture_hash(2, texture_info.GetTextureSize(), textureCacheSafetyColorSampleSize, 1);
+   u32 palette_size = 0;
+   if (texture_info.GetPaletteSize())
+   {
+     palette_size = *texture_info.GetPaletteSize();
++    harness_texture_hash(3, palette_size, textureCacheSafetyColorSampleSize, 1);
+     full_hash =
+         base_hash ^ Common::GetHash64(texture_info.GetTlutAddress(), *texture_info.GetPaletteSize(),
+                                       textureCacheSafetyColorSampleSize);
+@@ -3129,6 +3158,7 @@ u64 TCacheEntry::CalculateHash() const
+   u8* ptr = memory.GetPointerForRange(addr, size_in_bytes);
+   if (memory_stride == bytes_per_row)
+   {
++    harness_texture_hash(4, size_in_bytes, hash_sample_size, 1);
+     return Common::GetHash64(ptr, size_in_bytes, hash_sample_size);
+   }
+   else
+@@ -3143,6 +3173,7 @@ u64 TCacheEntry::CalculateHash() const
+       // side of the efb copy
+       samples_per_row = std::max(hash_sample_size / num_blocks_y, 4u);
+     }
++    harness_texture_hash(4, bytes_per_row, samples_per_row, num_blocks_y);
+ 
+     for (u32 i = 0; i < num_blocks_y; i++)
+     {
