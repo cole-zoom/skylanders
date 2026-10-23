@@ -492,15 +492,24 @@ contended** — that is the generalisable part, and it applies to every later br
 
 ### Phase 2 — `ppc2wasm`, the recompiler · ~4–6 months
 
-> **Status: the recompiler runs the game.** 98.7% of executed instructions translate, blocks
-> tail-call their successors, and the boot completes at **54.0 MIPS against 18.0 interpreted** —
-> a 3× win, with 94.9% of instructions executing as compiled WebAssembly. Full speed is ~600 MIPS,
-> so roughly 11× remains.
+> **Status: the recompiler runs the game at 195.8 MIPS** against 18.8 interpreted, with 98.6%
+> of executed instructions running as compiled WebAssembly. Full speed is ~600 MIPS, so
+> roughly 3.1× remains. Measure at several step counts: installation is a one-off cost, and
+> the same build reports 54.7 MIPS over 200M instructions and 195.8 over 800M.
 >
-> **The constraint is no longer code generation.** Emitted code measured 1538–2811 MIPS in a
-> microbenchmark; the cost is the ~17.7 million dispatcher round-trips a 200M-instruction boot
-> makes. See **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** for the ranked next steps, the
-> methodology that produced the measurable progress, and the landmines.
+> **The constraint is code DENSITY.** A guest instruction costs 0.44 ns when the compiled code
+> fits in cache and 2.25 ns when there is a megabyte of it; the boot measures 2.6. The emitted
+> code is capable of about 2,300 MIPS and delivers 400 because there is too much of it —
+> 16 bytes of wasm per arithmetic instruction and 94 per memory access.
+>
+> Three documents, in this order:
+>
+> 1. **[PHASE2-PROFILE.md](PHASE2-PROFILE.md)** — the current state, the budget, and
+>    "Three things that should have worked and did not". Start here.
+> 2. **[PHASE3-DENSITY.md](PHASE3-DENSITY.md)** — the plan that falls out of it, staged,
+>    with a kill gate before the expensive part.
+> 3. **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** — written at 54 MIPS and overtaken in
+>    places, but its methodology and landmine sections have not gone stale.
 
 The longest and least certain phase. A full Broadway decoder including paired singles, lazy
 condition-register evaluation to avoid emulating flags on every operation, static discovery of
