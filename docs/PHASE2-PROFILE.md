@@ -1,5 +1,8 @@
 # Where the 11× went
 
+> **The plan that came out of all this is `docs/PHASE3-DENSITY.md`.** Read
+> it after this one.
+>
 > **Status, after the work this document set off: 195.8 MIPS.** The
 > measurements below are the ones that produced that and they are kept as
 > written. What changed since, and what to do next, is in
