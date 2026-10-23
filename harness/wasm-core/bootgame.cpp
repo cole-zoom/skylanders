@@ -32,6 +32,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
+#include "Common/GekkoDisassembler.h"
 #include "Common/IOFile.h"
 #include "Core/Boot/Boot.h"
 #include "Core/Config/MainSettings.h"
@@ -62,6 +63,7 @@
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
 #include "Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h"
+#include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
@@ -98,7 +100,58 @@ EMSCRIPTEN_KEEPALIVE const char* harness_stage() { return (const char*)g_harness
 #endif
 }
 
+// ── the interpreter, called from compiled code ──
+//
+// What a block calls for an instruction it has no translation for; see
+// StateLayout::interp_hatch. This is Interpreter::SingleStepInner with the
+// fetch and the floating-point-availability test taken out -- the block
+// supplies the instruction word and has made that test -- and
+// Interpreter::SingleStep's exception check folded in after it. Returns
+// non-zero when the PC did not simply advance, so the block leaves with the
+// PC the interpreter chose.
+static Interpreter* g_hatch_interp = nullptr;
+static PowerPC::PowerPCManager* g_hatch_ppc = nullptr;
+static PowerPC::PowerPCState* g_hatch_state = nullptr;
+
+#if !defined(__EMSCRIPTEN__)
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+extern "C" EMSCRIPTEN_KEEPALIVE u32 ppc_interp_op(u32 /*state*/, u32 ins, u32 pc)
+{
+  auto& st = *g_hatch_state;
+  st.pc = pc;
+  st.npc = pc + 4;
+  Interpreter::RunInterpreterOp(*g_hatch_interp, UGeckoInstruction{ins});
+  // A DSI is checked before the PC advances (SingleStepInner), everything
+  // else after it (SingleStep). Both end with pc = npc.
+  if ((st.Exceptions & EXCEPTION_DSI) != 0)
+  {
+    g_hatch_ppc->CheckExceptions();
+    st.pc = st.npc;
+    return 1;
+  }
+  st.pc = st.npc;
+  if (st.Exceptions != 0)
+  {
+    g_hatch_ppc->CheckExceptions();
+    st.pc = st.npc;
+  }
+  return st.pc != pc + 4 ? 1u : 0u;
+}
+
 #if defined(__EMSCRIPTEN__)
+// The import object every block module is instantiated with: the heap, the
+// table, and the interpreter hatch, which is this module's own export.
+EM_JS(void, JitImportsInit, (), {
+  Module.__jitImports = {
+    env: {
+      memory: wasmMemory,
+      __indirect_function_table: wasmTable,
+      ppc_interp_op: wasmExports['ppc_interp_op'],
+    },
+  };
+});
+
 // Install a compiled block and return its table index, which under Emscripten
 // IS a callable function pointer.
 EM_JS(int, JitInstall, (const uint8_t* ptr, int len), {
@@ -109,9 +162,7 @@ EM_JS(int, JitInstall, (const uint8_t* ptr, int len), {
     // successor. Omitting it fails instantiation with a link error, which
     // this catch turns into a silent fallback -- every block interpreted,
     // and the only symptom a run that is SLOWER than no JIT at all.
-    const inst = new WebAssembly.Instance(mod, {
-      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
-    });
+    const inst = new WebAssembly.Instance(mod, Module.__jitImports);
     const idx = wasmTable.length;
     wasmTable.grow(1);
     wasmTable.set(idx, inst.exports.f);
@@ -137,9 +188,7 @@ EM_JS(int, JitInstallBatch, (const uint8_t* ptr, int len, int nfuncs), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, {
-      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
-    });
+    const inst = new WebAssembly.Instance(mod, Module.__jitImports);
     const base = wasmTable.length;
     wasmTable.grow(nfuncs);
     for (let i = 0; i < nfuncs; i++)
@@ -504,6 +553,14 @@ int main(int argc, char** argv)
   bool want_jit = false;
   bool want_link = true;
   bool want_jit_stats = false;
+  bool want_idle_skip = true;
+  u32 jit_threshold = 16;
+  bool want_jit_names = false;
+  bool want_hatch = true;
+  bool want_phys = true;
+  std::vector<std::pair<u32, u32>> disasm_ranges;  // --disasm=ADDR,N
+  bool want_mtmsr_continue = true;
+  u64 tick_cap = 0;
   int jit_probe = 0;
   bool want_render = false;
   std::string xfb_path;
@@ -598,6 +655,44 @@ int main(int argc, char** argv)
       jit_probe = std::atoi(argv[i] + 12);
     else if (std::strcmp(argv[i], "--jit-no-link") == 0)
       want_link = false;
+    // --jit-no-idle: spin through busy-wait loops instead of handing the
+    // rest of the slice to CoreTiming::Idle. For measuring what skipping
+    // them is worth, and for a differential that wants every instruction.
+    else if (std::strcmp(argv[i], "--jit-no-idle") == 0)
+      want_idle_skip = false;
+    // --jit-no-mtmsr: make every mtmsr leave the chain, as it used to.
+    else if (std::strcmp(argv[i], "--jit-no-mtmsr") == 0)
+      want_mtmsr_continue = false;
+    // --ticks=N: stop after N emulated ticks rather than N instructions.
+    // With idle skipping, instructions and emulated time come apart, and a
+    // fixed amount of emulated time is the comparison that means something.
+    else if (std::strncmp(argv[i], "--ticks=", 8) == 0)
+      tick_cap = std::strtoull(argv[i] + 8, nullptr, 0);
+    // --jit-threshold=N: compile a block on its Nth visit, interpreting it
+    // until then. 1 compiles everything on sight, as the dispatcher used to.
+    // --jit-names: give every compiled block a wasm name of the form
+    // b_<guest pc>, so a CPU profile attributes time to guest code rather
+    // than to wasm-function[k] in a module identified by hash.
+    else if (std::strcmp(argv[i], "--jit-names") == 0)
+      want_jit_names = true;
+    // --jit-no-hatch: an untranslated instruction ends its block and goes
+    // through the dispatcher to the interpreter, as it used to.
+    else if (std::strcmp(argv[i], "--jit-no-hatch") == 0)
+      want_hatch = false;
+    // --jit-no-phys: interpret code that runs with translation off, as
+    // the dispatcher used to, instead of compiling it in its own tier.
+    else if (std::strcmp(argv[i], "--jit-no-phys") == 0)
+      want_phys = false;
+    // --disasm=ADDR,N: at the end of the run, disassemble N guest
+    // instructions at ADDR. For reading what a hot block in a profile is.
+    else if (std::strncmp(argv[i], "--disasm=", 9) == 0)
+    {
+      unsigned addr = 0, count = 16;
+      std::sscanf(argv[i] + 9, "%x,%u", &addr, &count);
+      disasm_ranges.push_back({addr, count});
+    }
+    else if (std::strncmp(argv[i], "--jit-threshold=", 16) == 0)
+      jit_threshold = static_cast<u32>(std::strtoul(argv[i] + 16, nullptr, 0));
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -813,6 +908,15 @@ int main(int argc, char** argv)
   //     and every repeat run see the same one.
   Config::SetCurrent(Config::MAIN_CUSTOM_RTC_ENABLE, true);
   Config::SetCurrent(Config::MAIN_CUSTOM_RTC_VALUE, u32{0x5D000000});
+
+  // 1e. No speed limit. Dolphin throttles emulation to real time by
+  //     default (CoreTiming::Throttle sleeps when the guest clock runs
+  //     ahead of the wall clock), which is right for playing and wrong for
+  //     measuring: at 95% of real time it was already costing 184 ms of a
+  //     2.2 s run in clock reads and sleeps, and past 100% it would hold
+  //     the speed line at exactly 100% whatever the recompiler did. Zero
+  //     means unlimited (CoreTiming::IsSpeedUnlimited).
+  Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 0.0f);
 
   // 2. DSP HLE. HW::Init passes MAIN_DSP_HLE to DSPManager::Init and the LLE
   //    path spawns a dedicated DSP thread; HLE runs the DSP on the caller.
@@ -1081,8 +1185,19 @@ int main(int argc, char** argv)
     u32 instructions = 0;
     u8 stop = 0;          // 0 branch, 1 unsupported instruction, 2 hit the limit
     bool retired = false; // compiled, then observed to refuse its first instruction
+    // How many times the dispatcher has reached this PC uncompiled. A block
+    // is compiled on its jit_threshold-th visit; code that runs once --
+    // and a boot is mostly code that runs once -- is interpreted instead,
+    // which at a few hundred nanoseconds a block is far cheaper than the
+    // 24 us a module costs to install.
+    u8 visits = 0;
+    // Whether anything has been decided here: false means the PC has been
+    // seen but neither compiled nor refused, and compile_region may still
+    // compile it.
+    bool decided = false;
   };
   std::unordered_map<u32, JitEntry> jit_cache;
+  u64 jit_cold_runs = 0, jit_cold_insts = 0;
   u64 jit_blocks = 0, jit_insts = 0, jit_interp = 0, jit_bails = 0;
 
   // ── where the time goes ──
@@ -1128,6 +1243,7 @@ int main(int argc, char** argv)
   //                   MEM2 access looks like, and why MEM2 shows up as a
   //                   small bail count rather than as the cost it is
   std::map<u32, std::pair<u64, u32>> interp_counts, interp_retired;
+  std::map<u32, u32> interp_where;  // the last PC seen for each key
   u64 jit_retired_blocks = 0, interp_from_retired = 0;
 #if defined(__EMSCRIPTEN__)
   ppc2wasm::StateLayout jit_layout;
@@ -1142,6 +1258,60 @@ int main(int argc, char** argv)
   jit_layout.memory_pages = static_cast<u32>(JitMemoryPages());
   jit_layout.msr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, msr));
   jit_layout.downcount_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, downcount));
+  jit_layout.xer_ca_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_ca));
+  jit_layout.xer_stringctrl_offset =
+      static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_stringctrl));
+  jit_layout.ps_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, ps));
+  jit_layout.interp_hatch = want_hatch;
+  jit_layout.hatch_mmio = want_hatch;
+  jit_layout.pc_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, pc));
+  g_hatch_interp = &system.GetInterpreter();
+  g_hatch_ppc = &ppc;
+  g_hatch_state = &state;
+  JitImportsInit();
+  jit_layout.reserve_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve));
+  jit_layout.reserve_address_offset =
+      static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve_address));
+  jit_layout.fpscr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, fpscr));
+  // The time base is computed from CoreTiming's globals, which is only
+  // exact at an overclock factor of 1.0; see StateLayout::tb_*.
+  if (!Config::Get(Config::MAIN_OVERCLOCK_ENABLE))
+  {
+    auto& g = system.GetCoreTiming().GetGlobals();
+    jit_layout.tb_global_timer_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g.global_timer));
+    jit_layout.tb_slice_length_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g.slice_length));
+    jit_layout.tb_start_value_addr =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(&g.fake_TB_start_value));
+    jit_layout.tb_start_ticks_addr =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(&g.fake_TB_start_ticks));
+  }
+  jit_layout.dcache_enabled = state.m_enable_dcache;
+  jit_layout.low_dcbz_hack = Config::Get(Config::MAIN_LOW_DCBZ_HACK);
+
+  // ── the region table ──
+  //
+  // 128 host bases, one per 32 MB of guest address space, read by every
+  // compiled load and store; see StateLayout::region_table. MEM1 and its
+  // uncached mirror, MEM2 (two granules) and its mirror; everything else
+  // -- MMIO at 0xCC000000, the EFB, the locked cache, unmapped space --
+  // stays zero and bails to the interpreter, which knows what to do with
+  // it. The physical addresses the guest uses with translation off are
+  // not here either: compiled code only runs with MSR[DR] set.
+  std::vector<u32> region_table(128, 0);
+  {
+    const u32 ram = static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetRAM()));
+    const u32 exram = static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetEXRAM()));
+    region_table[0x80000000u >> 25] = ram;
+    region_table[0xC0000000u >> 25] = ram;
+    if (exram)
+    {
+      region_table[0x90000000u >> 25] = exram;
+      region_table[0x92000000u >> 25] = exram + 0x02000000u;
+      region_table[0xD0000000u >> 25] = exram;
+      region_table[0xD2000000u >> 25] = exram + 0x02000000u;
+    }
+  }
+  jit_layout.region_table = static_cast<u32>(reinterpret_cast<uintptr_t>(region_table.data()));
 
   // ── the link table ──
   //
@@ -1215,6 +1385,22 @@ int main(int argc, char** argv)
   jit_layout.trace_uncond = false;
   jit_layout.trace_backward = false;
 
+  // mtmsr stays in the chain unless the write has a consequence; see
+  // StateLayout::mtmsr_continue. 24.4M of 32.5M round-trips were these.
+  jit_layout.exceptions_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, Exceptions));
+  jit_layout.pagetable_pending_offset =
+      static_cast<u32>(offsetof(PowerPC::PowerPCState, pagetable_update_pending));
+  jit_layout.mtmsr_continue = want_link && want_mtmsr_continue;
+
+  // Idle loops hand the rest of their slice to CoreTiming::Idle; see
+  // StateLayout::idle_flag_addr. The flag lives here, read and cleared by
+  // the dispatcher after every chain.
+  u32 jit_idle_flag = 0;
+  if (want_link && want_idle_skip)
+    jit_layout.idle_flag_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&jit_idle_flag));
+  u64 jit_idle_exits = 0, jit_idled_ticks = 0, jit_mtmsr_exits = 0, jit_slices = 0;
+  u64 jit_fast_lookups = 0;
+
   // A block that does nothing but return its argument, for probe 3. It
   // isolates the indirect call itself from anything the call does.
   int jit_probe_fn = -1;
@@ -1230,12 +1416,26 @@ int main(int argc, char** argv)
     jit_probe_fn = JitInstall(pm.data(), static_cast<int>(pm.size()));
   }
 
-  // How many guest instructions a chain may run before handing control back
-  // so the emulated clock can advance. Short enough that scheduled events are
-  // not noticeably late, long enough that dispatch is amortised.
-  constexpr int kSlice = 1024;
+  // The downcount is CoreTiming's, not the dispatcher's.
+  //
+  // It used to be reset to a fixed 1024 before every chain and the clock
+  // advanced by whatever the chain consumed when it returned -- so every
+  // chain end, 32.5 million of them over the boot, paid for
+  // CoreTiming::Advance. That is not how Dolphin runs compiled code. Its
+  // dispatcher lets the downcount run from one Advance to the next: Advance
+  // sets it to the distance to the next scheduled event (capped at
+  // MAX_SLICE_LENGTH), blocks decrement it as they run, and only when it
+  // reaches zero does the clock advance and events fire. A chain that ends
+  // early for any other reason -- a link miss, a bail, an mtmsr that needs
+  // the interpreter -- simply dispatches again with whatever budget is left.
+  //
+  // Measured over an 800M-instruction boot the dispatcher loop and Advance
+  // were about 40% of the run between them, against 25% for the compiled
+  // code itself. This is the change that addresses that.
   const u32 jit_state_ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(&state));
   auto& jit_timing = system.GetCoreTiming();
+  auto& jit_interpreter = system.GetInterpreter();
+  bool jit_started = false;
 
   // Every block gets compiled, however short.
   //
@@ -1247,7 +1447,6 @@ int main(int argc, char** argv)
   // compiled -- not collisions, not a stale table, not the budget.
   constexpr u32 kMinBlock = 1;
   constexpr u32 kMaxBlock = 64;
-#endif
 
   // ── region compilation ──
   //
@@ -1264,7 +1463,55 @@ int main(int argc, char** argv)
   // callable the moment it is installed, so nothing hot waits behind
   // unrelated discoveries to become compiled.
   constexpr u32 kRegion = 16;
-  auto compile_region = [&](u32 seed) {
+
+  // ── two tiers: translation on, translation off ──
+  //
+  // Compiled code maps guest addresses through a fixed table, so a block is
+  // only right for one setting of MSR[DR]. Code that runs with translation
+  // off -- the OS's exception prologue and epilogue at physical 0x500 and
+  // friends, on every interrupt -- used to go to the interpreter on the
+  // dispatcher's DR guard: measured past the boot, most of what was still
+  // interpreted. It gets its own cache, link table and layout, whose
+  // region table maps the PHYSICAL addresses 0x00000000 (MEM1) and
+  // 0x10000000 (MEM2). A chain cannot change DR without leaving (mtmsr
+  // flips it as a sensitive bit; rfi goes through the hatch and reports a
+  // new PC), so a chain is wholly one tier or the other, and the
+  // dispatcher picks the tier by DR at every entry.
+  struct Tier
+  {
+    std::unordered_map<u32, JitEntry>& cache;
+    std::vector<u32>& link_table;
+    ppc2wasm::StateLayout& layout;
+    bool physical;
+  };
+  std::unordered_map<u32, JitEntry> jit_cache_phys;
+  constexpr u32 kLinkEntriesPhys = 1u << 16;  // the handlers are a few kilobytes of code
+  std::vector<u32> link_table_phys(kLinkEntriesPhys * 2, 0);
+  std::vector<u32> region_table_phys(128, 0);
+  {
+    const u32 ram = static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetRAM()));
+    const u32 exram = static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetEXRAM()));
+    region_table_phys[0x00000000u >> 25] = ram;
+    if (exram)
+    {
+      region_table_phys[0x10000000u >> 25] = exram;
+      region_table_phys[0x12000000u >> 25] = exram + 0x02000000u;
+    }
+  }
+  ppc2wasm::StateLayout jit_layout_phys = jit_layout;
+  jit_layout_phys.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table_phys.data()));
+  jit_layout_phys.link_mask = kLinkEntriesPhys - 1;
+  jit_layout_phys.region_table =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(region_table_phys.data()));
+  Tier tier_virt{jit_cache, link_table, jit_layout, false};
+  Tier tier_phys{jit_cache_phys, link_table_phys, jit_layout_phys, true};
+  u64 jit_phys_dispatches = 0;
+
+  auto compile_region = [&](Tier& tier, u32 seed) {
+    // The tier's state, under the names the rest of this lambda uses.
+    auto& jit_cache = tier.cache;
+    auto& link_table = tier.link_table;
+    auto& jit_layout = tier.layout;
     // Candidate PCs, bounded to MEM1 with room for a full block read.
     //
     // A successor is a GUESS about reachability, and a wrong one points at
@@ -1276,9 +1523,16 @@ int main(int argc, char** argv)
     auto push = [&](u32 p) {
       if (qn >= kRegion * 3)
         return;
-      if ((p & 0xFE000000) != 0x80000000)
-        return;
-      if ((p & 0x01FFFFFF) + kMaxBlock * 4 > 0x1800000)
+      // Code in MEM1 or MEM2, with room for a full block read. A Wii game
+      // runs relocatable modules out of MEM2, and before this accepted
+      // them every block there was interpreted forever.
+      const bool in_mem1 = tier.physical
+                               ? p + kMaxBlock * 4 <= 0x1800000
+                               : (p & 0xFE000000) == 0x80000000 &&
+                                     (p & 0x01FFFFFF) + kMaxBlock * 4 <= 0x1800000;
+      const bool in_mem2 = (p & 0xFC000000) == (tier.physical ? 0x10000000u : 0x90000000u) &&
+                           (p & 0x03FFFFFF) + kMaxBlock * 4 <= 0x4000000;
+      if (!in_mem1 && !in_mem2)
         return;
       // Stay near the seed.
       //
@@ -1307,6 +1561,9 @@ int main(int argc, char** argv)
     mb.ImportMemory(jit_layout.memory_pages, jit_layout.memory_pages, jit_layout.memory_shared);
     if (want_link)
       mb.ImportTable();
+    if (want_hatch)
+      mb.ImportFunction("env", "ppc_interp_op", {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
+                        {ppc2wasm::kI32});
     mb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
 
     struct Pending
@@ -1318,6 +1575,7 @@ int main(int argc, char** argv)
       u32 nsucc;
       ppc2wasm::Bytes body;
       u32 locals;
+      u32 locals_i64;
       std::vector<ppc2wasm::DirectFixup> fixups;
     };
     std::vector<Pending> pending;
@@ -1337,7 +1595,9 @@ int main(int argc, char** argv)
     // is recorded as "interpret this", which is the same verdict the
     // compiler would reach if the PC were reached for real.
     u32 frontier = 0;
-    const double t_translate0 = JitNow();
+    // performance.now() is not free: 21,000 calls measured at 175 ms of
+    // self time in a 2.2 s profile. Timed only when the statistics are on.
+    const double t_translate0 = want_jit_stats ? JitNow() : 0.0;
     while (pending.size() < kRegion)
     {
       if (qi >= qn)
@@ -1352,8 +1612,11 @@ int main(int argc, char** argv)
           break;  // out of bounds, or already queued
       }
       const u32 bpc = queue[qi++];
-      if (jit_cache.count(bpc))
-        continue;
+      {
+        auto seen = jit_cache.find(bpc);
+        if (seen != jit_cache.end() && seen->second.decided)
+          continue;
+      }
       u32 code[kMaxBlock];
       for (u32 k = 0; k < kMaxBlock; ++k)
         code[k] = system.GetMemory().Read_U32(bpc + k * 4);
@@ -1376,7 +1639,7 @@ int main(int argc, char** argv)
         // known until the whole region has been discovered -- the target
         // may be a block this walk has not reached yet.
         pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc,
-                           std::move(r.body), r.locals, std::move(r.fixups)});
+                           std::move(r.body), r.locals, r.locals_i64, std::move(r.fixups)});
         for (u32 i = 0; i < r.nsucc; ++i)
           push(r.succ[i]);
         // The next address in memory after this block, which is past the
@@ -1390,12 +1653,13 @@ int main(int argc, char** argv)
         // Nothing compiled here. Remembered so the compiler is not re-run
         // on every visit, exactly as before -- the only difference is that
         // this PC may have been reached by guessing rather than by running.
-        JitEntry none;
+        JitEntry& none = jit_cache[bpc];
         none.stop = stop;
-        jit_cache.emplace(bpc, none);
+        none.decided = true;
       }
     }
-    jit_t_translate += JitNow() - t_translate0;
+    if (want_jit_stats)
+      jit_t_translate += JitNow() - t_translate0;
 
     // The seed MUST end up in the cache, compiled or not. Everything
     // downstream does jit_cache.find(pc) and dereferences the result, and
@@ -1404,8 +1668,7 @@ int main(int argc, char** argv)
     // entry there means "interpret this", which is the right answer and
     // the one the old one-block-at-a-time path produced by accident.
     auto ensure_seed = [&]() {
-      if (!jit_cache.count(seed))
-        jit_cache.emplace(seed, JitEntry{});
+      jit_cache[seed].decided = true;
     };
 
     if (pending.empty())
@@ -1422,10 +1685,13 @@ int main(int argc, char** argv)
     //
     // Linear search over at most kRegion entries, which beats building a
     // map for sixteen items.
-    auto index_of = [&pending](u32 target) -> int {
+    // Imported functions take the low indices, so a sibling's function
+    // index is its position in `pending` plus the import count.
+    const int import_count = static_cast<int>(mb.ImportCount());
+    auto index_of = [&pending, import_count](u32 target) -> int {
       for (size_t k = 0; k < pending.size(); ++k)
         if (pending[k].pc == target)
-          return static_cast<int>(k);
+          return static_cast<int>(k) + import_count;
       return -1;
     };
     for (size_t k = 0; k < pending.size(); ++k)
@@ -1433,15 +1699,23 @@ int main(int argc, char** argv)
       jit_direct_holes += pending[k].fixups.size();
       jit_direct_patched += ppc2wasm::PatchDirectCalls(pending[k].body, pending[k].fixups,
                                                        index_of);
-      mb.AddFunction(pending[k].body, "f" + std::to_string(k), pending[k].locals);
+      mb.AddFunction(pending[k].body, "f" + std::to_string(k), pending[k].locals,
+                     pending[k].locals_i64);
+      if (want_jit_names)
+      {
+        char nm[16];
+        std::snprintf(nm, sizeof(nm), "b_%08x", pending[k].pc);
+        mb.SetFunctionName(static_cast<uint32_t>(k), nm);
+      }
     }
 
-    const double t_install0 = JitNow();
+    const double t_install0 = want_jit_stats ? JitNow() : 0.0;
     const auto bytes = mb.Build();
     const int base =
         JitInstallBatch(bytes.data(), static_cast<int>(bytes.size()),
                         static_cast<int>(pending.size()));
-    jit_t_install += JitNow() - t_install0;
+    if (want_jit_stats)
+      jit_t_install += JitNow() - t_install0;
     ++jit_installs;
     jit_batched += pending.size();
     {
@@ -1477,10 +1751,11 @@ int main(int argc, char** argv)
 
     for (size_t k = 0; k < pending.size(); ++k)
     {
-      JitEntry e;
+      JitEntry& e = jit_cache[pending[k].pc];
       e.index = (base < 0) ? -1 : base + static_cast<int>(k);
       e.instructions = pending[k].instructions;
       e.stop = pending[k].stop;
+      e.decided = true;
       if (e.index >= 0)
       {
         // Publish it so other blocks can jump here directly.
@@ -1488,10 +1763,10 @@ int main(int argc, char** argv)
         link_table[slot * 2 + 0] = pending[k].pc;
         link_table[slot * 2 + 1] = static_cast<u32>(e.index);
       }
-      jit_cache.emplace(pending[k].pc, e);
     }
     ensure_seed();
   };
+#endif
 
   // Run one step, through a compiled block when there is one. Returns how
   // many guest instructions were executed.
@@ -1502,76 +1777,166 @@ int main(int argc, char** argv)
       ppc.SingleStep();
       return 1;
     }
-    const u32 pc = state.pc;
-    auto it = jit_cache.find(pc);
-    if (it == jit_cache.end())
+
+    // ── the slice ──
+    //
+    // Advance opens a slice: it fires every event that is due, sets the
+    // downcount to the distance to the next one, and delivers any external
+    // interrupt that became deliverable -- which may move state.pc, so the
+    // PC is read AFTER this and not before.
+    if (!jit_started || state.downcount <= 0)
     {
-      compile_region(pc);
-      it = jit_cache.find(pc);
+      jit_started = true;
+      ++jit_slices;
+      jit_timing.Advance();
     }
-    if (it->second.index < 0)
-    {
+
+    const u32 pc = state.pc;
+
+    // One instruction through the interpreter, the way Interpreter::Run's
+    // fast loop does it: no CoreTiming::Advance per instruction. (The same
+    // lambda is defined again below, after the lookup, for the paths there;
+    // this copy serves the one early exit above it.)
+    auto interpret_one_outer = [&]() -> u32 {
       ++jit_interp;
+      jit_interpreter.SingleStepInner();
+      if (state.Exceptions != 0)
+      {
+        ppc.CheckExceptions();
+        state.pc = state.npc;
+      }
+      state.downcount -= 1;
+      return 1;
+    };
+
+    // The tier is chosen by MSR[DR]: compiled code maps guest addresses
+    // for exactly one setting of it. See Tier above.
+    if (!state.msr.DR && !want_phys)
+      return interpret_one_outer();
+    Tier& tier = state.msr.DR ? tier_virt : tier_phys;
+    auto& jit_cache = tier.cache;
+    auto& link_table = tier.link_table;
+    auto& jit_layout = tier.layout;
+    if (tier.physical)
+      ++jit_phys_dispatches;
+
+    // ── find the block ──
+    //
+    // The link table first. It is a direct-mapped {pc, index} cache that
+    // emitted code already consults on every chain step, so for a PC that
+    // has been compiled and published it answers in one load and one
+    // compare -- against a hash, a bucket walk and a compare for the
+    // unordered_map, which is now only consulted when the table misses:
+    // an uncompiled PC, a retired one, or a collision.
+    int index = -1;
+    JitEntry* entry = nullptr;
+    {
+      const u32 slot = (pc >> 2) & jit_layout.link_mask;
+      if (link_table[slot * 2 + 0] == pc && link_table[slot * 2 + 1] != 0)
+        index = static_cast<int>(link_table[slot * 2 + 1]);
+    }
+    if (index < 0)
+    {
+      entry = &jit_cache[pc];
+      if (!entry->decided)
+      {
+        if (++entry->visits < jit_threshold)
+        {
+          // Not hot yet. Interpret the straight-line run from here -- up to
+          // the first taken branch or exception -- and come back when the
+          // PC is reached again. Only the START of the run gets a cache
+          // entry, so a cold path does not seed the cache with one entry
+          // per instruction.
+          //
+          // The run stops at a budget boundary too, so the clock advances
+          // on time; and it stops if translation is turned off, since the
+          // dispatcher's own guard would otherwise be bypassed for the
+          // rest of the run.
+          u32 ran = 0;
+          while (true)
+          {
+            const u32 at = state.pc;
+            ++jit_interp;
+            jit_interpreter.SingleStepInner();
+            if (state.Exceptions != 0)
+            {
+              ppc.CheckExceptions();
+              state.pc = state.npc;
+            }
+            state.downcount -= 1;
+            ++ran;
+            if (state.pc != at + 4 || ran >= kMaxBlock || state.downcount <= 0)
+              break;
+          }
+          ++jit_cold_runs;
+          jit_cold_insts += ran;
+          return ran;
+        }
+        compile_region(tier, pc);
+        // compile_region may rehash the map; take the entry again.
+        entry = &jit_cache[pc];
+      }
+      index = entry->index;
+    }
+
+    // One instruction through the interpreter, the way Interpreter::Run's
+    // fast loop does it rather than the way Interpreter::SingleStep does:
+    // no CoreTiming::Advance per instruction. SingleStep exists for the
+    // debugger and declares a new one-tick slice every call, which is why
+    // the harness's interpreter measures 18 MIPS and why 1.4% of
+    // instructions used to cost 15% of the run.
+    auto interpret_one = [&]() -> u32 {
+      ++jit_interp;
+      jit_interpreter.SingleStepInner();
+      if (state.Exceptions != 0)
+      {
+        ppc.CheckExceptions();
+        state.pc = state.npc;
+      }
+      // One tick per instruction, the same charge compiled code makes.
+      state.downcount -= 1;
+      return 1;
+    };
+
+    if (index < 0)
+    {
       // What the interpreter is left holding. Keyed as --jit-coverage keys
       // it so the two rankings can be read side by side -- the interesting
       // comparison is an instruction that is RARE in the stream and common
       // here, which is what a missing form looks like.
-      if (want_jit_stats)
+      if (want_jit_stats && entry)
       {
         const u32 ins = system.GetMemory().Read_U32(state.pc);
         const u32 primary = ins >> 26;
         const u32 key = (primary == 31 || primary == 19 || primary == 63)
                             ? (primary << 16) | (((ins >> 1) & 0x3FF) << 1) | (ins & 1)
                             : (primary << 16);
-        auto& slot = (it->second.retired ? interp_retired : interp_counts)[key];
+        auto& slot = (entry->retired ? interp_retired : interp_counts)[key];
         ++slot.first;
         slot.second = ins;
-        if (it->second.retired)
+        interp_where[key] = state.pc;
+        if (entry->retired)
           ++interp_from_retired;
       }
-      ppc.SingleStep();
-      return 1;
+      return interpret_one();
     }
-    if (want_jit_stats)
-      ++stop_dyn[it->second.stop];
+    if (want_jit_stats && entry)
+      ++stop_dyn[entry->stop];
 
-    // The translation guard, once per chain rather than once per block.
-    //
-    // Compiled code maps guest addresses with ram_base + (ea & mask),
-    // which is only right while MSR[DR] is set. That used to be a prologue
-    // on every memory-touching block; MSR cannot change inside a chain --
-    // mtmsr ends its block and returns here -- so one check before
-    // entering is exactly as strong, and it is a C++ branch instead of
-    // five wasm instructions at 261 million block entries.
-    //
-    // Checked for every block, not just the ones that touch memory,
-    // because a chain can tail-call from a block that does not into one
-    // that does, and the dispatcher cannot see where a chain will go.
-    if (!state.msr.DR)
-    {
-      ++jit_interp;
-      ppc.SingleStep();
-      return 1;
-    }
+    // No translation guard here any more: the tier was chosen by MSR[DR]
+    // above, and MSR cannot change inside a chain without the chain
+    // leaving -- an mtmsr that flips DR returns here, and rfi reports a
+    // new PC through the hatch.
 
     using BlockFn = u32 (*)(u32);
-    BlockFn f = reinterpret_cast<BlockFn>(it->second.index);
+    BlockFn f = reinterpret_cast<BlockFn>(index);
+    if (!entry)
+      ++jit_fast_lookups;
 
-    // How far the call got is measured differently depending on whether
-    // blocks link.
-    //
-    // A LINKED block decrements the downcount itself and may tail-call
-    // several successors, so what returns is the end of a chain and the only
-    // record of its length is what the budget lost. An UNLINKED block never
-    // touches the downcount, so reading it would always say zero -- which is
-    // exactly what happened: every block fell back to the interpreter and
-    // the JIT reported 0% while quietly costing a compile per block.
-    // Only a linked chain needs a budget. Writing the downcount for an
-    // unlinked block perturbs the emulated clock for no reason -- and
-    // measurably changed what the game did, which is the sort of thing a
-    // dispatcher must never do by accident.
-    if (want_link)
-      state.downcount = kSlice;
+    // Blocks decrement the downcount themselves, so what a chain consumed
+    // is simply the difference. No chain ever runs with a non-positive
+    // budget: the slice check above guarantees it is positive on entry.
+    const int dc_before = state.downcount;
     const u32 ret = f(jit_state_ptr);
 
     const bool bailed = (ret & 1u) != 0;
@@ -1581,21 +1946,22 @@ int main(int argc, char** argv)
     if (bailed)
       ++jit_bails;
 
-    int consumed;
-    if (want_link)
-    {
-      consumed = kSlice - state.downcount;
-    }
-    else
-    {
-      // One block, so the PC says how much of it ran: a bail lands inside the
-      // block, anything else is the whole of it.
-      consumed = bailed ? static_cast<int>((next_pc - pc) / 4)
-                        : (msr_changed ? static_cast<int>((next_pc - pc) / 4)
-                                       : static_cast<int>(it->second.instructions));
-    }
+    int consumed = dc_before - state.downcount;
     if (consumed < 0)
       consumed = 0;
+
+    if (consumed == 0 && !state.msr.FP)
+    {
+      // Refused with floating point turned off. The Wii's OS switches FP
+      // contexts lazily: MSR[FP] is cleared on every thread switch and the
+      // first FP instruction of the next thread traps, so this is a block
+      // that begins with an FP instruction doing exactly what it should.
+      // Retiring it would interpret it forever for one expected trap --
+      // measured as 64,000 interpreted lfd before this check existed.
+      // Interpret the one instruction, which raises the exception, and
+      // keep the block.
+      return interpret_one();
+    }
 
     if (consumed == 0)
     {
@@ -1603,16 +1969,22 @@ int main(int argc, char** argv)
       //
       // Compiling every block, however short, is what makes a successor
       // exist to link to -- but it also creates blocks whose first
-      // instruction always refuses, usually a memory access outside MEM1.
+      // instruction always refuses, usually a memory access outside RAM.
       // Those cost a call and a chain step and never execute anything, and
       // with linking on they end a chain that was otherwise running.
       //
       // Retire it: drop the entry and clear its link slot so chains stop
       // routing through a block that cannot make progress. The decision is
       // made from OBSERVED behaviour, which is the only way -- whether an
-      // address lands in MEM1 is not knowable when the block is compiled.
-      it->second.index = -1;
-      it->second.retired = true;
+      // address lands in RAM is not knowable when the block is compiled.
+      //
+      // A block found through the link table has no `entry` in hand; it
+      // is looked up here, on this cold path, rather than on every step.
+      if (!entry)
+        entry = &jit_cache[pc];
+      entry->index = -1;
+      entry->retired = true;
+      entry->decided = true;
       ++jit_retired_blocks;
       const u32 slot = (pc >> 2) & jit_layout.link_mask;
       if (link_table[slot * 2 + 0] == pc)
@@ -1620,26 +1992,38 @@ int main(int argc, char** argv)
         link_table[slot * 2 + 0] = 0;
         link_table[slot * 2 + 1] = 0;
       }
-      ++jit_interp;
-      ppc.SingleStep();
-      return 1;
+      return interpret_one();
     }
 
-    // Advance the emulated clock by what the chain actually ran. Without
-    // this nothing scheduled ever fires: no vertical retrace, no IPC reply,
-    // and the game waits forever on a flag an interrupt was meant to set.
-    //
-    // Events that would have fired mid-chain fire at its end, so the slice
-    // size sets timing granularity. That is a real behavioural difference
-    // from the interpreter, not an implementation detail.
-    if (want_link && !bailed && !msr_changed)
+    // An idle exit: the block proved nothing it does can change its own
+    // outcome before the next event, so the rest of the slice is handed to
+    // CoreTiming::Idle -- which is what Dolphin's JIT does with the same
+    // loops. The next Advance then fires that event immediately.
+    if (jit_idle_flag)
     {
-      // This exit came back to the dispatcher, so the chain stopped here.
-      // Was its successor something we had already compiled?
-      ++miss_total;
-      auto nx = jit_cache.find(next_pc);
-      if (nx != jit_cache.end() && nx->second.index >= 0)
-        ++miss_but_cached;
+      jit_idle_flag = 0;
+      ++jit_idle_exits;
+      const int rest = state.downcount;
+      if (rest > 0)
+      {
+        jit_timing.Idle();
+        jit_idled_ticks += static_cast<u64>(rest);
+      }
+    }
+
+    if (want_link && !bailed && !msr_changed && jit_idle_flag == 0 && state.downcount > 0)
+    {
+      // This exit came back to the dispatcher with budget to spare, so the
+      // chain stopped on a lookup miss. Was its successor something we had
+      // already compiled? Only counted with the statistics on: it is a
+      // second hash lookup per chain otherwise.
+      if (want_jit_stats)
+      {
+        ++miss_total;
+        auto nx = jit_cache.find(next_pc);
+        if (nx != jit_cache.end() && nx->second.index >= 0)
+          ++miss_but_cached;
+      }
     }
 
     if (msr_changed)
@@ -1648,14 +2032,11 @@ int main(int argc, char** argv)
       // after that write happens here: translation state is recomputed, and
       // any interrupt that was already pending is taken -- which is the
       // whole reason enabling MSR[EE] cannot be a plain store.
+      ++jit_mtmsr_exits;
       ppc.MSRUpdated();
       ppc.CheckExceptions();
       state.pc = state.npc;
     }
-
-    jit_timing.GetGlobals().slice_length = consumed;
-    state.downcount = 0;
-    jit_timing.Advance();
 
     // ── per-round-trip probes ──
     //
@@ -1675,10 +2056,14 @@ int main(int argc, char** argv)
       jit_probe_sink += (jit_cache.find(next_pc) != jit_cache.end()) ? 1 : 0;
       break;
     case 2:  // CoreTiming::Advance, with no time to advance by
+    {
+      const int keep = state.downcount;
       jit_timing.GetGlobals().slice_length = 0;
       state.downcount = 0;
       jit_timing.Advance();
+      state.downcount = keep;
       break;
+    }
     case 3:  // one indirect call through the table, into a block that returns
       if (jit_probe_fn >= 0)
         jit_probe_sink += reinterpret_cast<u32 (*)(u32)>(jit_probe_fn)(jit_state_ptr);
@@ -1719,6 +2104,18 @@ int main(int argc, char** argv)
   s64 fifo_configured_at = -1, fifo_written_at = -1;
   u32 fifo_configured_pc = 0, fifo_written_pc = 0;
 
+  // Emulated time, for the speed figure that actually matters. MIPS says
+  // how fast instructions run; with idle loops skipped, instructions and
+  // time come apart, and what the player feels is emulated seconds per
+  // wall second. The Wii's clock is 729 MHz, so that is ticks / 729e6.
+  const s64 ticks_at_step_start = system.GetCoreTiming().GetTicks();
+  // Checks that need to run every step only when a flag asks for them.
+  // Each is cheap alone; together, every step, they were a measurable part
+  // of a dispatcher loop that runs 40 million times.
+  const bool slow_checks = want_trace || checkpoint != 0 || trace_from != 0 || want_events ||
+                           frame_every != 0 || want_coverage || watch_addr != 0 || dump_at != 0;
+  u64 next_mark = 0;
+
   for (u64 i = 0; i < steps; ++i)
   {
     // Liveness, not logging. The stepping phase produces NO output for
@@ -1729,14 +2126,20 @@ int main(int argc, char** argv)
     // makes a stall timeout safe to apply at all.
     //
     // Every 2^22 steps (~4M) so the cost is nothing and the marker still
-    // moves several times a minute under the wasm interpreter.
-    if ((i & 0x3FFFFF) == 0)
+    // moves several times a minute under the wasm interpreter. A threshold
+    // rather than a mask, because a compiled chain advances `i` by dozens
+    // at a time and would step over an exact multiple almost every time.
+    if (i >= next_mark)
     {
       char buf[96];
       std::snprintf(buf, sizeof(buf), "stepping %lluM",
                     static_cast<unsigned long long>(i / 1000000));
       InitMark(buf);
+      next_mark = i + (1u << 22);
     }
+    if (tick_cap &&
+        static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) >= tick_cap)
+      break;
 
     // Events are logged over the same window as the trace. --events turns
     // logging on from the first step, which --from cannot express: a window
@@ -1756,6 +2159,8 @@ int main(int argc, char** argv)
         g_press_control = "";
       }
     }
+    if (slow_checks)
+    {
     if (i >= trace_from && (want_events || trace_from))
       g_event_log_on = true;
 
@@ -1853,21 +2258,26 @@ int main(int argc, char** argv)
                       static_cast<unsigned long long>(state.ps[r].PS1AsU64()));
       }
     }
+    }  // slow_checks
     const u32 ran_now = step_once();
     i += ran_now - 1;  // the for-loop's own ++i accounts for the first
     executed += ran_now;
     min_pc = std::min(min_pc, state.pc);
     max_pc = std::max(max_pc, state.pc);
 
-    if (fifo_configured_at < 0 && fifo.CPBase.load() != 0)
+    // Two atomic loads a step until the milestone is reached, none after.
+    if (fifo_written_at < 0)
     {
-      fifo_configured_at = static_cast<s64>(i);
-      fifo_configured_pc = state.pc;
-    }
-    if (fifo_written_at < 0 && fifo.CPWritePointer.load() != wp_initial)
-    {
-      fifo_written_at = static_cast<s64>(i);
-      fifo_written_pc = state.pc;
+      if (fifo_configured_at < 0 && fifo.CPBase.load() != 0)
+      {
+        fifo_configured_at = static_cast<s64>(i);
+        fifo_configured_pc = state.pc;
+      }
+      if (fifo.CPWritePointer.load() != wp_initial)
+      {
+        fifo_written_at = static_cast<s64>(i);
+        fifo_written_pc = state.pc;
+      }
     }
 
     // A PC of zero means execution fell off into nothing, which is a failure
@@ -1890,8 +2300,13 @@ int main(int argc, char** argv)
     // recompiler exists to move, and it is reported whether or not --jit is
     // on so the two runs are directly comparable.
     const double ms = JitNow() - step_t0;
-    std::printf("  speed     %.0f ms, %.1f MIPS  (%s)\n", ms,
-                executed / (ms / 1000.0) / 1e6, want_jit ? "jit" : "interpreter");
+    const double ticks =
+        static_cast<double>(system.GetCoreTiming().GetTicks() - ticks_at_step_start);
+    // 729 MHz is the Wii's clock; one emulated second is that many ticks.
+    const double emu_s = ticks / 729e6;
+    std::printf("  speed     %.0f ms, %.1f MIPS, %.3f emulated s, %.1f%% of real time  (%s)\n", ms,
+                executed / (ms / 1000.0) / 1e6, emu_s, 100.0 * emu_s / (ms / 1000.0),
+                want_jit ? "jit" : "interpreter");
   }
 #endif
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
@@ -2014,13 +2429,13 @@ int main(int argc, char** argv)
           for (const auto& t : top)
             tot += t.first;
           for (size_t k = 0; k < top.size() && k < 8; ++k)
-            std::printf("  jit       %s %zu: primary %2u xo %4u  %10llu  %5.1f%%  (%08x)\n",
+            std::printf("  jit       %s %zu: primary %2u xo %4u  %10llu  %5.1f%%  (%08x at %08x)\n",
                         label[m], k + 1, top[k].second >> 16, (top[k].second & 0xFFFF) >> 1,
                         static_cast<unsigned long long>(top[k].first),
                         tot ? 100.0 * static_cast<double>(top[k].first) /
                                   static_cast<double>(tot)
                             : 0.0,
-                        (*maps[m])[top[k].second].second);
+                        (*maps[m])[top[k].second].second, interp_where[top[k].second]);
         }
       }
       std::printf("  jit       link table %llu/%u slots live, %.2f instructions per chain\n",
@@ -2031,6 +2446,19 @@ int main(int argc, char** argv)
     std::printf("  jit       %llu interpreted singly, %llu block bails\n",
                 static_cast<unsigned long long>(jit_interp),
                 static_cast<unsigned long long>(jit_bails));
+    std::printf("  jit       translation-off tier: %zu blocks cached, %llu dispatches\n",
+                jit_cache_phys.size(), static_cast<unsigned long long>(jit_phys_dispatches));
+    std::printf("  jit       threshold %u: %llu cold runs interpreted, %llu instructions\n",
+                jit_threshold, static_cast<unsigned long long>(jit_cold_runs),
+                static_cast<unsigned long long>(jit_cold_insts));
+    std::printf("  jit       %llu slices, %llu idle exits skipping %llu ticks, %llu mtmsr exits, "
+                "%llu of %llu dispatches through the link table\n",
+                static_cast<unsigned long long>(jit_slices),
+                static_cast<unsigned long long>(jit_idle_exits),
+                static_cast<unsigned long long>(jit_idled_ticks),
+                static_cast<unsigned long long>(jit_mtmsr_exits),
+                static_cast<unsigned long long>(jit_fast_lookups),
+                static_cast<unsigned long long>(jit_blocks));
   }
 #endif
   std::printf("  disc      %llu requests, %.2f MB fetched\n",
@@ -2211,6 +2639,18 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(r.count),
                   100.0 * static_cast<double>(r.count) / static_cast<double>(cov_total),
                   ok ? "translated" : "NOT translated");
+    }
+  }
+
+  for (const auto& [addr, count] : disasm_ranges)
+  {
+    std::printf("\n  ── guest code at %08x ──\n", addr);
+    auto& mem = system.GetMemory();
+    for (u32 k = 0; k < count; ++k)
+    {
+      const u32 a = addr + k * 4;
+      const u32 w = mem.Read_U32(a);
+      std::printf("  %08x  %08x  %s\n", a, w, Common::GekkoDisassembler::Disassemble(w, a).c_str());
     }
   }
 

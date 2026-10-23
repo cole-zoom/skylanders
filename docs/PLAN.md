@@ -492,24 +492,31 @@ contended** — that is the generalisable part, and it applies to every later br
 
 ### Phase 2 — `ppc2wasm`, the recompiler · ~4–6 months
 
-> **Status: the recompiler runs the game at 195.8 MIPS** against 18.8 interpreted, with 98.6%
-> of executed instructions running as compiled WebAssembly. Full speed is ~600 MIPS, so
-> roughly 3.1× remains. Measure at several step counts: installation is a one-off cost, and
-> the same build reports 54.7 MIPS over 200M instructions and 195.8 over 800M.
+> **Status: the boot runs at 150% of real time** in Chrome — 2.0 emulated seconds in 1.3 s
+> of wall clock, about 600 MIPS of real instructions with idle loops skipped and 830 without.
+> Twenty emulated seconds past the boot, with input and a figure on the portal, run at
+> 250–300%. Every floating-point *arithmetic* instruction still runs through the interpreter,
+> in place, from inside compiled code; that is the next thing to move.
 >
-> **The constraint is code DENSITY.** A guest instruction costs 0.44 ns when the compiled code
-> fits in cache and 2.25 ns when there is a megabyte of it; the boot measures 2.6. The emitted
-> code is capable of about 2,300 MIPS and delivers 400 because there is too much of it —
-> 16 bytes of wasm per arithmetic instruction and 94 per memory access.
+> **The constraint was never code density.** A sampling profile put the dispatcher loop at
+> 35% of the run and the compiled blocks at 25%, with a hot set of ten functions; the same
+> emitted code for the hottest loop ran at 0.59 ns per instruction in isolation, not the 2.6
+> the residual implied. What moved the number: Dolphin's slice-based timing model, idle-loop
+> skipping, `mtmsr` staying in the chain, MEM2 and the long tail of integer forms, a tier-up
+> threshold, the interpreter called in place for what is not translated, and turning off the
+> speed throttle that was quietly capping measurements at 100%.
 >
-> Three documents, in this order:
+> Documents, in this order:
 >
-> 1. **[PHASE2-PROFILE.md](PHASE2-PROFILE.md)** — the current state, the budget, and
->    "Three things that should have worked and did not". Start here.
-> 2. **[PHASE3-DENSITY.md](PHASE3-DENSITY.md)** — the plan that falls out of it, staged,
->    with a kill gate before the expensive part.
-> 3. **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** — written at 54 MIPS and overtaken in
->    places, but its methodology and landmine sections have not gone stale.
+> 1. **[PHASE3-FINDINGS.md](PHASE3-FINDINGS.md)** — the current state: the profile, the
+>    disagreement with the density plan and the evidence, what was built, what is next.
+>    Start here.
+> 2. **[PHASE2-PROFILE.md](PHASE2-PROFILE.md)** — the earlier budget at 195 MIPS and the
+>    three negative results. Its ranking is superseded; its landmines are not.
+> 3. **[PHASE3-DENSITY.md](PHASE3-DENSITY.md)** — the density plan. Not pursued, for the
+>    reasons in the findings document; kept for its working rules.
+> 4. **[PHASE2-HANDOFF.md](PHASE2-HANDOFF.md)** — written at 54 MIPS; its methodology and
+>    landmine sections have not gone stale.
 
 The longest and least certain phase. A full Broadway decoder including paired singles, lazy
 condition-register evaluation to avoid emulating flags on every operation, static discovery of

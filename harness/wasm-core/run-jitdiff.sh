@@ -24,4 +24,9 @@ cd "$(dirname "$0")/../.."
 
 OUT="${1:-/tmp/jitdiff.js}"
 harness/wasm-core/link.sh harness/wasm-core/jitdiff.cpp "$OUT"
-exec node "$OUT"
+# A larger heap, and gc() exposed so the install helpers can collect the
+# modules they replace. Reusing table slots made old instances collectable,
+# but with seventy-odd templates and FP state the suite installs some 20,000
+# modules and the worker's default heap filled before the collector caught
+# up -- it died in the block differential with "reaching memory limit".
+exec node --max-old-space-size=8192 --expose-gc "$OUT"

@@ -13,6 +13,7 @@
 // Runs only under Emscripten -- a compiled block is WebAssembly, and there is
 // nothing to execute it with natively. The encoder half is tested separately
 // in jittest.cpp, which does run in CI.
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -20,9 +21,12 @@
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Core/ConfigManager.h"
+#include "Core/CoreTiming.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/Core.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/ConditionRegister.h"
+#include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -40,6 +44,44 @@ static void check(bool ok, const char* what)
     ++g_failures;
 }
 
+// The interpreter hatch compiled blocks import; the same function the
+// dispatcher exports (bootgame.cpp), so what the differential runs is what
+// the emulator runs. See StateLayout::interp_hatch.
+static Interpreter* g_hatch_interp = nullptr;
+static PowerPC::PowerPCManager* g_hatch_ppc = nullptr;
+static PowerPC::PowerPCState* g_hatch_state = nullptr;
+
+extern "C" EMSCRIPTEN_KEEPALIVE u32 ppc_interp_op(u32 /*state*/, u32 ins, u32 pc)
+{
+  auto& st = *g_hatch_state;
+  st.pc = pc;
+  st.npc = pc + 4;
+  Interpreter::RunInterpreterOp(*g_hatch_interp, UGeckoInstruction{ins});
+  if ((st.Exceptions & EXCEPTION_DSI) != 0)
+  {
+    g_hatch_ppc->CheckExceptions();
+    st.pc = st.npc;
+    return 1;
+  }
+  st.pc = st.npc;
+  if (st.Exceptions != 0)
+  {
+    g_hatch_ppc->CheckExceptions();
+    st.pc = st.npc;
+  }
+  return st.pc != pc + 4 ? 1u : 0u;
+}
+
+EM_JS(void, JitImportsInit, (), {
+  Module.__jitImports = {
+    env: {
+      memory: wasmMemory,
+      __indirect_function_table: wasmTable,
+      ppc_interp_op: wasmExports['ppc_interp_op'],
+    },
+  };
+});
+
 // Install a module, optionally REPLACING an existing table slot.
 //
 // Growing a fresh slot per trial pins every WebAssembly.Module and Instance
@@ -52,15 +94,17 @@ EM_JS(int, InstallModuleAt, (const uint8_t* ptr, int len, int slot), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, {
-      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
-    });
+    const inst = new WebAssembly.Instance(mod, Module.__jitImports);
     let idx = slot;
     if (idx < 0) {
       idx = wasmTable.length;
       wasmTable.grow(1);
     }
     wasmTable.set(idx, inst.exports.f);
+    // Every few hundred installs, collect the modules this slot has replaced
+    // -- when the runner exposes gc(), which run-jitdiff.sh does.
+    Module.__installs = (Module.__installs | 0) + 1;
+    if (typeof gc === 'function' && (Module.__installs % 500) === 0) gc();
     return idx;
   } catch (e) {
     out('  install failed: ' + e);
@@ -84,13 +128,13 @@ EM_JS(int, InstallBatchAt, (const uint8_t* ptr, int len, int nfuncs, int slot, i
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, {
-      env: { memory: wasmMemory, __indirect_function_table: wasmTable },
-    });
+    const inst = new WebAssembly.Instance(mod, Module.__jitImports);
     let base = slot;
     if (base < 0) { base = wasmTable.length; wasmTable.grow(reserve); }
     for (let i = 0; i < nfuncs; i++)
       wasmTable.set(base + i, inst.exports['f' + i]);
+    Module.__installs = (Module.__installs | 0) + 1;
+    if (typeof gc === 'function' && (Module.__installs % 500) === 0) gc();
     return base;
   } catch (e) {
     out('  batch install failed: ' + e);
@@ -172,12 +216,28 @@ int main()
   state.spr[SPR_IBAT4L] = 0x1000'0002;
   state.spr[SPR_DBAT4U] = 0x9000'1fff;
   state.spr[SPR_DBAT4L] = 0x1000'0002;
+  // The uncached mirrors, DBAT1 and DBAT5 in CBoot::SetupBAT. Compiled code
+  // reaches them through the region table; without these the interpreter
+  // drops every access to them and the two engines are comparing different
+  // machines.
+  state.spr[SPR_DBAT1U] = 0xc000'1fff;
+  state.spr[SPR_DBAT1L] = 0x0000'002a;
+  state.spr[SPR_DBAT5U] = 0xd000'1fff;
+  state.spr[SPR_DBAT5L] = 0x1000'002a;
   HID4(state).SBE = 1;
   auto& mmu = system.GetMMU();
   mmu.DBATUpdated();
   mmu.IBATUpdated();
   state.msr.IR = 1;
   state.msr.DR = 1;
+  // Floating point on, and paired singles enabled through HID2[PSE], as
+  // the boot leaves them; the FP forms raise exceptions otherwise, and
+  // both engines agreeing on that would test nothing.
+  state.msr.FP = 1;
+  state.spr[SPR_HID2] |= (1u << 29) | (1u << 31);  // PSE, LSQE
+  // GQR1 dequantizes signed halfwords with a scale of 2, GQR0 is plain
+  // floats; psq_l/psq_st are generated against both.
+  state.spr[SPR_GQR0 + 1] = (7u << 16) | (2u << 24) | 7u | (2u << 8);
   // The machine state every differential below restores from. Captured here,
   // once, because an exception taken inside any trial masks MSR down.
   const u32 kPristineMsr = state.msr.Hex;
@@ -210,6 +270,84 @@ int main()
   layout.enable_linking = true;
   layout.cr_table_base =
       static_cast<u32>(reinterpret_cast<uintptr_t>(PowerPC::ConditionRegister::s_crTable.data()));
+  layout.xer_ca_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_ca));
+  layout.xer_stringctrl_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, xer_stringctrl));
+  layout.ps_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, ps));
+  layout.fpscr_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, fpscr));
+  layout.reserve_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve));
+  layout.reserve_address_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve_address));
+  layout.interp_hatch = true;
+  layout.pc_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, pc));
+  g_hatch_interp = &system.GetInterpreter();
+  g_hatch_ppc = &ppc;
+  g_hatch_state = &state;
+  JitImportsInit();
+  {
+    auto& g = system.GetCoreTiming().GetGlobals();
+    layout.tb_global_timer_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g.global_timer));
+    layout.tb_slice_length_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g.slice_length));
+    layout.tb_start_value_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g.fake_TB_start_value));
+    layout.tb_start_ticks_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g.fake_TB_start_ticks));
+  }
+  layout.dcache_enabled = state.m_enable_dcache;
+  // The region table, as the dispatcher builds it: MEM1, MEM2 and their
+  // uncached mirrors. The block differential points some bases into MEM2 so
+  // the second table entry is exercised and not just present.
+  std::vector<u32> region_table(128, 0);
+  {
+    const u32 ram = static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetRAM()));
+    const u32 exram = static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetEXRAM()));
+    region_table[0x80000000u >> 25] = ram;
+    region_table[0xC0000000u >> 25] = ram;
+    region_table[0x90000000u >> 25] = exram;
+    region_table[0x92000000u >> 25] = exram + 0x02000000u;
+    region_table[0xD0000000u >> 25] = exram;
+    region_table[0xD2000000u >> 25] = exram + 0x02000000u;
+  }
+  layout.region_table = static_cast<u32>(reinterpret_cast<uintptr_t>(region_table.data()));
+  // dcbz needs HID0[DCE]; the boot sets it and so does this.
+  state.spr[SPR_HID0] |= 1u << 14;
+  // Floating-point registers: seeded with a mix of ordinary doubles, bit
+  // patterns of singles widened the way lfs widens them, and the specials
+  // the conversion routines branch on -- zero, denormals, infinities and
+  // both kinds of NaN -- because those branches are where a bit-exact
+  // reimplementation goes wrong.
+  auto seed_ps = [&](auto& rnd) {
+    static const u64 kSpecials[] = {
+        0x0000000000000000ull, 0x8000000000000000ull,  // +0, -0
+        0x7FF0000000000000ull, 0xFFF0000000000000ull,  // +inf, -inf
+        0x7FF8000000000000ull, 0x7FF4000000000000ull,  // quiet NaN, signalling NaN
+        0x0008000000000000ull, 0x0000000000000001ull,  // double denormals
+        0x3810000000000000ull, 0x380FFFFFFFFFFFFFull,  // smallest normal single, just below
+        0x36A0000000000000ull, 0x3800000000000000ull,  // in the denormal-single range
+        0x3FF0000000000000ull, 0x4000000000000000ull,  // 1.0, 2.0
+        0x47EFFFFFE0000000ull, 0xC7EFFFFFE0000000ull,  // max single, as a double
+    };
+    for (int i = 0; i < 32; ++i)
+    {
+      const u32 pick = rnd() % 4;
+      u64 v;
+      if (pick == 0)
+        v = kSpecials[rnd() % (sizeof(kSpecials) / sizeof(kSpecials[0]))];
+      else if (pick == 1)
+        v = (static_cast<u64>(rnd()) << 32) | rnd();
+      else
+        v = std::bit_cast<u64>(static_cast<double>(static_cast<s32>(rnd())) / 1024.0);
+      state.ps[i].SetPS0(v);
+      state.ps[i].SetPS1((rnd() & 1) ? v : ((static_cast<u64>(rnd()) << 32) | rnd()));
+    }
+  };
+  // A random register value used as an address must not land in
+  // 0xC8000000-0xCFFFFFFF: the BAT maps it onto the EFB and hardware
+  // register space, and a store the interpreter routes there with an
+  // address no device claims indexes MMIO::Mapping's handler table past
+  // its end (no bounds check in a release build) -- a wasm trap, not a
+  // result. No game stores at random addresses there; the generator must
+  // not either. Before the hatch this never ran, because such an access
+  // bailed and the oracle was only run up to the bail.
+  auto safe_random = [](u32 v) {
+    return ((v & 0xF8000000u) == 0xC8000000u) ? (v ^ 0x40000000u) : v;
+  };
   std::printf("  gpr offset in PowerPCState: %u\n", layout.gpr_offset);
   std::printf("  heap: %u pages   guest RAM at host 0x%08x\n\n", layout.memory_pages,
               layout.ram_base);
@@ -379,10 +517,12 @@ int main()
        {0x3C60'8000, 0x6063'2000, 0x7C69'03A6, 0x4E80'0420}},
 
       // ── the guard ──
-      // MEM2 lives at 0x90000000 and a compiled block may not touch it, so
-      // the block must refuse instruction 2 and hand back its PC.
-      {"an address outside MEM1 bails to the interpreter",
-       {0x3C60'9000, 0x3880'0001, 0x8083'0000}, 2},
+      // The hardware registers live at 0xCC000000 and a compiled block may
+      // not touch them, so the block must refuse instruction 2 and hand back
+      // its PC. (This used to use MEM2, which compiled code now reaches
+      // through the region table.)
+      {"an address outside RAM bails to the interpreter",
+       {0x3C60'CC00, 0x3880'0001, 0x8083'0000}, 2},
   };
 
   for (const Case& c : cases)
@@ -498,6 +638,45 @@ int main()
     }
   }
 
+  // ── mftb ──
+  //
+  // Not comparable against the interpreter the way everything else is: the
+  // interpreter's SingleStep advances the clock, so the two engines would
+  // read different times. Checked against the formula instead, computed
+  // from the same globals the block reads, at the downcount the block had
+  // when it ran the instruction.
+  {
+    const u32 prog[2] = {0x7C6C42E6, 0x7C8D42E6};  // mftb r3 ; mftbu r4
+    auto r = ppc2wasm::CompileBlock(prog, BASE, 2, layout);
+    bool ok = r.instructions == 2;
+    if (ok)
+    {
+      const int idx = InstallModule(r.module.data(), static_cast<int>(r.module.size()));
+      ok = idx >= 0;
+      if (ok)
+      {
+        auto& g = system.GetCoreTiming().GetGlobals();
+        state.downcount = 1000;
+        state.pc = state.npc = BASE;
+        const u64 ticks = static_cast<u64>(g.global_timer) + static_cast<u64>(g.slice_length - 1000);
+        const u64 want = g.fake_TB_start_value + (ticks - g.fake_TB_start_ticks) / 12;
+        RunBlock(idx, state, ppc);
+        ok = state.gpr[3] == static_cast<u32>(want) && state.gpr[4] == static_cast<u32>(want >> 32) &&
+             state.spr[SPR_TL] == static_cast<u32>(want) && state.spr[SPR_TU] == static_cast<u32>(want >> 32);
+        if (!ok)
+          std::printf("      want %016llx got %08x:%08x\n", static_cast<unsigned long long>(want),
+                      state.gpr[4], state.gpr[3]);
+      }
+    }
+    check(ok, "mftb / mftbu read the time base CoreTiming would report");
+  }
+
+  // From here on an access outside RAM runs through the hatch rather than
+  // bailing, as the dispatcher has it. The hand-written bail case above
+  // needed the bail; the chain differential below turns this off again to
+  // keep that path exercised.
+  layout.hatch_mmio = true;
+
   // ── randomised differential ──
   //
   // Thirty-odd hand-written cases check the instructions someone thought to
@@ -535,6 +714,45 @@ int main()
         {41, 0, "lhzu"},    {45, 0, "sthu"},
         {31, 55, "lwzux"},  {31, 183, "stwux"},
         {31, 339, "mfspr"}, {31, 467, "mtspr"},
+        // The carry forms, which write XER[CA] -- compared below, because a
+        // wrong carry is invisible in the registers for a whole block.
+        {12, 0, "addic"},   {13, 0, "addic."}, {8, 0, "subfic"},
+        {31, 10, "addc"},   {31, 8, "subfc"},  {31, 138, "adde"}, {31, 136, "subfe"},
+        {31, 202, "addze"}, {31, 200, "subfze"},
+        {31, 824, "srawi"}, {31, 792, "sraw"},
+        {31, 491, "divw"},  {31, 459, "divwu"}, {31, 75, "mulhw"}, {31, 11, "mulhwu"},
+        {20, 0, "rlwimi"},  {23, 0, "rlwnm"},
+        {31, 1014, "dcbz"}, {31, 86, "dcbf"}, {31, 54, "dcbst"}, {31, 278, "dcbt"},
+        {31, 598, "sync"},  {31, 854, "eieio"},
+        // Floating-point loads and stores, and the moves that touch no flags.
+        {48, 0, "lfs"},     {49, 0, "lfsu"},   {50, 0, "lfd"},    {51, 0, "lfdu"},
+        {52, 0, "stfs"},    {53, 0, "stfsu"},  {54, 0, "stfd"},   {55, 0, "stfdu"},
+        {31, 535, "lfsx"},  {31, 567, "lfsux"}, {31, 599, "lfdx"}, {31, 631, "lfdux"},
+        {31, 663, "stfsx"}, {31, 695, "stfsux"}, {31, 727, "stfdx"}, {31, 759, "stfdux"},
+        {31, 983, "stfiwx"},
+        {63, 72, "fmr"},    {63, 40, "fneg"},  {63, 264, "fabs"}, {63, 136, "fnabs"},
+        {63, 23, "fsel"},
+        {4, 72, "ps_mr"},   {4, 40, "ps_neg"}, {4, 264, "ps_abs"}, {4, 136, "ps_nabs"},
+        {4, 528, "ps_merge00"}, {4, 560, "ps_merge01"}, {4, 592, "ps_merge10"},
+        {4, 624, "ps_merge11"}, {4, 23, "ps_sel"},
+        {46, 0, "lmw"},     {47, 0, "stmw"},
+        {31, 20, "lwarx"},  {31, 150, "stwcx."},
+        // Through the interpreter hatch: FP arithmetic, compares and
+        // conversions, the paired forms, quantized loads and stores, and
+        // the condition-register moves.
+        {63, 21, "fadd"},   {63, 20, "fsub"},  {63, 25, "fmul"},  {63, 18, "fdiv"},
+        {63, 29, "fmadd"},  {63, 28, "fmsub"}, {63, 31, "fnmadd"}, {63, 12, "frsp"},
+        {63, 15, "fctiwz"}, {63, 14, "fctiw"}, {63, 0, "fcmpu"},  {63, 32, "fcmpo"},
+        {63, 583, "mffs"},  {63, 26, "frsqrte"},
+        {59, 21, "fadds"},  {59, 20, "fsubs"}, {59, 25, "fmuls"}, {59, 18, "fdivs"},
+        {59, 29, "fmadds"}, {59, 28, "fmsubs"}, {59, 30, "fnmsubs"}, {59, 24, "fres"},
+        {4, 21, "ps_add"},  {4, 20, "ps_sub"}, {4, 25, "ps_mul"}, {4, 18, "ps_div"},
+        {4, 29, "ps_madd"}, {4, 28, "ps_msub"}, {4, 10, "ps_sum0"}, {4, 11, "ps_sum1"},
+        {4, 12, "ps_muls0"}, {4, 13, "ps_muls1"}, {4, 14, "ps_madds0"}, {4, 0, "ps_cmpu0"},
+        {4, 24, "ps_res"},
+        {56, 0, "psq_l"},   {60, 0, "psq_st"},
+        {31, 19, "mfcr"},   {31, 144, "mtcrf"}, {19, 193, "crxor"}, {19, 449, "cror"},
+        {19, 0, "mcrf"},
     };
 
     u32 seed = 0x12345678;
@@ -567,7 +785,13 @@ int main()
           // The SPR field is split and swapped, and only LR and CTR are
           // translated. Anything else stops the block and compares
           // nothing.
-          const u32 spr = (rnd() & 1) ? 8u : 9u;
+          // GQRs are read but never written here: a random quantization type
+          // is undefined (Helper_Dequantize has no case for it), and the
+          // interpreter traps on one.
+          static const u32 kSprs[] = {8, 9, 26, 27, 272, 273, 274, 275, 912, 915, 919, 1, 18, 19};
+          static const u32 kWritableSprs[] = {8, 9, 26, 27, 272, 273, 274, 275, 1, 18, 19};
+          const u32 spr = (t.xo == 339) ? kSprs[rnd() % (sizeof(kSprs) / sizeof(kSprs[0]))]
+                                        : kWritableSprs[rnd() % (sizeof(kWritableSprs) / sizeof(kWritableSprs[0]))];
           ins = (31u << 26) | (d << 21) | ((spr & 0x1F) << 16) |
                 (((spr >> 5) & 0x1F) << 11) | (t.xo << 1);
         }
@@ -581,6 +805,46 @@ int main()
           if ((rnd() & 1) && ppc2wasm::detail::RcDestination(ins | 1u) >= 0)
             ins |= 1u;
         }
+        else if (t.primary == 63 || t.primary == 4 || t.primary == 59)
+        {
+          // A-forms (five-bit XO, frC above it) for the arithmetic; the
+          // compares put a CR field where rD would be; everything else is
+          // an X-form with the full ten-bit XO.
+          const u32 c = rnd() % 32;
+          const bool a_form = t.xo < 32 && t.xo != 0 && t.xo != 12 && t.xo != 14 && t.xo != 15;
+          if (a_form)
+            ins = (t.primary << 26) | (d << 21) | (a << 16) | (b << 11) | (c << 6) | (t.xo << 1);
+          else if (t.xo == 0 || t.xo == 32)  // fcmpu, fcmpo, ps_cmpu0
+            ins = (t.primary << 26) | ((rnd() % 8) << 23) | (a << 16) | (b << 11) | (t.xo << 1);
+          else
+            ins = (t.primary << 26) | (d << 21) | (a << 16) | (b << 11) | (t.xo << 1);
+          if ((rnd() & 1) && t.xo != 0 && t.xo != 32)
+            ins |= 1u;  // Rc: CR1 from FPSCR
+        }
+        else if (t.primary == 56 || t.primary == 60)
+        {
+          // psq_l / psq_st: W selects one or both halves, I the GQR, and a
+          // small positive displacement keeps the address in the window.
+          ins = (t.primary << 26) | (d << 21) | (a << 16) | ((rnd() & 1) << 15) |
+                ((rnd() & 1) << 12) | (rnd() & 0x0FF0);
+        }
+        else if (t.primary == 19)
+        {
+          // crxor / cror take three CR bit numbers; mcrf two fields.
+          if (t.xo == 0)
+            ins = (19u << 26) | ((rnd() % 8) << 23) | ((rnd() % 8) << 18) | (t.xo << 1);
+          else
+            ins = (19u << 26) | ((rnd() % 32) << 21) | ((rnd() % 32) << 16) | ((rnd() % 32) << 11) |
+                  (t.xo << 1);
+        }
+        else if (t.primary == 31 && t.xo == 144)  // mtcrf: a random field mask
+          ins = (31u << 26) | (d << 21) | ((rnd() & 0xFF) << 12) | (t.xo << 1);
+        else if (t.primary == 46 || t.primary == 47)
+        {
+          // lmw/stmw from a high register so the run stays short enough to
+          // land inside MEM1 near the base.
+          ins = (t.primary << 26) | ((20 + rnd() % 12) << 21) | (a << 16) | (rnd() & 0x00F0);
+        }
         else
         {
           // A SMALL non-negative displacement, so the address stays inside
@@ -588,8 +852,8 @@ int main()
           // it, where the interpreter faults and a compiled block bails --
           // both correct, and not comparable.
           ins = (t.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x0FF0);
-          if (t.primary == 21 && (rnd() & 1))
-            ins |= 1u;  // rlwinm.
+          if ((t.primary == 21 || t.primary == 20 || t.primary == 23) && (rnd() & 1))
+            ins |= 1u;  // rlwinm. / rlwimi. / rlwnm.
         }
 
         // Restore the machine state before every trial.
@@ -611,16 +875,41 @@ int main()
         // Seed registers with a mix of small, negative and large values, and
         // point the ones used as addresses somewhere inside MEM1.
         for (int i = 0; i < 32; ++i)
-          state.gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : rnd();
+          state.gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : safe_random(rnd());
         state.gpr[a] = 0x8000'0000 + (rnd() & 0x000F'FFF0);
         if (t.primary == 31)
           state.gpr[b] = rnd() & 0xFF0;
         for (int i = 0; i < 8; ++i)
           state.cr.fields[i] = 0;
+        state.xer_ca = static_cast<u8>(rnd() & 1);
+        const u8 init_ca = state.xer_ca;
+        // The rest of XER too. SO folds into every compare and every CR0
+        // update, and mtxer now writes all three fields from compiled code;
+        // left unreset, a value one run wrote leaks into the other's start.
+        state.xer_so_ov = static_cast<u8>(rnd() & 3);
+        state.xer_stringctrl = static_cast<u16>(rnd() & 0xFF7F);
+        const u8 init_so_ov = state.xer_so_ov;
+        const u16 init_sc = state.xer_stringctrl;
+        // The reservation, half the time held for the address the memory
+        // forms are about to use, so stwcx. takes both of its paths.
+        state.reserve = (rnd() & 1) != 0;
+        state.reserve_address = (rnd() & 1) ? state.gpr[a] + state.gpr[b] : rnd();
+        const bool init_reserve = state.reserve;
+        const u32 init_reserve_address = state.reserve_address;
         state.spr[SPR_LR] = 0;
         state.downcount = 1000;
         u32 before[32];
         std::memcpy(before, state.gpr, sizeof(before));
+        seed_ps(rnd);
+        PowerPC::PairedSingle before_ps[32];
+        std::memcpy(before_ps, state.ps, sizeof(before_ps));
+        // FPSCR too: the Rc forms copy its top bits into CR1.
+        // FPSCR: the sticky bits sometimes set, NI (flush denormals) and the
+        // rounding mode varied, the exception-enable bits clear so nothing
+        // traps -- traps go through the same path on both engines, but
+        // they would end most trials before the interesting part.
+        state.fpscr.Hex = ((rnd() & 1) ? (rnd() & 0xF0000000u) : 0) | ((rnd() & 1) << 2) | (rnd() & 3);
+        const u32 init_fpscr = state.fpscr.Hex;
 
         memory.Write_U32(ins, BASE);
         state.pc = state.npc = BASE;
@@ -629,6 +918,14 @@ int main()
         std::memcpy(want, state.gpr, sizeof(want));
         u64 want_cr[8];
         std::memcpy(want_cr, state.cr.fields, sizeof(want_cr));
+        const u8 want_ca = state.xer_ca;
+        const u8 want_so_ov = state.xer_so_ov;
+        const u16 want_sc = state.xer_stringctrl;
+        const bool want_reserve = state.reserve;
+        const u32 want_reserve_address = state.reserve_address;
+        const u32 want_fpscr = state.fpscr.Hex;
+        PowerPC::PairedSingle want_ps[32];
+        std::memcpy(want_ps, state.ps, sizeof(want_ps));
 
         auto rr = ppc2wasm::CompileBlock(&ins, BASE, 1, layout);
         if (rr.instructions != 1)
@@ -642,8 +939,15 @@ int main()
         slot = ix;
 
         std::memcpy(state.gpr, before, sizeof(before));
+        std::memcpy(state.ps, before_ps, sizeof(before_ps));
+        state.fpscr.Hex = init_fpscr;
         for (int i = 0; i < 8; ++i)
           state.cr.fields[i] = 0;
+        state.xer_ca = init_ca;
+        state.xer_so_ov = init_so_ov;
+        state.xer_stringctrl = init_sc;
+        state.reserve = init_reserve;
+        state.reserve_address = init_reserve_address;
         state.spr[SPR_LR] = 0;
         state.downcount = 1000;
         state.pc = state.npc = BASE;
@@ -672,6 +976,43 @@ int main()
             bad = true;
           }
         }
+        // The carry, which the add/subtract-with-carry forms, subfic and
+        // the arithmetic shifts write, and which nothing in the registers
+        // or the condition fields reveals.
+        if (!bad && (state.xer_ca != want_ca || state.xer_so_ov != want_so_ov ||
+                     state.xer_stringctrl != want_sc))
+        {
+          std::printf("  %-8s ins=%08x XER interpreter=ca%u so_ov%u sc%04x recompiled=ca%u so_ov%u sc%04x\n",
+                      t.name, ins, want_ca, want_so_ov, want_sc, state.xer_ca, state.xer_so_ov,
+                      state.xer_stringctrl);
+          bad = true;
+        }
+        if (!bad && state.fpscr.Hex != want_fpscr)
+        {
+          std::printf("  %-8s ins=%08x FPSCR interpreter=%08x recompiled=%08x\n", t.name, ins,
+                      want_fpscr, state.fpscr.Hex);
+          bad = true;
+        }
+        if (!bad && (state.reserve != want_reserve ||
+                     (state.reserve && state.reserve_address != want_reserve_address)))
+        {
+          std::printf("  %-8s ins=%08x reservation interpreter=%d@%08x recompiled=%d@%08x\n", t.name,
+                      ins, want_reserve, want_reserve_address, state.reserve, state.reserve_address);
+          bad = true;
+        }
+        for (int i = 0; i < 32 && !bad; ++i)
+        {
+          if (state.ps[i].PS0AsU64() != want_ps[i].PS0AsU64() ||
+              state.ps[i].PS1AsU64() != want_ps[i].PS1AsU64())
+          {
+            std::printf("  %-8s ins=%08x f%-2d interpreter=%016llx/%016llx recompiled=%016llx/%016llx\n",
+                        t.name, ins, i, static_cast<unsigned long long>(want_ps[i].PS0AsU64()),
+                        static_cast<unsigned long long>(want_ps[i].PS1AsU64()),
+                        static_cast<unsigned long long>(state.ps[i].PS0AsU64()),
+                        static_cast<unsigned long long>(state.ps[i].PS1AsU64()));
+            bad = true;
+          }
+        }
         if (bad)
         {
           ++fails_here;
@@ -697,8 +1038,11 @@ int main()
   {
     std::printf("\n  randomised block differential\n");
 
-    // A scratch window for stores, well away from the code being run.
+    // A scratch window for stores, well away from the code being run, and a
+    // second one in MEM2 so the region table's second entry is exercised:
+    // a base register points into one or the other.
     constexpr u32 kScratch = 0x8001'0000;
+    constexpr u32 kScratch2 = 0x9001'0000;
     constexpr u32 kScratchWords = 256;
 
     // Instructions the generator draws from. Deliberately a mix of
@@ -729,6 +1073,23 @@ int main()
         {31, 339}, // mfspr
         {31, 467}, // mtspr
         {16, 0},  // a conditional branch, to exercise an early exit
+        // The carry forms, shifts, divides and dcbz. dcbz zeroes 32 bytes
+        // of the scratch window, which the digest sees.
+        {12, 0}, {13, 0}, {8, 0}, {31, 10}, {31, 8}, {31, 138}, {31, 136}, {31, 202}, {31, 200},
+        {31, 824}, {31, 792}, {31, 491}, {31, 459}, {31, 75}, {31, 11}, {20, 0}, {23, 0},
+        {31, 1014}, {31, 86}, {31, 278}, {31, 598},
+        // Floating-point loads, stores and moves; lmw/stmw.
+        {48, 0}, {50, 0}, {52, 0}, {54, 0}, {49, 0}, {53, 0},
+        {31, 535}, {31, 599}, {31, 663}, {31, 727}, {31, 983},
+        {63, 72}, {63, 40}, {63, 264}, {63, 136}, {63, 23},
+        {4, 72}, {4, 40}, {4, 264}, {4, 528}, {4, 624}, {4, 23},
+        {46, 0}, {47, 0},
+        {31, 20}, {31, 150},  // lwarx, stwcx.
+        // Through the hatch.
+        {63, 21}, {63, 25}, {63, 29}, {63, 12}, {63, 15}, {63, 0}, {63, 32},
+        {59, 21}, {59, 25}, {59, 29}, {59, 20}, {59, 18},
+        {4, 21}, {4, 25}, {4, 29}, {4, 10}, {4, 12}, {4, 0},
+        {56, 0}, {60, 0}, {31, 19}, {31, 144}, {19, 193},
     };
     // Forms that carry an Rc bit, drawn with it set so CR0 is exercised
     // inside a block and not only in isolation -- a dot form mid-block
@@ -747,15 +1108,16 @@ int main()
 
     auto digest = [&]() {
       u64 h = 0xcbf29ce484222325ULL;
-      for (u32 w = 0; w < kScratchWords; ++w)
-      {
-        const u32 v = memory.Read_U32(kScratch + w * 4);
-        for (int by = 0; by < 4; ++by)
+      for (u32 base : {kScratch, kScratch2})
+        for (u32 w = 0; w < kScratchWords; ++w)
         {
-          h ^= (v >> (by * 8)) & 0xFF;
-          h *= 0x100000001b3ULL;
+          const u32 v = memory.Read_U32(base + w * 4);
+          for (int by = 0; by < 4; ++by)
+          {
+            h ^= (v >> (by * 8)) & 0xFF;
+            h *= 0x100000001b3ULL;
+          }
         }
-      }
       return h;
     };
 
@@ -787,15 +1149,40 @@ int main()
           ins = (31u << 26) | (1u << 21) | (146u << 1);
         else if (g.primary == 31 && (g.xo == 339 || g.xo == 467))
         {
-          // The SPR field is split and swapped; only LR (8) and CTR (9)
-          // are translated.
-          const u32 spr = (rnd() & 1) ? 8u : 9u;
+          // The SPR field is split and swapped.
+          static const u32 kSprs[] = {8, 9, 26, 27, 272, 275, 912, 919, 1, 18};
+          static const u32 kWritableSprs[] = {8, 9, 26, 27, 272, 275, 1, 18};
+          const u32 spr = (g.xo == 339) ? kSprs[rnd() % (sizeof(kSprs) / sizeof(kSprs[0]))]
+                                        : kWritableSprs[rnd() % (sizeof(kWritableSprs) / sizeof(kWritableSprs[0]))];
           ins = (31u << 26) | (d << 21) | ((spr & 0x1F) << 16) | (((spr >> 5) & 0x1F) << 11) |
                 (g.xo << 1);
         }
         else if (g.primary == 31)
           ins = maybe_rc((31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1),
                          (rnd() & 1) != 0);
+        else if (g.primary == 63 || g.primary == 4 || g.primary == 59)
+        {
+          const u32 c = rnd() % 32;
+          const bool a_form = g.xo < 32 && g.xo != 0 && g.xo != 12 && g.xo != 14 && g.xo != 15;
+          if (a_form)
+            ins = (g.primary << 26) | (d << 21) | (a << 16) | (b << 11) | (c << 6) | (g.xo << 1);
+          else if (g.xo == 0 || g.xo == 32)
+            ins = (g.primary << 26) | ((rnd() % 8) << 23) | (a << 16) | (b << 11) | (g.xo << 1);
+          else
+            ins = (g.primary << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1);
+          if ((rnd() & 1) && g.xo != 0 && g.xo != 32)
+            ins |= 1u;
+        }
+        else if (g.primary == 56 || g.primary == 60)
+          ins = (g.primary << 26) | (d << 21) | (a << 16) | ((rnd() & 1) << 15) |
+                ((rnd() & 1) << 12) | (rnd() & 0x03F0);
+        else if (g.primary == 19)
+          ins = (19u << 26) | ((rnd() % 32) << 21) | ((rnd() % 32) << 16) | ((rnd() % 32) << 11) |
+                (g.xo << 1);
+        else if (g.primary == 31 && g.xo == 144)
+          ins = (31u << 26) | (d << 21) | ((rnd() & 0xFF) << 12) | (g.xo << 1);
+        else if (g.primary == 46 || g.primary == 47)
+          ins = (g.primary << 26) | ((24 + rnd() % 8) << 21) | (a << 16) | (rnd() & 0x00F0);
         else if (g.primary == 16)
         {
           // A forward conditional branch, drawn across all six shapes of
@@ -814,29 +1201,35 @@ int main()
         }
         else
           ins = maybe_rc((g.primary << 26) | (d << 21) | (a << 16) | (rnd() & 0x03F0),
-                         g.primary == 21 && (rnd() & 1) != 0);
+                         (g.primary == 21 || g.primary == 20 || g.primary == 23) &&
+                             (rnd() & 1) != 0);
         prog.push_back(ins);
       }
 
       // A starting state both engines share, including memory.
       u32 init_gpr[32];
       for (int i = 0; i < 32; ++i)
-        init_gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : rnd();
-      // Every register that might be used as a base points into the scratch
-      // window, so loads and stores stay inside MEM1 and inside the window
-      // the digest covers.
+        init_gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : safe_random(rnd());
+      // Every register that might be used as a base points into one of the
+      // scratch windows, so loads and stores stay inside memory the digest
+      // covers -- and a third of them into the MEM2 window.
       for (int i = 1; i < 32; ++i)
         if (rnd() & 1)
-          init_gpr[i] = kScratch + (rnd() % 64) * 4;
+          init_gpr[i] = ((rnd() % 3) == 0 ? kScratch2 : kScratch) + (rnd() % 64) * 4;
+      const u8 init_ca = static_cast<u8>(rnd() & 1);
+      const u8 init_so_ov = static_cast<u8>(rnd() & 3);
+      const u16 init_sc = static_cast<u16>(rnd() & 0xFF7F);
+      const bool init_reserve = (rnd() & 1) != 0;
       // r1 carries a machine state value an mtmsr can safely write: the one
       // the harness is already running under, with the interrupt-enable bit
       // varied so the path that takes a pending interrupt is exercised.
       init_gpr[1] = (state.msr.Hex & ~0x8000u) | ((rnd() & 1) ? 0x8000u : 0u);
+      std::vector<u32> init_mem(kScratchWords * 2);
       for (u32 w = 0; w < kScratchWords; ++w)
-        memory.Write_U32(rnd(), kScratch + w * 4);
-      std::vector<u32> init_mem(kScratchWords);
-      for (u32 w = 0; w < kScratchWords; ++w)
-        init_mem[w] = memory.Read_U32(kScratch + w * 4);
+      {
+        init_mem[w] = rnd();
+        init_mem[kScratchWords + w] = rnd();
+      }
 
       // MSR is part of the starting state, and a block containing mtmsr
       // changes it. Restoring only registers and memory leaves the second
@@ -851,6 +1244,11 @@ int main()
       // silently cut linked chains from 244 to 104.
       const u32 init_msr = kPristineMsr;
       const u32 init_ctr = rnd() % 4;
+      seed_ps(rnd);
+      PowerPC::PairedSingle init_ps[32];
+      std::memcpy(init_ps, state.ps, sizeof(init_ps));
+      const u32 init_fpscr =
+          ((rnd() & 1) ? (rnd() & 0xF0000000u) : 0) | ((rnd() & 1) << 2) | (rnd() & 3);
       auto reset = [&]() {
         state.msr.Hex = init_msr;
         ppc.MSRUpdated();
@@ -864,10 +1262,20 @@ int main()
         // the decrement wraps to 0xffffffff, which a saturating
         // implementation would get wrong and no larger seed would expose.
         state.spr[SPR_CTR] = init_ctr;
+        state.xer_ca = init_ca;
+        state.xer_so_ov = init_so_ov;
+        state.xer_stringctrl = init_sc;
+        state.reserve = init_reserve;
+        state.reserve_address = init_gpr[24] + init_gpr[16];  // a plausible lwarx address
+        std::memcpy(state.ps, init_ps, sizeof(init_ps));
+        state.fpscr.Hex = init_fpscr;
         state.downcount = static_cast<int>(kBudget);
         state.pc = state.npc = BASE;
         for (u32 w = 0; w < kScratchWords; ++w)
+        {
           memory.Write_U32(init_mem[w], kScratch + w * 4);
+          memory.Write_U32(init_mem[kScratchWords + w], kScratch2 + w * 4);
+        }
       };
 
       for (u32 k = 0; k < prog.size(); ++k)
@@ -909,7 +1317,15 @@ int main()
       u64 jit_cr[8];
       std::memcpy(jit_cr, state.cr.fields, sizeof(jit_cr));
       const u32 jit_lr = state.spr[SPR_LR];
+      const u8 jit_ca = state.xer_ca;
+      const u8 jit_so_ov = state.xer_so_ov;
+      const u16 jit_sc = state.xer_stringctrl;
+      const bool jit_reserve = state.reserve;
+      const u32 jit_reserve_address = state.reserve_address;
+      const u32 jit_fpscr = state.fpscr.Hex;
       const u64 jit_mem = digest();
+      PowerPC::PairedSingle jit_ps[32];
+      std::memcpy(jit_ps, state.ps, sizeof(jit_ps));
 
       const u32 ran = ran_i < 0 ? 0u : static_cast<u32>(ran_i);
 
@@ -919,7 +1335,20 @@ int main()
       const u64 int_mem = digest();
 
       ++blocks_run;
-      bool ok = (jit_mem == int_mem);
+      bool ok = (jit_mem == int_mem) && (state.xer_ca == jit_ca) &&
+                (state.xer_so_ov == jit_so_ov) && (state.xer_stringctrl == jit_sc) &&
+                (state.reserve == jit_reserve) &&
+                (!state.reserve || state.reserve_address == jit_reserve_address) &&
+                (state.fpscr.Hex == jit_fpscr);
+      int bad_ps = -1;
+      for (int i = 0; i < 32; ++i)
+        if (state.ps[i].PS0AsU64() != jit_ps[i].PS0AsU64() ||
+            state.ps[i].PS1AsU64() != jit_ps[i].PS1AsU64())
+        {
+          ok = false;
+          if (bad_ps < 0)
+            bad_ps = i;
+        }
       int bad = -1;
       for (int i = 0; i < 32; ++i)
         if (state.gpr[i] != jit_gpr[i])
@@ -947,6 +1376,25 @@ int main()
                       jit_gpr[bad]);
         if (jit_mem != int_mem)
           std::printf("      memory digests differ\n");
+        if (state.xer_ca != jit_ca || state.xer_so_ov != jit_so_ov || state.xer_stringctrl != jit_sc)
+          std::printf("      XER interpreter=ca%u so_ov%u sc%04x recompiled=ca%u so_ov%u sc%04x\n",
+                      state.xer_ca, state.xer_so_ov, state.xer_stringctrl, jit_ca, jit_so_ov, jit_sc);
+        if (state.fpscr.Hex != jit_fpscr)
+          std::printf("      FPSCR interpreter=%08x recompiled=%08x\n", state.fpscr.Hex, jit_fpscr);
+        if (bad_ps >= 0)
+          std::printf("      f%-2d interpreter=%016llx/%016llx recompiled=%016llx/%016llx\n", bad_ps,
+                      static_cast<unsigned long long>(state.ps[bad_ps].PS0AsU64()),
+                      static_cast<unsigned long long>(state.ps[bad_ps].PS1AsU64()),
+                      static_cast<unsigned long long>(jit_ps[bad_ps].PS0AsU64()),
+                      static_cast<unsigned long long>(jit_ps[bad_ps].PS1AsU64()));
+        for (int i = 0; i < 8; ++i)
+          if (state.cr.fields[i] != jit_cr[i])
+            std::printf("      cr%d interpreter=%016llx recompiled=%016llx\n", i,
+                        static_cast<unsigned long long>(state.cr.fields[i]),
+                        static_cast<unsigned long long>(jit_cr[i]));
+        if (state.spr[SPR_LR] != jit_lr)
+          std::printf("      lr interpreter=%08x recompiled=%08x\n", state.spr[SPR_LR], jit_lr);
+        std::printf("      returned %08x\n", ret);
       }
     }
     char lbl[128];
@@ -975,6 +1423,20 @@ int main()
   // cannot: it says where the chain stopped, not how many blocks it crossed.
   {
     std::printf("\n  randomised chain differential\n");
+
+    // Chains run with the two dispatcher-facing options the boot uses:
+    // mtmsr continuing when the write has no consequence, and busy-wait
+    // loops exiting through the idle flag. Neither changes what a chain
+    // computes -- an idle exit stops after charging what ran, and the
+    // interpreter is run for exactly that many instructions -- so the
+    // comparison below is the check that they do not.
+    layout.exceptions_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, Exceptions));
+    layout.pagetable_pending_offset =
+        static_cast<u32>(offsetof(PowerPC::PowerPCState, pagetable_update_pending));
+    layout.mtmsr_continue = true;
+    layout.hatch_mmio = false;
+    static u32 idle_flag = 0;
+    layout.idle_flag_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&idle_flag));
 
     // Clear of the code the earlier sections wrote, and of their scratch.
     constexpr u32 kChainBase = 0x8000'2000;
@@ -1052,7 +1514,7 @@ int main()
     //   r1        the machine state value an mtmsr may safely write
     //   r2-r15    results -- the only registers any instruction WRITES
     //   r16-r22   small non-negative indices for the indexed forms
-    //   r23       a base in MEM2, which the guard must always refuse
+    //   r23       a base in the hardware registers, which the guard must always refuse
     //   r24-r31   bases inside the scratch window
     //
     // The first version drew every field at random, as the block
@@ -1194,7 +1656,7 @@ int main()
       }
 
       // One guard refusal per trial, in one chain in four: rewrite the base
-      // of a single memory instruction to r23, which points into MEM2.
+      // of a single memory instruction to r23, which points at MMIO.
       if ((rnd() % 4) == 0)
       {
         const u32 from = rnd() % static_cast<u32>(prog.size());
@@ -1211,13 +1673,20 @@ int main()
 
       u32 init_gpr[32];
       for (int i = 0; i < 32; ++i)
-        init_gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : rnd();
+        init_gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : safe_random(rnd());
       for (int i = 16; i < 23; ++i)
         init_gpr[i] = (rnd() % 64) * 4;  // indices
-      init_gpr[23] = 0x9000'0000 + (rnd() % 64) * 4;  // MEM2: always refused
+      // The hardware registers: not memory, always refused. (This was MEM2
+      // until compiled code learned to reach it through the region table.)
+      init_gpr[23] = 0xCC00'0000 + (rnd() % 64) * 4;
       for (int i = 24; i < 32; ++i)
         init_gpr[i] = kScratch + (rnd() % 48) * 4;  // bases
-      init_gpr[1] = (kPristineMsr & ~0x8000u) | ((rnd() & 1) ? 0x8000u : 0u);
+      // EE varies so an mtmsr sometimes enables interrupts; FE0 varies so
+      // an mtmsr sometimes flips a bit the block cannot handle itself and
+      // has to exit on. With mtmsr_continue, a write that changes neither
+      // simply continues the chain, and both shapes must stay covered.
+      init_gpr[1] = (kPristineMsr & ~0x8800u) | ((rnd() & 1) ? 0x8000u : 0u) |
+                    ((rnd() % 4) == 0 ? 0x0800u : 0u);
       // LR and CTR start at block entries, so blr and bcctr are chain steps
       // rather than immediate misses.
       const u32 init_lr = kChainBase + (rnd() % nblocks) * K * 4;
@@ -1282,7 +1751,7 @@ int main()
 
       std::vector<int> index(nblocks, -1);
       std::vector<ppc2wasm::Bytes> bodies(nblocks);
-      std::vector<u32> block_locals(nblocks, 0);
+      std::vector<u32> block_locals(nblocks, 0), block_locals_i64(nblocks, 0);
       std::vector<std::vector<ppc2wasm::DirectFixup>> block_fixups(nblocks);
       bool all_compiled = true;
       for (u32 i = 0; i < nblocks && all_compiled; ++i)
@@ -1294,6 +1763,7 @@ int main()
         {
           bodies[i] = std::move(rb.body);
           block_locals[i] = rb.locals;
+          block_locals_i64[i] = rb.locals_i64;
           block_fixups[i] = std::move(rb.fixups);
         }
       }
@@ -1303,21 +1773,28 @@ int main()
       // Function index i is block i, so a hole naming block i's start PC
       // resolves to i. Targets outside the chain -- the address past the
       // end, an LR or CTR value -- stay nops and fall back to the table.
-      auto index_of = [&](u32 target) -> int {
-        for (u32 i = 0; i < nblocks; ++i)
-          if (kChainBase + i * K * 4 == target)
-            return static_cast<int>(i);
-        return -1;
-      };
       ppc2wasm::ModuleBuilder cmb;
       cmb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
       cmb.ImportTable();
+      cmb.ImportFunction("env", "ppc_interp_op", {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
+                         {ppc2wasm::kI32});
       cmb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
+      // Function index i is block i plus the imports before it, so a hole
+      // naming block i's start PC resolves to i + ImportCount. Targets
+      // outside the chain -- the address past the end, an LR or CTR value
+      // -- stay nops and fall back to the table.
+      const int import_count = static_cast<int>(cmb.ImportCount());
+      auto index_of = [&](u32 target) -> int {
+        for (u32 i = 0; i < nblocks; ++i)
+          if (kChainBase + i * K * 4 == target)
+            return static_cast<int>(i) + import_count;
+        return -1;
+      };
       u32 trial_direct = 0;
       for (u32 i = 0; i < nblocks; ++i)
       {
         trial_direct += ppc2wasm::PatchDirectCalls(bodies[i], block_fixups[i], index_of);
-        cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i]);
+        cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i], block_locals_i64[i]);
       }
       const auto chain_module = cmb.Build();
       const int base = InstallBatchAt(chain_module.data(), static_cast<int>(chain_module.size()),
