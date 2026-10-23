@@ -14,17 +14,30 @@ Headline, same harness, same machine (Chrome 155, Apple M4):
 | #83, idle loops not skipped (796 MIPS) | 1847 ms | 108% |
 | #83: 20 emulated seconds, input and a figure on the portal | 6865 ms | 291% |
 | now: the first 2.0 emulated seconds of the boot | 1380–1417 ms | **141–145%** |
-| now: 390 emulated seconds, title to tutorial level, pressing A | 527 s | **74%** |
-| now: the gameplay window, 300–390 emulated s, character on screen, 3D scene | 152.6 s for 90 s | **59%** |
+| now, single core: 390 emulated seconds, title to tutorial level, pressing A | 527 s | 74% |
+| now, single core: the gameplay window, 300–390 emulated s, character on screen, 3D scene | 152.6 s for 90 s | 59% |
+| now, dual core (`--dual-core`, the GPU on its own thread as in Dolphin): 390 emulated seconds | 444 s | **88%** |
+| now, dual core: the gameplay window | 127.8 s for 90 s | **70%** |
 
 The gameplay rows are the facts about gameplay speed, measured CPU-side
 with the Null video backend (nothing is drawn): the game runs its 60 Hz
-frame loop at 59.6 frames per emulated second throughout, so 59% of real
-time is about 35 frames a wall second in the tutorial level. Over the
-same 390 seconds at the start of the gameplay work the numbers were 63%
-and 50%: the hatch share fell from 2.17% of executed instructions to
-0.62%, the instructions interpreted one at a time from 462 million to
-3.5 million, and the blocks retired from 47 to none.
+frame loop at 59.6 frames per emulated second throughout, so 70% of real
+time is about 42 frames a wall second in the tutorial level. Single core
+and dual core produce the same frame count and the same 28,874 draws in
+the GX capture at 390 s -- the game takes the same path. Over the same
+390 seconds at the start of the gameplay work the single-core numbers
+were 63% and 50%: the hatch share fell from 2.17% of executed
+instructions to 0.62%, the instructions interpreted one at a time from
+462 million to 3.5 million, and the blocks retired from 47 to none.
+
+The dual-core run executes HALF the guest instructions of the single-core
+one for the same 390 emulated seconds and the same frames (127 billion
+against 267 billion). The difference is the game spinning in its
+GPU-wait loops -- `bl OSDisableInterrupts; lbz; bl OSEnableInterrupts;
+cmpwi; bne`, which the busy-wait rule cannot see through -- while the
+single-core run did the GPU's work inline between those spins. The CPU
+work the game actually does in gameplay is about 360 million instructions
+per emulated second, not the billion the single-core count suggested.
 
 "Real-time speed" is emulated seconds per wall second, which is what a
 player experiences and what MIPS stops measuring the moment an idle loop
@@ -170,6 +183,8 @@ seconds (title to tutorial level, pressing A) and its last 90 seconds:
 | a Nunchuk on the Wii Remote, presses by emulated tick, the disc-file timeline, a GX inventory at 390 s; `fadd`/`fsub`/`fmul`/`fdiv`, their single and paired forms, `ps_muls0/1`, `frsp` inline for the common case | 63.0% | 50.2% | 5.8B instructions through the hatch (2.17%); `psq_l` 29%, `psq_st` 14%, `stb`/`stw` 14% of them |
 | `psq_l`/`psq_st` and their six variants specialised on the GQR and guarded; gather-pipe stores inline when they do not fill the buffer | 64.9% | 52.8% | both gone from the histogram; the gain was small, which said the hatch was not the cost |
 | the retirement list: the skinning loop's loads and stores at `0xE0000000` bailed on every iteration; the locked L1 cache translated; the `0xCC00`/`0xCD00` MMIO mask fixed; `mfcr`/`mtcrf`/`fcmpu`/`fcmpo` inline; the FP program exception after an `mtmsr` exit | **74.0%** | **59.0%** | interpreted singly 462M → 3.5M, bails 226M → 1.2M, retired 47 → 0; hatch 1.7B (0.62%), 55% of it the fused multiply-adds |
+| a CPU profile of the window: 44% compiled blocks, 42% VideoCommon on the emulation thread (texture hashing 28%), 9% interpreter; `--dual-core` runs the GPU on its own thread as Core.cpp does (`EmulatorState(true)` is the line without which the loop sleeps) | **87.9%** | **70.4%** | same frames and draws; guest instructions 267B → 127B, the GPU-wait spinning gone |
+| `--dual-core --no-sync-idle`: the CPU not waiting for the GPU thread at each skipped idle loop (Dolphin's "Sync on skip idle" off) | 251% | 275% | **not comparable**: 11,754 frames instead of 23,249 and 15.9 per emulated second in the window -- the GPU falls behind and the game drops frames. Different work, so not a speed |
 
 The native build of the harness was also repaired (`compile_region` had
 been left outside the Emscripten guard), the differential grew checks for
@@ -313,47 +328,76 @@ is drawn.
 
 ## 5. Known gaps, ranked by what they cost now
 
-The gameplay window runs about 970 million guest instructions per
-emulated second with idle loops already skipped, and the compiled code
-executes them at roughly 2 ns each. That product is the gap: the
-remaining interpreter work (hatch, bails, retired blocks) is now a
-single-digit share of the wall time, and the rest is the emitted code.
+A CPU profile of the gameplay window (profiler started after 300
+emulated seconds, 159 s of samples on the emulation thread) splits the
+time as follows:
 
-1. **Code quality in the emitted blocks** -- registers in locals across a
+| share | what |
+|---|---|
+| 44% | compiled blocks -- 12,385 distinct blocks sampled, the top 10 only 6.5% of block time, the top 500 47%: a flat profile with no single hot loop |
+| 42% | **VideoCommon on the CPU thread**: `GetMurmurHash3` alone 28% (the texture cache hashing every texture a draw uses, from `TextureCacheBase::LoadImpl` and `TCacheEntry::CalculateHash`), vertex loading 6%, XFB decode and the rest |
+| 9% | interpreter: the fused multiply-adds through the hatch (`fma`, `NI_madd_msub`, `ps_madds0/1`) |
+| 3% | the dispatcher and CoreTiming |
+
+What held the single-core number at 59% was the Null backend's command
+processing on the emulation thread, there because the harness was
+configured single-core for determinism against the native oracle.
+Dolphin's own answer is its dual-core mode, a GPU thread; `--dual-core`
+in the harness runs it the way Core.cpp does, and the window went to
+70%. The compiled-block share above is not all useful work either: half
+of the single-core run's guest instructions were the game's GPU-wait
+loops spinning (see the headline), and in dual core those spins are how
+the CPU thread waits for the GPU thread. The recompiler's own cost in the
+window is therefore well under half the wall time; the GPU thread's
+work (0.76 s per emulated second, texture hashing above all) and the
+frame-by-frame hand-off between the two threads are what the 70% is
+made of.
+
+1. **VideoCommon's CPU-side cost**, 42% of the emulation thread in
+   gameplay, texture hashing above all. A GPU thread takes it off the
+   CPU's critical path but does not make it cheaper, and a WebGPU backend
+   will carry the same vertex loading and texture cache. Worth its own
+   profile once there is a backend to profile it against.
+2. **Code quality in the emitted blocks** -- registers in locals across a
    block, real `loop` constructs for self-targeting back edges, the
    compare-and-branch pairs that are a third of the stream. The
-   hand-written hot-loop variant showed 2.8× headroom on that shape, and
-   at 970 M instructions per emulated second this is where the factor of
-   two to real time has to come from. A gameplay-window profile
-   (`--jit-names`, profiler started after 300 emulated seconds) is the
-   next measurement to take.
-2. **The fused multiply-adds through the hatch.** After the quantized
+   hand-written hot-loop variant showed 2.8× headroom on that shape. The
+   gameplay profile is flat (the top 500 of 12,385 blocks are 47% of
+   block time), so the gain has to come from the general shape of the
+   emitted code, not from a hot-loop special case.
+3. **The fused multiply-adds through the hatch.** After the quantized
    forms and the gather pipe went inline, `ps_madds0`/`ps_madds1`/
    `ps_madd` are 40% of what remains in the histogram, in the skinning
    loop above all. Dolphin's `NI_madd_msub` is a software routine for the
    single-precision rounding; an inline common case needs care and the
    differential is ready for it.
-3. **Compare and CR0 encoding.** `cmpwi` is ~30 wasm instructions through
+4. **Compare and CR0 encoding.** `cmpwi` is ~30 wasm instructions through
    `s_crTable`; Dolphin's own JIT stores the sign-extended difference.
    Adopting that needs the differential to compare decoded CR fields
    rather than raw words, which is the right invariant anyway -- and would
    also let `mtcrf` stop re-encoding the fields its mask leaves alone.
-4. **Interrupt-polling loops that call a function.** The game's main wait
-   past the boot is `bl OSDisableInterrupts; lbz; bl OSEnableInterrupts;
-   cmpwi; bne`, which the busy-wait rule cannot see through. Dolphin
-   cannot either; with calls followed (the `trace_uncond` flag) and
-   `mfmsr`/`mtmsr` admitted when only EE changes, it could be. Idle
-   skipping already covers 61% of the emulated time over a 390-second
-   run, so what is left of this is in gameplay, where it is small.
-5. **No block invalidation**, as before. `icbi` is interpreted and
+5. **The GPU-wait loop that calls a function.** The game waits for the
+   GPU in `bl OSDisableInterrupts; lbz; bl OSEnableInterrupts; cmpwi;
+   bne`, which the busy-wait rule cannot see through, and that loop was
+   HALF the guest instructions of the single-core run (267 billion
+   against 127 billion dual-core, same frames). Dolphin cannot see
+   through it either. In dual core it is the CPU thread's way of waiting
+   for the GPU thread, so it costs host CPU rather than wall time; in
+   single core it was a third of the wall time spent running a loop
+   whose outcome the inline GPU work had already decided. With calls
+   followed (`trace_uncond`) and `mfmsr`/`mtmsr` admitted when only EE
+   changes, the rule could recognise it; what the dispatcher should do
+   with a recognised GPU wait is a timing-model question (the Null
+   backend is instant in emulated time, a real one is not).
+6. **No block invalidation**, as before. `icbi` is interpreted and
    invalidates nothing of ours. `mtspr` to a BAT goes through the hatch
    and the region tables, the gather-pipe address and the locked-cache
    mapping do not follow it; the game sets its BATs once, at OS init.
-6. **The hatch's inline footprint.** Every load and store carries a cold
+7. **The hatch's inline footprint.** Every load and store carries a cold
    path for the hardware registers, the gather pipe and now the locked
    cache; it runs only for addresses outside RAM, but it is code the
    browser compiles. The boot window is unchanged by it within noise.
-7. **The interpreter has no bounds check on its MMIO handler table.** A
+8. **The interpreter has no bounds check on its MMIO handler table.** A
    store to `0xCC80xxxx` from guest code would trap the whole emulator.
    No game does it; the randomised differential did, which is why the
    hatch only takes the three blocks the interpreter decodes.
@@ -378,7 +422,13 @@ python3 harness/src/decode_capture.py <that run's output>              # what th
 
 Flags that turn each change off for an A/B: `--jit-no-idle`,
 `--jit-no-mtmsr`, `--jit-no-hatch`, `--jit-no-phys`, `--jit-no-gp`,
-`--jit-no-psq`, `--jit-threshold=1`, `--jit-no-link`. The first argument
+`--jit-no-psq`, `--jit-no-l1`, `--jit-threshold=1`, `--jit-no-link`.
+`--dual-core` runs the GPU on its own thread (Dolphin's dual-core mode);
+the run is then not deterministic, so it is for speed, not for a
+differential against the oracle. Check `frames` and the GX capture's
+draw count against the single-core run before comparing speeds: a
+variant that changes what the game does (`--no-sync-idle` halves the
+frame count) is not faster, it is different. The first argument
 is a cap on instructions; `--ticks=N` stops at N emulated ticks (729
 million per second), which is the comparison to use. `--speed-from=T`
 opens a second speed window at tick T, so a gameplay phase can be timed

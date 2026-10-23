@@ -494,11 +494,13 @@ contended** — that is the generalisable part, and it applies to every later br
 
 > **Status: the boot runs at 145% of real time** in Chrome — 2.0 emulated seconds in 1.4 s
 > of wall clock — and the game plays: pressing A takes it from the title into the tutorial
-> level with the character on screen, 390 emulated seconds in 527 s of wall clock (74%), and
-> the gameplay window itself, a 3D scene at 60 frames per emulated second, at 59% of real
-> time. CPU-side, with the Null video backend. The remaining factor is the emitted code
-> itself: about a billion guest instructions per emulated second at ~2 ns each, with the
-> interpreter's share (the fused multiply-adds through the hatch) under a tenth of the time.
+> level with the character on screen, 390 emulated seconds in 444 s of wall clock (88%), and
+> the gameplay window itself, a 3D scene at 60 frames per emulated second, at 70% of real
+> time with the GPU on its own thread (59% single-core). CPU-side, with the Null video
+> backend. A profile of the window puts the recompiled CPU at 44% of the emulation thread,
+> VideoCommon's command processing and texture hashing at 42%, and the interpreter (the fused
+> multiply-adds through the hatch) at 9%; the game's own CPU work in gameplay is about 360
+> million instructions per emulated second.
 >
 > **The constraint was never code density.** A sampling profile put the dispatcher loop at
 > 35% of the run and the compiled blocks at 25%, with a hot set of ten functions; the same

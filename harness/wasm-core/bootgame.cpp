@@ -18,7 +18,10 @@
 #include <cstring>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <functional>
+#include <future>
+#include <thread>
 #include <map>
 #include <tuple>
 #include <unordered_map>
@@ -40,6 +43,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigLoaders/BaseConfigLoader.h"
 #include "Core/ConfigManager.h"
+#include "Common/Thread.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "AudioCommon/AudioCommon.h"
@@ -270,13 +274,21 @@ static std::vector<u8> g_gx_bytes;
 static size_t g_gx_limit = 0;
 // Capturing is ARMED by the step loop, immediately or at --gx-from, so a
 // capture can be a window late in the run rather than the boot.
-static bool g_gx_armed = false;
+//
+// With --dual-core the opcode decoder, and so this hook, runs on the GPU
+// thread while the step loop runs on the CPU thread. The flag and the
+// byte count cross that boundary as atomics; the vector itself is only
+// read once the GPU thread has been stopped.
+static std::atomic<bool> g_gx_armed{false};
+static std::atomic<size_t> g_gx_size{0};
 
 extern "C" void harness_gx_command(const u8* data, u32 size)
 {
-  if (!g_gx_armed || g_gx_limit == 0 || g_gx_bytes.size() >= g_gx_limit)
+  if (!g_gx_armed.load(std::memory_order_relaxed) || g_gx_limit == 0 ||
+      g_gx_bytes.size() >= g_gx_limit)
     return;
   g_gx_bytes.insert(g_gx_bytes.end(), data, data + size);
+  g_gx_size.store(g_gx_bytes.size(), std::memory_order_release);
 }
 
 // base64, so the capture costs 1.33 bytes per byte through the CDP channel
@@ -607,6 +619,8 @@ int main(int argc, char** argv)
   bool want_gp = true;
   bool want_psq = true;
   bool want_l1 = true;
+  bool want_dual_core = false;
+  bool want_sync_idle = true;
   bool want_nunchuk = true;
   bool want_disc_files = false;
   u64 gx_from = 0;      // --gx-from=TICKS: arm the GX capture at this emulated time
@@ -750,6 +764,21 @@ int main(int argc, char** argv)
     // (and retire the block when first), as they used to.
     else if (std::strcmp(argv[i], "--jit-no-l1") == 0)
       want_l1 = false;
+    // --dual-core: Dolphin's dual-core mode. The GPU -- VideoCommon's
+    // command processing, vertex loading and texture cache, which is 42%
+    // of the emulation thread's time in gameplay with the Null backend --
+    // runs on its own thread, as it does in Dolphin itself. The run is
+    // then not deterministic, so this is for speed measurements, not for
+    // differentials against the native oracle.
+    else if (std::strcmp(argv[i], "--dual-core") == 0)
+      want_dual_core = true;
+    // --no-sync-idle: with --dual-core, the CPU does not wait for the GPU
+    // thread to drain the FIFO each time an idle loop is skipped
+    // (Dolphin's "Sync on skip idle", on by default). The game still
+    // synchronises where it asks to -- draw-done, tokens -- and the FIFO
+    // bounds how far ahead the CPU can get.
+    else if (std::strcmp(argv[i], "--no-sync-idle") == 0)
+      want_sync_idle = false;
     // --no-nunchuk: leave the Wiimote without an extension. The game asks
     // for a Nunchuk before it will go anywhere, so one is attached by
     // default; this is for comparing against baselines recorded without.
@@ -858,6 +887,9 @@ int main(int argc, char** argv)
   // differential build would default to the AArch64 recompiler, and the two
   // must run the same core to be comparable.
   Config::SetCurrent(Config::MAIN_CPU_CORE, PowerPC::CPUCore::Interpreter);
+  // System::Initialize reads MAIN_CPU_THREAD here, once; the later setting
+  // in the configuration block below is what the rest of Dolphin reads.
+  Config::SetCurrent(Config::MAIN_CPU_THREAD, want_dual_core);
   system.Initialize();
 
   system.SetIsWii(true);
@@ -1043,7 +1075,8 @@ int main(int argc, char** argv)
   //     CPU thread, and also makes the run deterministic -- a differential
   //     against a native oracle cannot tolerate a second thread deciding when
   //     the FIFO is consumed.
-  Config::SetCurrent(Config::MAIN_CPU_THREAD, false);
+  Config::SetCurrent(Config::MAIN_CPU_THREAD, want_dual_core);
+  Config::SetCurrent(Config::MAIN_SYNC_ON_SKIP_IDLE, want_sync_idle);
 
   // 1c. Null video backend. It registers the CP/PE MMIO the game writes to
   //     and consumes the FIFO, but rasterises nothing -- which is exactly the
@@ -1286,14 +1319,41 @@ int main(int argc, char** argv)
   VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
   check(g_video_backend != nullptr, "Null video backend activated");
 
-  // Single core, so the GPU runs on this thread. Both of these are what
+  // Single core: the GPU runs on this thread. Both of these are what
   // Core.cpp does inside its init_video lambda; passthrough means AsyncRequests
   // executes work inline instead of queueing it for a GPU thread that does not
   // exist here.
-  Core::DeclareAsGPUThread();
-  AsyncRequests::GetInstance()->SetPassthrough(true);
-  const bool video_up = g_video_backend && g_video_backend->Initialize(wsi);
+  //
+  // Dual core (--dual-core): the GPU thread is spawned here exactly as
+  // Core.cpp's GetInitializedVideoGuard spawns it -- it initialises the
+  // backend, reports back, and runs the FIFO loop until ExitGpuLoop. This
+  // thread stays the CPU thread.
+  bool video_up = false;
+  std::thread gpu_thread;
+  if (want_dual_core)
+  {
+    std::promise<bool> init_from_thread;
+    gpu_thread = std::thread([&] {
+      Common::SetCurrentThreadName("Video thread");
+      Core::DeclareAsGPUThread();
+      AsyncRequests::GetInstance()->SetPassthrough(false);
+      const bool ok = g_video_backend && g_video_backend->Initialize(wsi);
+      init_from_thread.set_value(ok);
+      if (!ok)
+        return;
+      system.GetFifo().RunGpuLoop();
+    });
+    video_up = init_from_thread.get_future().get();
+  }
+  else
+  {
+    Core::DeclareAsGPUThread();
+    AsyncRequests::GetInstance()->SetPassthrough(true);
+    video_up = g_video_backend && g_video_backend->Initialize(wsi);
+  }
   check(video_up, "video backend initialised");
+  std::printf("  threads   %s\n", want_dual_core ? "dual core: the GPU on its own thread" :
+                                                   "single core: the GPU on this thread");
   INIT_MARK("video backend done");
 
   // IOS is NOT initialised here. HW::Init does it (HW.cpp:58, "Depends on
@@ -1363,6 +1423,12 @@ int main(int argc, char** argv)
   // in a three-instruction wait loop at 0x803873a0 for ten billion
   // instructions. A default-false flag and a missing one-line call.
   system.GetFifo().Prepare();
+  // The GPU loop does nothing until told the emulator is running --
+  // Core::SetState(Running) does this in Dolphin. Without it the FIFO
+  // filled to 2,336 bytes and stayed there while the game's wait loop was
+  // skipped as idle: 400 emulated seconds in four seconds and no frame.
+  if (want_dual_core)
+    system.GetFifo().EmulatorState(true);
 
   auto& state = system.GetPPCState();
   std::printf("  entry pc  0x%08x (was 0x%08x)\n", state.pc, pc_before);
@@ -2643,7 +2709,7 @@ int main(int argc, char** argv)
       break;
     if (g_fifo_limit && g_fifo_bytes.size() >= g_fifo_limit)
       break;
-    if (g_gx_limit && g_gx_bytes.size() >= g_gx_limit)
+    if (g_gx_limit && g_gx_size.load(std::memory_order_acquire) >= g_gx_limit)
       break;
   }
 
@@ -2680,6 +2746,15 @@ int main(int argc, char** argv)
     }
   }
 #endif
+  if (gpu_thread.joinable())
+  {
+    // After the clock has been read, before anything below reads what the
+    // GPU thread wrote: the capture vector, the FIFO state. ExitGpuLoop
+    // returns once the loop has stopped; the FIFO may still hold what the
+    // CPU wrote last.
+    system.GetFifo().ExitGpuLoop();
+    gpu_thread.join();
+  }
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
   std::printf("  pc range  0x%08x .. 0x%08x (started 0x%08x, now 0x%08x)\n", min_pc, max_pc,
               first_pc, state.pc);
