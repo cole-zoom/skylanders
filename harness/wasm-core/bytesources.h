@@ -20,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <functional>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -38,6 +39,10 @@ struct SourceStats
 {
   u64 requests = 0;
   u64 bytes = 0;
+  // Called with every read's raw disc offset and length, when set. The
+  // harness uses it to name the file a read lands in, which is the only
+  // cheap signal of what the game is doing at a given moment.
+  std::function<void(u64, u64)> on_read;
 };
 
 inline ByteSource FileByteSource(const std::string& path, std::shared_ptr<SourceStats> stats)
@@ -58,6 +63,8 @@ inline ByteSource FileByteSource(const std::string& path, std::shared_ptr<Source
     out.resize(got);
     stats->requests++;
     stats->bytes += got;
+    if (stats->on_read)
+      stats->on_read(offset, got);
     return out;
   };
 }
@@ -95,6 +102,8 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
       out.assign(fetch->data, fetch->data + fetch->numBytes);
       stats->requests++;
       stats->bytes += out.size();
+      if (stats->on_read)
+        stats->on_read(offset, out.size());
     }
     else if (fetch)
     {

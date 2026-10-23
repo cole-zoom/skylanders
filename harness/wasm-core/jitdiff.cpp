@@ -24,9 +24,11 @@
 #include "Core/CoreTiming.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/Core.h"
+#include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/ConditionRegister.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -164,7 +166,11 @@ static u32 RunBlock(int index, PowerPC::PowerPCState& state, PowerPC::PowerPCMan
   state.pc = state.npc = ret & ~3u;
   if (ret & 2u)
   {
+    // What Interpreter::mtmsr does after the write, in the same order:
+    // an FP exception already summarised in FPSCR[FEX] is taken the
+    // moment FE0 or FE1 enables it.
     ppc.MSRUpdated();
+    CheckFPExceptions(state);
     ppc.CheckExceptions();
     state.pc = state.npc;
   }
@@ -222,6 +228,9 @@ int main()
   // machines.
   state.spr[SPR_DBAT1U] = 0xc000'1fff;
   state.spr[SPR_DBAT1L] = 0x0000'002a;
+  // The locked L1 cache at 0xE0000000, 256 KB, as a game's OS init maps it.
+  state.spr[SPR_DBAT2U] = 0xe000'0007;
+  state.spr[SPR_DBAT2L] = 0xe000'0002;
   state.spr[SPR_DBAT5U] = 0xd000'1fff;
   state.spr[SPR_DBAT5L] = 0x1000'002a;
   HID4(state).SBE = 1;
@@ -235,9 +244,14 @@ int main()
   // both engines agreeing on that would test nothing.
   state.msr.FP = 1;
   state.spr[SPR_HID2] |= (1u << 29) | (1u << 31);  // PSE, LSQE
-  // GQR1 dequantizes signed halfwords with a scale of 2, GQR0 is plain
-  // floats; psq_l/psq_st are generated against both.
-  state.spr[SPR_GQR0 + 1] = (7u << 16) | (2u << 24) | 7u | (2u << 8);
+  // GQR0 is plain floats, as the ABI requires; GQR1 to GQR4 cover the four
+  // integer types with scales positive, zero and negative (a six-bit
+  // scale of 60 or 61 is -4 or -3). psq_l/psq_st draw their GQR from
+  // these five.
+  state.spr[SPR_GQR0 + 1] = (7u << 16) | (2u << 24) | 7u | (2u << 8);    // s16, ld 2, st 2
+  state.spr[SPR_GQR0 + 2] = (4u << 16) | 4u;                             // u8, scales 0
+  state.spr[SPR_GQR0 + 3] = (5u << 16) | (5u << 24) | 5u | (61u << 8);   // u16, ld 5, st -3
+  state.spr[SPR_GQR0 + 4] = (6u << 16) | (60u << 24) | 6u | (7u << 8);   // s8, ld -4, st 7
   // The machine state every differential below restores from. Captured here,
   // once, because an exception taken inside any trial masks MSR down.
   const u32 kPristineMsr = state.msr.Hex;
@@ -278,6 +292,13 @@ int main()
   layout.reserve_address_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve_address));
   layout.interp_hatch = true;
   layout.pc_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, pc));
+  // The GQRs above, specialised on as the dispatcher does; the guard the
+  // emitted code carries is exercised by the mtspr-to-GQR case below.
+  layout.gqr_values = &state.spr[SPR_GQR0];
+  // The locked cache, mapped by the DBAT above; the dispatcher checks the
+  // same thing before enabling it.
+  if (memory.GetL1Cache() && mmu.IsOptimizableRAMAddress(0xE0000000u, 32))
+    layout.l1_cache_base = static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetL1Cache()));
   g_hatch_interp = &system.GetInterpreter();
   g_hatch_ppc = &ppc;
   g_hatch_state = &state;
@@ -677,6 +698,205 @@ int main()
   // keep that path exercised.
   layout.hatch_mmio = true;
 
+  // ── the write-gather pipe ──
+  //
+  // A store to the pipe's page appends to a host buffer; compiled code
+  // writes the buffer directly while the store leaves room, and the one
+  // that would fill it takes the hatch, where the interpreter flushes.
+  // Only the inline path is run here: a flush reaches the command
+  // processor and the video FIFO, which this harness never initialises.
+  // The block is compiled WITHOUT the MMIO hatch, so a store that missed
+  // the pipe path would bail and the comparison would see the stores
+  // after it missing. Checked from an empty buffer and from one filled
+  // to the last byte the stores fit in.
+  {
+    system.GetGPFifo().Init();
+    layout.gather_pipe_ea = 0xCC008000u;
+    layout.gather_pipe_ptr_offset =
+        static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_ptr));
+    layout.gather_pipe_base_offset =
+        static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_base_ptr));
+    layout.hatch_mmio = false;
+    // stw r4,0(r3) ; sth r5,0(r3) ; stb r4,0(r3) ; stfs f1,0(r3) ;
+    // stwx r5,r3,r6 ; stb r5,0x10(r3)             -- 16 bytes
+    const u32 prog[] = {0x9083'0000, 0xB0A3'0000, 0x9883'0000,
+                        0xD023'0000, 0x7CA3'312E, 0x98A3'0010};
+    constexpr u32 kN = sizeof(prog) / sizeof(prog[0]);
+    auto setup = [&](size_t fill) {
+      for (u32 i = 0; i < kN; ++i)
+        memory.Write_U32(prog[i], BASE + i * 4);
+      state.pc = state.npc = BASE;
+      state.gpr[3] = 0xCC008000u;
+      state.gpr[4] = 0x11223344u;
+      state.gpr[5] = 0xAABBCCDDu;
+      state.gpr[6] = 0x20;
+      state.ps[1].SetPS0(std::bit_cast<u64>(1.5));
+      std::memset(state.gather_pipe_base_ptr, 0, 32);
+      state.gather_pipe_ptr = state.gather_pipe_base_ptr + fill;
+      state.downcount = 1000;
+    };
+    for (size_t fill : {size_t{0}, size_t{15}})
+    {
+      setup(fill);
+      for (u32 i = 0; i < kN; ++i)
+        ppc.SingleStep();
+      u8 want[32];
+      std::memcpy(want, state.gather_pipe_base_ptr, sizeof(want));
+      const size_t want_count = state.gather_pipe_ptr - state.gather_pipe_base_ptr;
+
+      auto r = ppc2wasm::CompileBlock(prog, BASE, kN, layout);
+      bool ok = r.instructions == kN;
+      if (ok)
+      {
+        const int idx = InstallModule(r.module.data(), static_cast<int>(r.module.size()));
+        ok = idx >= 0;
+        if (ok)
+        {
+          setup(fill);
+          const u32 ret = RunBlock(idx, state, ppc);
+          const size_t got_count = state.gather_pipe_ptr - state.gather_pipe_base_ptr;
+          ok = (ret & ~3u) == BASE + 4 * kN && got_count == want_count &&
+               std::memcmp(want, state.gather_pipe_base_ptr, sizeof(want)) == 0;
+          if (!ok)
+          {
+            std::printf("      pc %08x count %zu (want %zu)\n", ret, got_count, want_count);
+            for (int i = 0; i < 32; ++i)
+              std::printf("%02x%s", state.gather_pipe_base_ptr[i], i == 31 ? "\n" : " ");
+            for (int i = 0; i < 32; ++i)
+              std::printf("%02x%s", want[i], i == 31 ? "\n" : " ");
+          }
+        }
+      }
+      char label[96];
+      std::snprintf(label, sizeof(label), "gather pipe: six stores inline from a buffer at %zu",
+                    fill);
+      check(ok, label);
+    }
+    layout.hatch_mmio = true;
+  }
+
+  // ── the locked L1 cache ──
+  //
+  // Stores and loads at 0xE0001000 reach Dolphin's locked-cache buffer in
+  // both engines; the buffer, the registers and the paired-single result
+  // are compared. Compiled without the MMIO hatch, so an access that
+  // missed the locked-cache path would bail and the later stores would
+  // be missing from the buffer.
+  {
+    layout.hatch_mmio = false;
+    // lis r3,0xE000 ; ori r3,r3,0x1000 ; lis r4,0x1122 ; ori r4,r4,0x3344 ;
+    // stw r4,0(r3) ; lwz r5,0(r3) ; lbz r6,1(r3) ; sth r4,8(r3) ;
+    // psq_st f1,0x10(r3),0,0 ; psq_l f2,0x10(r3),0,0 ; lhz r7,8(r3)
+    const u32 prog[] = {0x3C60'E000, 0x6063'1000, 0x3C80'1122, 0x6084'3344, 0x9083'0000,
+                        0x80A3'0000, 0x88C3'0001, 0xB083'0008, 0xF023'0010, 0xE043'0010,
+                        0xA0E3'0008};
+    constexpr u32 kN = sizeof(prog) / sizeof(prog[0]);
+    u8* l1 = memory.GetL1Cache();
+    auto setup = [&]() {
+      for (u32 i = 0; i < kN; ++i)
+        memory.Write_U32(prog[i], BASE + i * 4);
+      state.pc = state.npc = BASE;
+      for (int i = 0; i < 32; ++i)
+        state.gpr[i] = 0;
+      state.ps[1].SetBoth(1.5, -2.25);
+      state.ps[2].SetBoth(0.0, 0.0);
+      std::memset(l1 + 0x1000, 0, 32);
+      state.downcount = 1000;
+    };
+    bool ok = l1 != nullptr && layout.l1_cache_base != 0;
+    if (ok)
+    {
+      setup();
+      for (u32 i = 0; i < kN; ++i)
+        ppc.SingleStep();
+      u8 want[32];
+      std::memcpy(want, l1 + 0x1000, sizeof(want));
+      u32 want_gpr[32];
+      std::memcpy(want_gpr, state.gpr, sizeof(want_gpr));
+      const u64 want_ps[2] = {state.ps[2].ps0, state.ps[2].ps1};
+      auto r = ppc2wasm::CompileBlock(prog, BASE, kN, layout);
+      ok = r.instructions == kN;
+      if (ok)
+      {
+        const int idx = InstallModule(r.module.data(), static_cast<int>(r.module.size()));
+        ok = idx >= 0;
+        if (ok)
+        {
+          setup();
+          const u32 ret = RunBlock(idx, state, ppc);
+          ok = (ret & ~3u) == BASE + 4 * kN && std::memcmp(want, l1 + 0x1000, sizeof(want)) == 0 &&
+               std::memcmp(want_gpr, state.gpr, sizeof(want_gpr)) == 0 &&
+               state.ps[2].ps0 == want_ps[0] && state.ps[2].ps1 == want_ps[1];
+          if (!ok)
+          {
+            std::printf("      pc %08x r5 %08x (want %08x) r6 %08x (want %08x) r7 %08x (want %08x)\n",
+                        ret, state.gpr[5], want_gpr[5], state.gpr[6], want_gpr[6], state.gpr[7],
+                        want_gpr[7]);
+            std::printf("      f2 %016llx:%016llx (want %016llx:%016llx)\n",
+                        (unsigned long long)state.ps[2].ps0, (unsigned long long)state.ps[2].ps1,
+                        (unsigned long long)want_ps[0], (unsigned long long)want_ps[1]);
+          }
+        }
+      }
+    }
+    check(ok, "locked L1 cache: stores, loads and a quantized pair at 0xE0001000");
+    layout.hatch_mmio = true;
+  }
+
+  // ── the GQR guard ──
+  //
+  // psq_l is specialised on GQR1's value at compile time. A block that
+  // writes GQR1 and then loads through it must get the new format: the
+  // guard sees the register differ and the hatch runs the load.
+  {
+    // lis r3,0x8000 ; ori r3,r3,0x7800 ; lis r4,0x0007 ; ori r4,r4,0x0007 ;
+    // li r5,0x1234 ; stw r5,0(r3) ; mtspr GQR1,r4 ; psq_l f1,0(r3),0,1 ;
+    // mtspr GQR1,r6 (restores the seeded value) ; psq_l f2,0(r3),0,1
+    const u32 saved = state.spr[SPR_GQR0 + 1];
+    const u32 prog[] = {0x3C60'8000, 0x6063'7800, 0x3C80'0007, 0x6084'0007, 0x38A0'1234,
+                        0x90A3'0000, 0x7C91'E3A6, 0xE023'1000, 0x7CD1'E3A6, 0xE043'1000};
+    constexpr u32 kN = sizeof(prog) / sizeof(prog[0]);
+    auto setup = [&]() {
+      for (u32 i = 0; i < kN; ++i)
+        memory.Write_U32(prog[i], BASE + i * 4);
+      state.pc = state.npc = BASE;
+      state.spr[SPR_GQR0 + 1] = saved;
+      state.gpr[6] = saved;
+      state.ps[1].SetBoth(0.0, 0.0);
+      state.ps[2].SetBoth(0.0, 0.0);
+      state.downcount = 1000;
+    };
+    setup();
+    for (u32 i = 0; i < kN; ++i)
+      ppc.SingleStep();
+    const u64 want1[2] = {state.ps[1].ps0, state.ps[1].ps1};
+    const u64 want2[2] = {state.ps[2].ps0, state.ps[2].ps1};
+    auto r = ppc2wasm::CompileBlock(prog, BASE, kN, layout);
+    bool ok = r.instructions == kN;
+    if (ok)
+    {
+      const int idx = InstallModule(r.module.data(), static_cast<int>(r.module.size()));
+      ok = idx >= 0;
+      if (ok)
+      {
+        setup();
+        const u32 ret = RunBlock(idx, state, ppc);
+        ok = (ret & ~3u) == BASE + 4 * kN && state.ps[1].ps0 == want1[0] &&
+             state.ps[1].ps1 == want1[1] && state.ps[2].ps0 == want2[0] &&
+             state.ps[2].ps1 == want2[1];
+        if (!ok)
+          std::printf("      pc %08x f1 %016llx:%016llx (want %016llx:%016llx) f2 %016llx:%016llx "
+                      "(want %016llx:%016llx)\n",
+                      ret, (unsigned long long)state.ps[1].ps0, (unsigned long long)state.ps[1].ps1,
+                      (unsigned long long)want1[0], (unsigned long long)want1[1],
+                      (unsigned long long)state.ps[2].ps0, (unsigned long long)state.ps[2].ps1,
+                      (unsigned long long)want2[0], (unsigned long long)want2[1]);
+      }
+    }
+    check(ok, "psq_l after mtspr GQR1 takes the guard and gets the new format");
+    state.spr[SPR_GQR0 + 1] = saved;
+  }
+
   // ── randomised differential ──
   //
   // Thirty-odd hand-written cases check the instructions someone thought to
@@ -750,7 +970,8 @@ int main()
         {4, 29, "ps_madd"}, {4, 28, "ps_msub"}, {4, 10, "ps_sum0"}, {4, 11, "ps_sum1"},
         {4, 12, "ps_muls0"}, {4, 13, "ps_muls1"}, {4, 14, "ps_madds0"}, {4, 0, "ps_cmpu0"},
         {4, 24, "ps_res"},
-        {56, 0, "psq_l"},   {60, 0, "psq_st"},
+        {56, 0, "psq_l"},   {60, 0, "psq_st"}, {57, 0, "psq_lu"}, {61, 0, "psq_stu"},
+        {4, 6, "psq_lx"},   {4, 7, "psq_stx"}, {4, 38, "psq_lux"}, {4, 39, "psq_stux"},
         {31, 19, "mfcr"},   {31, 144, "mtcrf"}, {19, 193, "crxor"}, {19, 449, "cror"},
         {19, 0, "mcrf"},
     };
@@ -805,6 +1026,13 @@ int main()
           if ((rnd() & 1) && ppc2wasm::detail::RcDestination(ins | 1u) >= 0)
             ins |= 1u;
         }
+        else if (t.primary == 4 && (t.xo == 6 || t.xo == 7 || t.xo == 38 || t.xo == 39))
+        {
+          // psq_lx / psq_stx / psq_lux / psq_stux: W and the GQR sit in the
+          // low bits of the ten-bit field, above the six-bit opcode.
+          ins = (4u << 26) | (d << 21) | (a << 16) | (b << 11) | ((rnd() & 1) << 10) |
+                ((rnd() % 5) << 7) | (t.xo << 1);
+        }
         else if (t.primary == 63 || t.primary == 4 || t.primary == 59)
         {
           // A-forms (five-bit XO, frC above it) for the arithmetic; the
@@ -821,12 +1049,13 @@ int main()
           if ((rnd() & 1) && t.xo != 0 && t.xo != 32)
             ins |= 1u;  // Rc: CR1 from FPSCR
         }
-        else if (t.primary == 56 || t.primary == 60)
+        else if (t.primary >= 56 && t.primary <= 61)
         {
-          // psq_l / psq_st: W selects one or both halves, I the GQR, and a
-          // small positive displacement keeps the address in the window.
+          // psq_l / psq_st and their update forms: W selects one or both
+          // halves, I one of the five GQRs seeded above, and a small
+          // positive displacement keeps the address in the window.
           ins = (t.primary << 26) | (d << 21) | (a << 16) | ((rnd() & 1) << 15) |
-                ((rnd() & 1) << 12) | (rnd() & 0x0FF0);
+                ((rnd() % 5) << 12) | (rnd() & 0x07F0);  // twelve-bit field: bit 11 is the sign
         }
         else if (t.primary == 19)
         {
@@ -877,7 +1106,7 @@ int main()
         for (int i = 0; i < 32; ++i)
           state.gpr[i] = (rnd() & 1) ? (rnd() & 0xFFFF) : safe_random(rnd());
         state.gpr[a] = 0x8000'0000 + (rnd() & 0x000F'FFF0);
-        if (t.primary == 31)
+        if (t.primary == 31 || t.primary == 4)
           state.gpr[b] = rnd() & 0xFF0;
         for (int i = 0; i < 8; ++i)
           state.cr.fields[i] = 0;
@@ -1089,7 +1318,8 @@ int main()
         {63, 21}, {63, 25}, {63, 29}, {63, 12}, {63, 15}, {63, 0}, {63, 32},
         {59, 21}, {59, 25}, {59, 29}, {59, 20}, {59, 18},
         {4, 21}, {4, 25}, {4, 29}, {4, 10}, {4, 12}, {4, 0},
-        {56, 0}, {60, 0}, {31, 19}, {31, 144}, {19, 193},
+        {56, 0}, {60, 0}, {57, 0}, {61, 0}, {4, 6}, {4, 7}, {4, 38}, {4, 39},
+        {31, 19}, {31, 144}, {19, 193},
     };
     // Forms that carry an Rc bit, drawn with it set so CR0 is exercised
     // inside a block and not only in isolation -- a dot form mid-block
@@ -1160,6 +1390,9 @@ int main()
         else if (g.primary == 31)
           ins = maybe_rc((31u << 26) | (d << 21) | (a << 16) | (b << 11) | (g.xo << 1),
                          (rnd() & 1) != 0);
+        else if (g.primary == 4 && (g.xo == 6 || g.xo == 7 || g.xo == 38 || g.xo == 39))
+          ins = (4u << 26) | (d << 21) | (a << 16) | (b << 11) | ((rnd() & 1) << 10) |
+                ((rnd() % 5) << 7) | (g.xo << 1);
         else if (g.primary == 63 || g.primary == 4 || g.primary == 59)
         {
           const u32 c = rnd() % 32;
@@ -1173,9 +1406,9 @@ int main()
           if ((rnd() & 1) && g.xo != 0 && g.xo != 32)
             ins |= 1u;
         }
-        else if (g.primary == 56 || g.primary == 60)
+        else if (g.primary >= 56 && g.primary <= 61)
           ins = (g.primary << 26) | (d << 21) | (a << 16) | ((rnd() & 1) << 15) |
-                ((rnd() & 1) << 12) | (rnd() & 0x03F0);
+                ((rnd() % 5) << 12) | (rnd() & 0x03F0);
         else if (g.primary == 19)
           ins = (19u << 26) | ((rnd() % 32) << 21) | ((rnd() % 32) << 16) | ((rnd() % 32) << 11) |
                 (g.xo << 1);
@@ -1703,9 +1936,17 @@ int main()
       // the budget exit is reached often rather than as a rarity.
       const u32 budget = 6 + rnd() % 60;
       const u32 init_msr = kPristineMsr;
+      // FPSCR too, as the block differential seeds it. Left unreset, the
+      // value the last block trial happened to leave -- FEX among its
+      // bits -- decided whether an mtmsr here that sets FE0 raises the
+      // floating-point program exception, and which trials that fell on
+      // moved whenever the random stream before this section changed.
+      const u32 init_fpscr =
+          ((rnd() & 1) ? (rnd() & 0xF0000000u) : 0) | ((rnd() & 1) << 2) | (rnd() & 3);
 
       auto reset = [&]() {
         state.msr.Hex = init_msr;
+        state.fpscr.Hex = init_fpscr;
         ppc.MSRUpdated();
         for (int i = 0; i < 32; ++i)
           state.gpr[i] = init_gpr[i];
@@ -1858,7 +2099,10 @@ int main()
       state.pc = state.npc = ret & ~3u;
       if (msr_changed)
       {
+        // As the dispatcher and RunBlock do: Interpreter::mtmsr's steps
+        // after the write, FP exception check included.
         ppc.MSRUpdated();
+        CheckFPExceptions(state);
         ppc.CheckExceptions();
         state.pc = state.npc;
       }
