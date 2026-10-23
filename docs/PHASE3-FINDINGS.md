@@ -10,9 +10,21 @@ Headline, same harness, same machine (Chrome 155, Apple M4):
 | | wall time | real-time speed |
 |---|---|---|
 | start of this work (#82): 800M instructions, 193.8 MIPS | 4127 ms for 1.10 emulated s | 26.6% |
-| end: the first 2.0 emulated seconds of the boot | 1391–1427 ms | **140–144%** |
-| end, idle loops not skipped (796 MIPS) | 1847 ms | 108% |
-| end: 20 emulated seconds, input and a figure on the portal | 6865 ms | **291%** |
+| #83: the first 2.0 emulated seconds of the boot | 1391–1427 ms | **140–144%** |
+| #83, idle loops not skipped (796 MIPS) | 1847 ms | 108% |
+| #83: 20 emulated seconds, input and a figure on the portal | 6865 ms | 291% |
+| now: the first 2.0 emulated seconds of the boot | 1380–1417 ms | **141–145%** |
+| now: 390 emulated seconds, title to tutorial level, pressing A | 527 s | **74%** |
+| now: the gameplay window, 300–390 emulated s, character on screen, 3D scene | 152.6 s for 90 s | **59%** |
+
+The gameplay rows are the facts about gameplay speed, measured CPU-side
+with the Null video backend (nothing is drawn): the game runs its 60 Hz
+frame loop at 59.6 frames per emulated second throughout, so 59% of real
+time is about 35 frames a wall second in the tutorial level. Over the
+same 390 seconds at the start of the gameplay work the numbers were 63%
+and 50%: the hatch share fell from 2.17% of executed instructions to
+0.62%, the instructions interpreted one at a time from 462 million to
+3.5 million, and the blocks retired from 47 to none.
 
 "Real-time speed" is emulated seconds per wall second, which is what a
 player experiences and what MIPS stops measuring the moment an idle loop
@@ -150,6 +162,15 @@ The three rows at the end are measured with `--ticks` (fixed emulated
 time); the earlier ones at a fixed 800M instructions, which covered the
 same 2.056 emulated seconds until the hatch changed the timing path.
 
+The gameplay work that followed, measured over the same 390 emulated
+seconds (title to tutorial level, pressing A) and its last 90 seconds:
+
+| step | whole run | gameplay window | notes |
+|---|---|---|---|
+| a Nunchuk on the Wii Remote, presses by emulated tick, the disc-file timeline, a GX inventory at 390 s; `fadd`/`fsub`/`fmul`/`fdiv`, their single and paired forms, `ps_muls0/1`, `frsp` inline for the common case | 63.0% | 50.2% | 5.8B instructions through the hatch (2.17%); `psq_l` 29%, `psq_st` 14%, `stb`/`stw` 14% of them |
+| `psq_l`/`psq_st` and their six variants specialised on the GQR and guarded; gather-pipe stores inline when they do not fill the buffer | 64.9% | 52.8% | both gone from the histogram; the gain was small, which said the hatch was not the cost |
+| the retirement list: the skinning loop's loads and stores at `0xE0000000` bailed on every iteration; the locked L1 cache translated; the `0xCC00`/`0xCD00` MMIO mask fixed; `mfcr`/`mtcrf`/`fcmpu`/`fcmpo` inline; the FP program exception after an `mtmsr` exit | **74.0%** | **59.0%** | interpreted singly 462M → 3.5M, bails 226M → 1.2M, retired 47 → 0; hatch 1.7B (0.62%), 55% of it the fused multiply-adds |
+
 The native build of the harness was also repaired (`compile_region` had
 been left outside the Emscripten guard), the differential grew checks for
 XER, the FP registers, FPSCR and the reservation, a MEM2 scratch window,
@@ -183,8 +204,11 @@ has fired.
 
 **The region table** maps the top seven bits of a guest address to a host
 base: MEM1, MEM2 (two granules) and both uncached mirrors; everything
-else — MMIO, the EFB, the locked cache — is zero and bails to the
-interpreter. One load replaced one compare.
+else is zero and takes the miss path, which in order tries the locked L1
+cache (its own compare: 256 KB is too small for a 32 MB granule), the
+gather pipe (for a store), the hardware registers (through the hatch) and
+finally bails to the interpreter. One load replaced one compare on the
+hot path; the cold path grew, and only runs for addresses outside RAM.
 
 **The tier-up threshold** interprets a straight-line run from a cold PC up
 to the first taken branch, and only the start PC gets a cache entry.
@@ -194,11 +218,56 @@ hundred nanoseconds.
 **FP correctness is the interpreter's.** `lfs`/`stfs` use Dolphin's
 `ConvertToDouble`/`ConvertToSingle` reimplemented bit for bit (including
 the denormal and NaN branches, which `f64.promote_f32` would get wrong).
-Every FP *arithmetic* instruction currently goes through the hatch, so its
-NaN ordering, FPSCR flags and the single-precision rounding quirks are
-exactly `Interpreter_FloatingPoint.cpp`'s. Inlining the hottest of them is
-the next step and the differential is ready for it: FPSCR and all 32
-paired registers are compared.
+`fadd`/`fsub`/`fmul`/`fdiv`, their single and paired forms, `ps_muls0/1`
+and `frsp` are inline for the common case -- finite operands, a finite
+result -- with the interpreter's own rounding rules (`Force25Bit` on the
+multiplicand, `ForceSingle`'s NI flush, the FPRF class codes); anything
+that would set an exception bit is detected before any write and the
+whole instruction runs through the hatch instead. `fcmpu`/`fcmpo` are
+inline except with a NaN operand. Everything else -- the fused
+multiply-adds above all, whose single-precision rounding is a software
+routine in Dolphin -- still goes through the hatch, so its semantics are
+exactly `Interpreter_FloatingPoint.cpp`'s. Two interpreter quirks are
+matched on purpose: the compares OR their result into FPRF rather than
+replacing the FPCC bits (`fpscr.FPRF & ~FPCC_MASK` clears nothing, FPRF
+being a five-bit field), and `mtcrf` re-encodes every CR field through
+`s_crTable`, not only the ones its mask selects.
+
+**Quantized loads and stores are specialised on the GQR.** `psq_l`/
+`psq_st` and their indexed and update forms are compiled for the GQR
+value seen at compile time -- the type decides the load width and sign,
+the scale becomes one `f32.const` -- and guarded: the block compares the
+live register with that value and runs the instruction through the hatch
+when they differ. Dolphin's own JIT does the same. Over 390 emulated
+seconds of gameplay the guard never fell back enough to register in the
+hatch histogram.
+
+**The gather pipe is written inline** when the store does not fill the
+32-byte buffer: the bytes go to `gather_pipe_ptr` in guest order and the
+pointer advances. The store that would fill it takes the hatch, so the
+flush (`UpdateGatherPipe`, the FIFO, the command processor) stays the
+interpreter's and both paths meet at the same buffer state. The guest
+address is compared, so this is enabled only when the DBATs map
+`0xCC008000` to the pipe (`MMU::IsOptimizableGatherPipeWrite`), which the
+Wii's standard BATs do.
+
+**The locked L1 cache has a translation.** The character skinning loop
+(`0x8018acc0`..) streams its vertices through the locked cache at
+`0xE0000000`, and every one of its quantized loads and stores bailed:
+450 million instructions interpreted one at a time over 390 emulated
+seconds, 99% of everything still interpreted, found through a retirement
+list that prints the refusing instruction and its address. Addresses in
+`[0xE0000000, 0xE0040000)` now translate to Dolphin's locked-cache buffer,
+enabled per compile while the DBATs map the range
+(`MMU::IsOptimizableRAMAddress`), since the game's OS init sets that BAT
+long after the harness starts.
+
+**An `mtmsr` exit takes the FP program exception.** `Interpreter::mtmsr`
+follows the write with `CheckFPExceptions`: an exception already
+summarised in FPSCR[FEX] is raised the moment FE0 or FE1 enables it. The
+dispatcher's fix-up after a marked exit did `MSRUpdated` and
+`CheckExceptions` and skipped that step. The chain differential found it
+once FPSCR became part of its seeded state.
 
 **The hatch** is one imported function, `env.ppc_interp_op(state, ins,
 pc)`, exported by the harness and imported by every block module as
@@ -211,7 +280,11 @@ with the PC the interpreter chose. A load or store whose address lands in
 `0xCC00xxxx`, `0xCD00xxxx` or `0xCD80xxxx` takes the same path; any other
 address outside RAM still bails, because the interpreter has no bounds
 check on its MMIO handler table and needs a video backend for the EFB,
-and the randomised differential found both.
+and the randomised differential found both. (The mask that merged
+`0xCC00` and `0xCD00` cleared the wrong bit until the retirement list
+showed `lwzx`/`stwx` at `0xCD00002E` interpreted a million times; the
+randomised differential keeps its addresses out of that range on purpose
+and could not have seen it.)
 
 **Translation off has its own tier.** The block cache, link table and
 region table come in two sets, chosen by MSR[DR] at every dispatch. The
@@ -222,39 +295,65 @@ The last profile, over the first 2 emulated seconds: compiled blocks 55%
 of the run, the dispatcher loop 18%, module compilation 5%, disc reads
 over XHR 4%, the interpreter under 3%. What is left is the emitted code.
 
+**How the gameplay facts were gathered.** The harness attaches a Nunchuk
+(the game will not leave its first screen without one) and schedules
+presses by emulated tick; pressing A alone takes the game from the title
+through the tutorial level with the character on screen. Every disc file
+is printed as it is first read, with the emulated time: `level/
+Level_027_Tutorial.arc` opens at 104 s and `character/000_AirDragon.arc`
+at 171 s, so the window from 300 s is gameplay, not a menu. The GX
+command stream captured at 390 s decodes to ~1,900 draws a frame with
+normals and texture coordinates, 415k vertices per 3 MB -- a 3D scene,
+while the menus before it are triangle fans with colour and one texture
+coordinate. Frames are counted at XFB flips: 59.6 per emulated second
+throughout. All speeds are CPU-side with the Null video backend; nothing
+is drawn.
+
 ---
 
 ## 5. Known gaps, ranked by what they cost now
 
-1. **FP arithmetic through the hatch costs ~40–70 ns an instruction.** Fine
-   against the ~150 ns it replaced; not fine for gameplay, where it is a
-   quarter of the stream. Inline `fmuls`/`fadds`/`fmadds`/`ps_madd`/
-   `psq_l` first, profile-guided (`--jit-names`), exactly, one at a time;
-   the differential compares FPSCR and all 32 paired registers already.
-2. **Compare and CR0 encoding.** `cmpwi` is ~30 wasm instructions through
+The gameplay window runs about 970 million guest instructions per
+emulated second with idle loops already skipped, and the compiled code
+executes them at roughly 2 ns each. That product is the gap: the
+remaining interpreter work (hatch, bails, retired blocks) is now a
+single-digit share of the wall time, and the rest is the emitted code.
+
+1. **Code quality in the emitted blocks** -- registers in locals across a
+   block, real `loop` constructs for self-targeting back edges, the
+   compare-and-branch pairs that are a third of the stream. The
+   hand-written hot-loop variant showed 2.8× headroom on that shape, and
+   at 970 M instructions per emulated second this is where the factor of
+   two to real time has to come from. A gameplay-window profile
+   (`--jit-names`, profiler started after 300 emulated seconds) is the
+   next measurement to take.
+2. **The fused multiply-adds through the hatch.** After the quantized
+   forms and the gather pipe went inline, `ps_madds0`/`ps_madds1`/
+   `ps_madd` are 40% of what remains in the histogram, in the skinning
+   loop above all. Dolphin's `NI_madd_msub` is a software routine for the
+   single-precision rounding; an inline common case needs care and the
+   differential is ready for it.
+3. **Compare and CR0 encoding.** `cmpwi` is ~30 wasm instructions through
    `s_crTable`; Dolphin's own JIT stores the sign-extended difference.
    Adopting that needs the differential to compare decoded CR fields
-   rather than raw words, which is the right invariant anyway. Compares
-   and conditional branches are a third of the instruction stream.
-3. **Code quality in the hot integer loops** — registers in locals across
-   a block, real `loop` constructs for self-targeting back edges. The
-   hand-written hot-loop variant shows 2.8× headroom on that shape.
-4. **The hatch's inline footprint.** Every load and store now carries a
-   cold path of about forty bytes for the hardware-register case; that is
-   the likely cause of the −3% in the boot window.
-5. **Interrupt-polling loops that call a function.** The game's main wait
+   rather than raw words, which is the right invariant anyway -- and would
+   also let `mtcrf` stop re-encoding the fields its mask leaves alone.
+4. **Interrupt-polling loops that call a function.** The game's main wait
    past the boot is `bl OSDisableInterrupts; lbz; bl OSEnableInterrupts;
    cmpwi; bne`, which the busy-wait rule cannot see through. Dolphin
    cannot either; with calls followed (the `trace_uncond` flag) and
-   `mfmsr`/`mtmsr` admitted when only EE changes, it could be.
-6. **No block invalidation**, as before. `icbi` is interpreted and
+   `mfmsr`/`mtmsr` admitted when only EE changes, it could be. Idle
+   skipping already covers 61% of the emulated time over a 390-second
+   run, so what is left of this is in gameplay, where it is small.
+5. **No block invalidation**, as before. `icbi` is interpreted and
    invalidates nothing of ours. `mtspr` to a BAT goes through the hatch
-   and the region tables do not follow it; the boot sets the BATs once.
-7. **Gameplay has not been reached in the harness.** The runs with input
-   and a figure sit at a prompt that wants a Nunchuk; attaching one
-   (`record-gameplay.sh` shows the configuration) is the precondition for
-   a gameplay profile.
-8. **The interpreter has no bounds check on its MMIO handler table.** A
+   and the region tables, the gather-pipe address and the locked-cache
+   mapping do not follow it; the game sets its BATs once, at OS init.
+6. **The hatch's inline footprint.** Every load and store carries a cold
+   path for the hardware registers, the gather pipe and now the locked
+   cache; it runs only for addresses outside RAM, but it is code the
+   browser compiles. The boot window is unchanged by it within noise.
+7. **The interpreter has no bounds check on its MMIO handler table.** A
    store to `0xCC80xxxx` from guest code would trap the whole emulator.
    No game does it; the randomised differential did, which is why the
    hatch only takes the three blocks the interpreter decodes.
@@ -270,13 +369,23 @@ harness/wasm-core/run-jit.sh 2000000000 --jit --jit-stats --ticks=1458000000   #
 harness/wasm-core/run-jit.sh 20000000000 --jit --input=A --skylander --ticks=14580000000  # 20 s past the boot
 harness/wasm-core/run-jit.sh 800000000 --jit --disasm=803a7e00,12       # read a hot block
 harness/wasm-core/run-boot.sh /tmp/ssa.iso 20000                        # native trace differential
+# gameplay: 400 emulated s pressing A, speed measured from 300 s, the GX
+# stream captured at 390 s, every disc file read printed as it is opened
+harness/wasm-core/run-jit.sh 300000000000 --jit --jit-stats --input=A --skylander \
+  --ticks=291600000000 --speed-from=218700000000 --capture-gx=3000000 --gx-from=284310000000
+python3 harness/src/decode_capture.py <that run's output>              # what the GX stream draws
 ```
 
 Flags that turn each change off for an A/B: `--jit-no-idle`,
-`--jit-no-mtmsr`, `--jit-no-hatch`, `--jit-no-phys`, `--jit-threshold=1`,
-`--jit-no-link`. The first argument is a cap on instructions; `--ticks=N`
-stops at N emulated ticks (729 million per second), which is the
-comparison to use.
+`--jit-no-mtmsr`, `--jit-no-hatch`, `--jit-no-phys`, `--jit-no-gp`,
+`--jit-no-psq`, `--jit-threshold=1`, `--jit-no-link`. The first argument
+is a cap on instructions; `--ticks=N` stops at N emulated ticks (729
+million per second), which is the comparison to use. `--speed-from=T`
+opens a second speed window at tick T, so a gameplay phase can be timed
+on its own; `--xfb-every=T` prints a thumbnail of the frame every T ticks;
+`--pointer=X,Y`, `--period-ms`, `--press-ms` shape the input; a run
+without `--no-nunchuk` has a Nunchuk on the Wii Remote, which the game
+insists on before it leaves its first screen.
 
 Measurements vary by about ±3% run to run; a difference inside that is
 not a result. Do not run the differential (node) on the same machine

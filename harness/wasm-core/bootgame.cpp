@@ -18,7 +18,9 @@
 #include <cstring>
 #include <unistd.h>
 #include <algorithm>
+#include <functional>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 #include <memory>
 #include <set>
@@ -50,6 +52,10 @@
 #include "Core/HW/GCKeyboard.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/Wiimote.h"
+#include "Core/HW/WiimoteEmu/Extension/Nunchuk.h"
+#include "Core/HW/WiimoteEmu/ExtensionPort.h"
+#include "Core/HW/WiimoteEmu/WiimoteEmu.h"
+#include "InputCommon/ControllerEmu/ControlGroup/Attachments.h"
 #include "InputCommon/ControllerEmu/ControllerEmu.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/InputConfig.h"
@@ -64,9 +70,11 @@
 #include "Core/IOS/USB/Emulated/Skylanders/Skylander.h"
 #include "Core/IOS/USB/Emulated/Skylanders/SkylanderFigure.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "Core/WiiRoot.h"
+#include "DiscIO/Filesystem.h"
 #include "DiscIO/Volume.h"
 #include "DiscIO/VolumeDisc.h"
 #include "UICommon/UICommon.h"
@@ -112,6 +120,12 @@ EMSCRIPTEN_KEEPALIVE const char* harness_stage() { return (const char*)g_harness
 static Interpreter* g_hatch_interp = nullptr;
 static PowerPC::PowerPCManager* g_hatch_ppc = nullptr;
 static PowerPC::PowerPCState* g_hatch_state = nullptr;
+// What goes through the hatch, keyed as the interpreter statistics key it
+// (primary opcode, and the extended opcode for 4, 19, 31, 59 and 63), so
+// the two rankings read side by side. Only kept with --jit-stats.
+static bool g_hatch_stats = false;
+static u64 g_hatch_calls = 0;
+static std::map<u32, u64> g_hatch_hist;
 
 #if !defined(__EMSCRIPTEN__)
 #define EMSCRIPTEN_KEEPALIVE
@@ -119,6 +133,15 @@ static PowerPC::PowerPCState* g_hatch_state = nullptr;
 extern "C" EMSCRIPTEN_KEEPALIVE u32 ppc_interp_op(u32 /*state*/, u32 ins, u32 pc)
 {
   auto& st = *g_hatch_state;
+  ++g_hatch_calls;
+  if (g_hatch_stats)
+  {
+    const u32 primary = ins >> 26;
+    const u32 key = (primary == 31 || primary == 19 || primary == 63 || primary == 59 || primary == 4)
+                        ? (primary << 16) | (((ins >> 1) & 0x3FF) << 1)
+                        : (primary << 16);
+    ++g_hatch_hist[key];
+  }
   st.pc = pc;
   st.npc = pc + 4;
   Interpreter::RunInterpreterOp(*g_hatch_interp, UGeckoInstruction{ins});
@@ -245,10 +268,13 @@ extern "C" void harness_gp_bytes(const u8* data, size_t size)
 // geometry is hiding in display lists.
 static std::vector<u8> g_gx_bytes;
 static size_t g_gx_limit = 0;
+// Capturing is ARMED by the step loop, immediately or at --gx-from, so a
+// capture can be a window late in the run rather than the boot.
+static bool g_gx_armed = false;
 
 extern "C" void harness_gx_command(const u8* data, u32 size)
 {
-  if (g_gx_limit == 0 || g_gx_bytes.size() >= g_gx_limit)
+  if (!g_gx_armed || g_gx_limit == 0 || g_gx_bytes.size() >= g_gx_limit)
     return;
   g_gx_bytes.insert(g_gx_bytes.end(), data, data + size);
 }
@@ -319,14 +345,30 @@ static const char* g_press_control = "";
 // The sequence to cycle through, one entry per press window.
 static std::vector<std::pair<const char*, const char*>> g_input_sequence;
 
-// One emulated second is about 729 million instructions (the Wii CPU clock,
-// and this harness advances one tick per instruction). Press for ~0.2s every
-// ~2s: long enough to register, with gaps long enough for a menu to act on it.
-static constexpr u64 PRESS_PERIOD = 1458000000ull;  // ~2.0s
-static constexpr u64 PRESS_LENGTH = 150000000ull;   // ~0.2s
+// Presses are scheduled by EMULATED TIME -- CoreTiming ticks, 729 million
+// per second -- not by instruction count. They used to be scheduled by
+// instruction count, which was the same thing while every instruction cost
+// one tick; with idle loops skipped the two come apart, and a schedule in
+// instructions lands at a different emulated second on every build. Press
+// for 0.2 s every 2 s by default: long enough to register, with gaps long
+// enough for a menu to act on it. --period-ms and --press-ms change that.
+static u64 g_press_period = 1458000000ull;  // 2.0 s
+static u64 g_press_length = 145800000ull;   // 0.2 s
 
-// Names from WiimoteEmu.h and ControllerEmu.h. A D-pad direction and a face
-// button live in different GROUPS, which is why both halves are carried.
+// The Nunchuk's stick, as a deflection the override hands back for the X
+// and Y axes while a stick entry is held.
+static double g_stick_x = 0.0, g_stick_y = 0.0;
+// Where the Wii Remote points, in the cursor's -1..1 space with (0, 0) the
+// centre of the screen. --pointer=X,Y sets it; left unset, the cursor is
+// not overridden and reports whatever the unmapped controls give, which is
+// the centre as well. Menus in this game are pointed at.
+static bool g_pointer_set = false;
+static double g_pointer_x = 0.0, g_pointer_y = 0.0;
+
+// Names from WiimoteEmu.h, Nunchuk.h and ControllerEmu.h. A D-pad direction
+// and a face button live in different GROUPS, which is why both halves are
+// carried. Entries whose group begins with "Nunchuk " belong to the
+// extension's own override; the stick entries are deflections, not buttons.
 static bool LookupButton(const std::string& name,
                          std::pair<const char*, const char*>* out)
 {
@@ -337,6 +379,10 @@ static bool LookupButton(const std::string& name,
       {"Home", "Buttons", "Home"}, {"Up", "D-Pad", "Up"},
       {"Down", "D-Pad", "Down"},   {"Left", "D-Pad", "Left"},
       {"Right", "D-Pad", "Right"},
+      {"C", "Nunchuk Buttons", "C"}, {"Z", "Nunchuk Buttons", "Z"},
+      {"SX+", "Nunchuk Stick", "X+"}, {"SX-", "Nunchuk Stick", "X-"},
+      {"SY+", "Nunchuk Stick", "Y+"}, {"SY-", "Nunchuk Stick", "Y-"},
+      {"none", "", ""},
   };
   for (const auto& e : kMap)
   {
@@ -558,6 +604,14 @@ int main(int argc, char** argv)
   bool want_jit_names = false;
   bool want_hatch = true;
   bool want_phys = true;
+  bool want_gp = true;
+  bool want_psq = true;
+  bool want_l1 = true;
+  bool want_nunchuk = true;
+  bool want_disc_files = false;
+  u64 gx_from = 0;      // --gx-from=TICKS: arm the GX capture at this emulated time
+  u64 xfb_every = 0;    // --xfb-every=TICKS: a quarter-size framebuffer thumbnail this often
+  u64 speed_from = 0;   // --speed-from=TICKS: a second stopwatch from this emulated time
   std::vector<std::pair<u32, u32>> disasm_ranges;  // --disasm=ADDR,N
   bool want_mtmsr_continue = true;
   u64 tick_cap = 0;
@@ -683,6 +737,54 @@ int main(int argc, char** argv)
     // the dispatcher used to, instead of compiling it in its own tier.
     else if (std::strcmp(argv[i], "--jit-no-phys") == 0)
       want_phys = false;
+    // --jit-no-gp: every store to the write-gather pipe goes through the
+    // hatch, instead of the ones that do not fill the buffer being
+    // written to it inline.
+    else if (std::strcmp(argv[i], "--jit-no-gp") == 0)
+      want_gp = false;
+    // --jit-no-psq: the quantized paired-single loads and stores go
+    // through the hatch, instead of being specialised on the GQRs.
+    else if (std::strcmp(argv[i], "--jit-no-psq") == 0)
+      want_psq = false;
+    // --jit-no-l1: accesses to the locked L1 cache bail to the interpreter
+    // (and retire the block when first), as they used to.
+    else if (std::strcmp(argv[i], "--jit-no-l1") == 0)
+      want_l1 = false;
+    // --no-nunchuk: leave the Wiimote without an extension. The game asks
+    // for a Nunchuk before it will go anywhere, so one is attached by
+    // default; this is for comparing against baselines recorded without.
+    else if (std::strcmp(argv[i], "--no-nunchuk") == 0)
+      want_nunchuk = false;
+    // --disc-files: print the game partition's file table at startup.
+    else if (std::strcmp(argv[i], "--disc-files") == 0)
+      want_disc_files = true;
+    else if (std::strncmp(argv[i], "--period-ms=", 12) == 0)
+      g_press_period = std::strtoull(argv[i] + 12, nullptr, 0) * 729000ull;
+    else if (std::strncmp(argv[i], "--press-ms=", 11) == 0)
+      g_press_length = std::strtoull(argv[i] + 11, nullptr, 0) * 729000ull;
+    // --gx-from=TICKS: with --capture-gx=N, start capturing only once this
+    // much emulated time has passed, so the N bytes are a window late in
+    // the run -- the first seconds of gameplay rather than the boot.
+    else if (std::strncmp(argv[i], "--gx-from=", 10) == 0)
+      gx_from = std::strtoull(argv[i] + 10, nullptr, 0);
+    // --speed-from=TICKS: report the speed of everything after this
+    // emulated time as well as of the whole run. The number that matters
+    // for play is the one measured once the game is being played.
+    else if (std::strncmp(argv[i], "--speed-from=", 13) == 0)
+      speed_from = std::strtoull(argv[i] + 13, nullptr, 0);
+    // --xfb-every=TICKS: with --render, emit a 160x120 thumbnail of the
+    // framebuffer every N emulated ticks, as base64 PPM. A full frame is
+    // 900 KB; a thumbnail is 57 KB, which is what makes a dozen of them
+    // transportable out of a browser. For seeing which screen the game is
+    // on at each point of a long run.
+    else if (std::strncmp(argv[i], "--xfb-every=", 12) == 0)
+      xfb_every = std::strtoull(argv[i] + 12, nullptr, 0);
+    // --pointer=X,Y: hold the Wii Remote's pointer at this screen position,
+    // -1..1 on each axis, (0,0) the centre.
+    else if (std::strncmp(argv[i], "--pointer=", 10) == 0)
+    {
+      g_pointer_set = std::sscanf(argv[i] + 10, "%lf,%lf", &g_pointer_x, &g_pointer_y) == 2;
+    }
     // --disasm=ADDR,N: at the end of the run, disassemble N guest
     // instructions at ADDR. For reading what a hot block in a profile is.
     else if (std::strncmp(argv[i], "--disasm=", 9) == 0)
@@ -841,6 +943,16 @@ int main(int argc, char** argv)
               // Only the groups this harness drives are overridden. Returning
               // nullopt elsewhere leaves motion, IR and extensions to their
               // normal (neutral) handling rather than forcing them to zero.
+              if (group == "IR")
+              {
+                if (!g_pointer_set)
+                  return std::nullopt;
+                if (control == "X")
+                  return g_pointer_x;
+                if (control == "Y")
+                  return g_pointer_y;
+                return std::nullopt;
+              }
               if (group != "Buttons" && group != "D-Pad")
                 return std::nullopt;
               const bool held = group == g_press_group && control == g_press_control;
@@ -852,6 +964,55 @@ int main(int argc, char** argv)
     }
   }
   check(true, "controller configs loaded");
+
+  // ── the Nunchuk ──
+  //
+  // Skylanders stops at "Connect Nunchuk to the Wii Remote" and will not
+  // leave the title screen without one (scripts/record-gameplay.sh found
+  // this the hard way). The extension is an attachment on the emulated
+  // Wiimote with its own controls and its own input override, so the stick
+  // and the C and Z buttons are driven through a second override function
+  // installed on it.
+  if (want_nunchuk)
+  {
+    bool attached = false;
+    if (InputConfig* cfg = Wiimote::GetConfig())
+    {
+      if (auto* controller = cfg->GetController(0))
+      {
+        auto* wiimote = static_cast<WiimoteEmu::Wiimote*>(controller);
+        auto* attachments = static_cast<ControllerEmu::Attachments*>(
+            wiimote->GetWiimoteGroup(WiimoteEmu::WiimoteGroup::Attachments));
+        attachments->SetSelectedAttachment(WiimoteEmu::ExtensionNumber::NUNCHUK);
+        auto& nunchuk = *attachments->GetAttachmentList()[WiimoteEmu::ExtensionNumber::NUNCHUK];
+        nunchuk.SetInputOverrideFunction(
+            [](std::string_view group, std::string_view control,
+               ControlState state) -> std::optional<ControlState> {
+              if (group == "Stick")
+              {
+                if (control == "X")
+                  return g_stick_x;
+                if (control == "Y")
+                  return g_stick_y;
+                return std::nullopt;
+              }
+              if (group == "Buttons")
+              {
+                const bool held = std::string_view(g_press_group) == "Nunchuk Buttons" &&
+                                  control == g_press_control;
+                return held ? 1.0 : 0.0;
+              }
+              return std::nullopt;
+            });
+        // Selected, not yet active: the emulated Wiimote plugs the new
+        // extension in on a later update, as a real one would. The active
+        // number is reported at the end of the run.
+        attached = attachments->GetAttachmentSetting().GetValue() ==
+                   static_cast<int>(WiimoteEmu::ExtensionNumber::NUNCHUK);
+      }
+    }
+    check(attached, "Nunchuk selected on the Wii Remote");
+  }
 
   // Three config choices below, all about threads.
   //
@@ -981,6 +1142,68 @@ int main(int argc, char** argv)
     return 1;
   std::printf("  booting %s (%s)\n", volume->GetGameID().c_str(),
               volume->GetInternalName().c_str());
+
+  // ── which file is the game reading? ──
+  //
+  // The disc's file table, walked once, so that every read the harness
+  // serves can be named. A Wii partition's data is encrypted in 0x8000-byte
+  // clusters of which 0x7C00 are payload, so a raw disc offset maps to a
+  // partition offset through that geometry and then to a file through the
+  // FST. Printed only when the file changes, with the emulated time: a
+  // compact timeline of what the game is doing (its title screen, a movie,
+  // a level) that needs no renderer.
+  //
+  // --disc-files prints the table itself.
+  static std::vector<std::tuple<u64, u64, std::string>> disc_files;  // offset, size, path
+  static u64 disc_data_start = 0;
+  static const char* disc_last_file = "";
+  {
+    const DiscIO::Partition part = volume->GetGamePartition();
+    if (const DiscIO::FileSystem* fs = volume->GetFileSystem(part); fs && fs->IsValid())
+    {
+      disc_data_start = volume->PartitionOffsetToRawOffset(0, part) - 0x400;
+      std::function<void(const DiscIO::FileInfo&)> walk = [&](const DiscIO::FileInfo& f) {
+        if (f.IsDirectory())
+        {
+          for (const DiscIO::FileInfo& c : f)
+            walk(c);
+        }
+        else
+        {
+          disc_files.emplace_back(f.GetOffset(), f.GetSize(), f.GetPath());
+        }
+      };
+      walk(fs->GetRoot());
+      std::sort(disc_files.begin(), disc_files.end());
+      if (want_disc_files)
+        for (const auto& [off, size, path] : disc_files)
+          std::printf("  file %012llx %9llu %s\n", static_cast<unsigned long long>(off),
+                      static_cast<unsigned long long>(size), path.c_str());
+      std::printf("  disc      %zu files in the game partition\n", disc_files.size());
+    }
+  }
+  stats->on_read = [](u64 raw, u64 /*len*/) {
+    if (raw < disc_data_start || disc_files.empty())
+      return;
+    const u64 rel = raw - disc_data_start;
+    const u64 within = rel % 0x8000;
+    const u64 part_off = (rel / 0x8000) * 0x7C00 + (within > 0x400 ? within - 0x400 : 0);
+    // The last file starting at or before the offset.
+    auto it = std::upper_bound(disc_files.begin(), disc_files.end(),
+                               std::make_tuple(part_off, ~0ull, std::string()));
+    if (it == disc_files.begin())
+      return;
+    --it;
+    const auto& [off, size, path] = *it;
+    if (part_off >= off + size)
+      return;
+    if (path.c_str() == disc_last_file || path == disc_last_file)
+      return;
+    disc_last_file = path.c_str();
+    const auto& ct = Core::System::GetInstance().GetCoreTiming();
+    std::printf("  reading   %8.1f s  %s\n", static_cast<double>(ct.GetTicks()) / 729e6,
+                path.c_str());
+  };
 
   // ── boot ──
   // CBoot::BootUp runs the apploader out of the disc, which copies the game's
@@ -1268,6 +1491,7 @@ int main(int argc, char** argv)
   g_hatch_interp = &system.GetInterpreter();
   g_hatch_ppc = &ppc;
   g_hatch_state = &state;
+  g_hatch_stats = want_jit_stats;
   JitImportsInit();
   jit_layout.reserve_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve));
   jit_layout.reserve_address_offset =
@@ -1287,6 +1511,22 @@ int main(int argc, char** argv)
   }
   jit_layout.dcache_enabled = state.m_enable_dcache;
   jit_layout.low_dcbz_hack = Config::Get(Config::MAIN_LOW_DCBZ_HACK);
+  // The GQRs to specialise psq_l/psq_st on, read as each block is
+  // compiled; see StateLayout::gqr_values. The emitted guard keeps the
+  // result exact if the game changes one.
+  if (want_psq && want_hatch)
+    jit_layout.gqr_values = &state.spr[SPR_GQR0];
+  // The write-gather pipe, when the DBATs map it where every Wii game
+  // has it; see StateLayout::gather_pipe_ea. The physical tier runs the
+  // exception handlers, which issue no GX commands, and keeps the hatch.
+  if (want_gp && want_hatch && system.GetMMU().IsOptimizableGatherPipeWrite(0xCC008000u))
+  {
+    jit_layout.gather_pipe_ea = 0xCC008000u;
+    jit_layout.gather_pipe_ptr_offset =
+        static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_ptr));
+    jit_layout.gather_pipe_base_offset =
+        static_cast<u32>(offsetof(PowerPC::PowerPCState, gather_pipe_base_ptr));
+  }
 
   // ── the region table ──
   //
@@ -1499,6 +1739,7 @@ int main(int argc, char** argv)
     }
   }
   ppc2wasm::StateLayout jit_layout_phys = jit_layout;
+  jit_layout_phys.gather_pipe_ea = 0;
   jit_layout_phys.link_base = static_cast<u32>(reinterpret_cast<uintptr_t>(link_table_phys.data()));
   jit_layout_phys.link_mask = kLinkEntriesPhys - 1;
   jit_layout_phys.region_table =
@@ -1512,6 +1753,17 @@ int main(int argc, char** argv)
     auto& jit_cache = tier.cache;
     auto& link_table = tier.link_table;
     auto& jit_layout = tier.layout;
+    // The locked L1 cache, for blocks compiled while the DBATs map it;
+    // see StateLayout::l1_cache_base. Decided here, per compile, because
+    // the game's OS init sets that BAT long after this harness starts.
+    // The physical tier runs with translation off and keeps the bail.
+    if (want_l1 && !tier.physical && system.GetMemory().GetL1Cache())
+    {
+      jit_layout.l1_cache_base =
+          system.GetMMU().IsOptimizableRAMAddress(0xE0000000u, 32) ?
+              static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetL1Cache())) :
+              0;
+    }
     // Candidate PCs, bounded to MEM1 with room for a full block read.
     //
     // A successor is a GUESS about reachability, and a wrong one points at
@@ -1986,6 +2238,24 @@ int main(int argc, char** argv)
       entry->retired = true;
       entry->decided = true;
       ++jit_retired_blocks;
+      if (want_jit_stats && jit_retired_blocks <= 64)
+      {
+        // What refused, and the address it would have touched, for a
+        // D-form memory instruction: the usual cause is an address no
+        // region covers, and this says which.
+        const u32 ins = system.GetMemory().Read_U32(pc);
+        const u32 op = ins >> 26;
+        const u32 ra = (ins >> 16) & 0x1F;
+        s32 disp = 0;
+        if (op >= 56 && op <= 61)
+          disp = static_cast<s32>(ins << 20) >> 20;
+        else
+          disp = static_cast<s16>(ins & 0xFFFF);
+        const u32 ea = (ra ? state.gpr[ra] : 0) + static_cast<u32>(disp);
+        std::printf("  retire    pc %08x ins %08x ea %08x msr %08x hid2 %08x gqr%u %08x\n", pc,
+                    ins, ea, state.msr.Hex, state.spr[SPR_HID2], (ins >> 12) & 7,
+                    state.spr[SPR_GQR0 + ((ins >> 12) & 7)]);
+      }
       const u32 slot = (pc >> 2) & jit_layout.link_mask;
       if (link_table[slot * 2 + 0] == pc)
       {
@@ -2034,6 +2304,10 @@ int main(int argc, char** argv)
       // whole reason enabling MSR[EE] cannot be a plain store.
       ++jit_mtmsr_exits;
       ppc.MSRUpdated();
+      // Interpreter::mtmsr's next step: an FP exception already
+      // summarised in FPSCR[FEX] is taken when FE0 or FE1 enables it.
+      // Found by the chain differential, which seeds FPSCR with FEX set.
+      CheckFPExceptions(state);
       ppc.CheckExceptions();
       state.pc = state.npc;
     }
@@ -2115,6 +2389,20 @@ int main(int argc, char** argv)
   const bool slow_checks = want_trace || checkpoint != 0 || trace_from != 0 || want_events ||
                            frame_every != 0 || want_coverage || watch_addr != 0 || dump_at != 0;
   u64 next_mark = 0;
+  // The second stopwatch (--speed-from), and a frame counter: the XFB the
+  // Video Interface scans out alternates between two buffers, so a change
+  // of its address is a frame the game finished. Frames per emulated
+  // second says whether the game is running at its own frame rate, which
+  // no instruction count can.
+  u64 next_thumb = xfb_every;
+  bool window_open = false;
+  double window_t0 = 0.0;
+  u64 window_exec0 = 0;
+  s64 window_ticks0 = 0;
+  u64 window_frames0 = 0;
+  u64 frames = 0;
+  u32 last_xfb = 0;
+  g_gx_armed = (gx_from == 0);
 
   for (u64 i = 0; i < steps; ++i)
   {
@@ -2147,11 +2435,20 @@ int main(int argc, char** argv)
     g_cur_step = i;
     if (want_input && !g_input_sequence.empty())
     {
-      if ((i % PRESS_PERIOD) < PRESS_LENGTH)
+      const u64 t = static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start);
+      g_stick_x = g_stick_y = 0.0;
+      if ((t % g_press_period) < g_press_length)
       {
-        const auto& e = g_input_sequence[(i / PRESS_PERIOD) % g_input_sequence.size()];
+        const auto& e = g_input_sequence[(t / g_press_period) % g_input_sequence.size()];
         g_press_group = e.first;
         g_press_control = e.second;
+        if (std::string_view(e.first) == "Nunchuk Stick")
+        {
+          // Not a button: a deflection on one axis for the whole window.
+          const bool x = e.second[0] == 'X';
+          const double v = e.second[1] == '+' ? 0.95 : -0.95;
+          (x ? g_stick_x : g_stick_y) = v;
+        }
       }
       else
       {
@@ -2265,6 +2562,62 @@ int main(int argc, char** argv)
     min_pc = std::min(min_pc, state.pc);
     max_pc = std::max(max_pc, state.pc);
 
+    // A frame: the scanned-out XFB moved.
+    {
+      const u32 xfb = system.GetVideoInterface().GetXFBAddressTop();
+      if (xfb != last_xfb)
+      {
+        last_xfb = xfb;
+        ++frames;
+      }
+    }
+    if (xfb_every &&
+        static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) >= next_thumb)
+    {
+      next_thumb += xfb_every;
+      const u32 xfb = system.GetVideoInterface().GetXFBAddressTop();
+      if (xfb)
+      {
+        const auto yuv = ReadXfbYuv(system, xfb);
+        const auto rgb = YuvToRgb(yuv);
+        // Every fourth pixel of every fourth line.
+        std::vector<u8> ppm;
+        {
+          char hdr[64];
+          const int n = std::snprintf(hdr, sizeof(hdr), "P6\n%u %u\n255\n", XFB_W / 4, XFB_H / 4);
+          ppm.assign(hdr, hdr + n);
+        }
+        for (u32 y = 0; y < XFB_H; y += 4)
+          for (u32 x = 0; x < XFB_W; x += 4)
+          {
+            const size_t p = (static_cast<size_t>(y) * XFB_W + x) * 3;
+            ppm.push_back(rgb[p]);
+            ppm.push_back(rgb[p + 1]);
+            ppm.push_back(rgb[p + 2]);
+          }
+        std::printf("  xfb thumbnail at %.1f emulated s, emitting as base64\n",
+                    static_cast<double>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) /
+                        729e6);
+        EmitBase64(ppm);
+      }
+    }
+    if ((gx_from && !g_gx_armed) || (speed_from && !window_open))
+    {
+      const u64 t = static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start);
+      if (gx_from && !g_gx_armed && t >= gx_from)
+        g_gx_armed = true;
+      if (speed_from && !window_open && t >= speed_from)
+      {
+        window_open = true;
+#if defined(__EMSCRIPTEN__)
+        window_t0 = JitNow();
+#endif
+        window_exec0 = executed;
+        window_ticks0 = system.GetCoreTiming().GetTicks();
+        window_frames0 = frames;
+      }
+    }
+
     // Two atomic loads a step until the milestone is reached, none after.
     if (fifo_written_at < 0)
     {
@@ -2307,6 +2660,24 @@ int main(int argc, char** argv)
     std::printf("  speed     %.0f ms, %.1f MIPS, %.3f emulated s, %.1f%% of real time  (%s)\n", ms,
                 executed / (ms / 1000.0) / 1e6, emu_s, 100.0 * emu_s / (ms / 1000.0),
                 want_jit ? "jit" : "interpreter");
+    std::printf("  frames    %llu over the run, %.1f per emulated second\n",
+                static_cast<unsigned long long>(frames), emu_s > 0 ? frames / emu_s : 0.0);
+    if (InputConfig* cfg = Wiimote::GetConfig())
+      if (auto* controller = cfg->GetController(0))
+        std::printf("  wiimote   active extension %d (1 = Nunchuk)\n",
+                    static_cast<int>(static_cast<WiimoteEmu::Wiimote*>(controller)
+                                         ->GetActiveExtensionNumber()));
+    if (window_open)
+    {
+      const double wms = JitNow() - window_t0;
+      const double wticks =
+          static_cast<double>(system.GetCoreTiming().GetTicks() - window_ticks0);
+      const double wemu = wticks / 729e6;
+      std::printf("  window    from %.1f emulated s: %.0f ms, %.1f MIPS, %.3f emulated s, "
+                  "%.1f%% of real time, %.1f frames per emulated second\n",
+                  speed_from / 729e6, wms, (executed - window_exec0) / (wms / 1000.0) / 1e6, wemu,
+                  100.0 * wemu / (wms / 1000.0), wemu > 0 ? (frames - window_frames0) / wemu : 0.0);
+    }
   }
 #endif
   std::printf("  executed  %llu instructions\n", static_cast<unsigned long long>(executed));
@@ -2446,6 +2817,24 @@ int main(int argc, char** argv)
     std::printf("  jit       %llu interpreted singly, %llu block bails\n",
                 static_cast<unsigned long long>(jit_interp),
                 static_cast<unsigned long long>(jit_bails));
+    std::printf("  jit       %llu instructions through the hatch (%.2f%% of executed)\n",
+                static_cast<unsigned long long>(g_hatch_calls),
+                executed ? 100.0 * static_cast<double>(g_hatch_calls) /
+                               static_cast<double>(executed)
+                         : 0.0);
+    if (want_jit_stats && !g_hatch_hist.empty())
+    {
+      std::vector<std::pair<u64, u32>> top;
+      for (const auto& kv : g_hatch_hist)
+        top.push_back({kv.second, kv.first});
+      std::sort(top.begin(), top.end(), std::greater<>());
+      for (size_t k = 0; k < top.size() && k < 12; ++k)
+        std::printf("  jit       hatch %2zu: primary %2u xo %4u  %10llu  %5.1f%%\n", k + 1,
+                    top[k].second >> 16, (top[k].second & 0xFFFF) >> 1,
+                    static_cast<unsigned long long>(top[k].first),
+                    100.0 * static_cast<double>(top[k].first) /
+                        static_cast<double>(g_hatch_calls));
+    }
     std::printf("  jit       translation-off tier: %zu blocks cached, %llu dispatches\n",
                 jit_cache_phys.size(), static_cast<unsigned long long>(jit_phys_dispatches));
     std::printf("  jit       threshold %u: %llu cold runs interpreted, %llu instructions\n",
@@ -2485,7 +2874,7 @@ int main(int argc, char** argv)
 
   // Both --until-fifo and --capture-fifo stop early ON PURPOSE, so the step
   // count is not the success condition for them -- staying on valid code is.
-  const bool early_stop_ok = stop_at_fifo || g_fifo_limit || g_gx_limit;
+  const bool early_stop_ok = stop_at_fifo || g_fifo_limit || g_gx_limit || tick_cap != 0;
   // A compiled block runs to its own end, so the step limit is a floor
   // rather than an exact count -- the last block can carry execution a few
   // instructions past it. Requiring equality was right for an interpreter

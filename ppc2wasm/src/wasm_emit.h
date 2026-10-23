@@ -168,6 +168,33 @@ enum : uint8_t
   kF64Store = 0x39,
   kF64Const = 0x44,
   kF64Ge = 0x66,
+  kI64GtU = 0x56,
+  kF64Add = 0xA0,
+  kF64Sub = 0xA1,
+  kF64Mul = 0xA2,
+  kF64Div = 0xA3,
+  kF32DemoteF64 = 0xB6,
+  kF64PromoteF32 = 0xBB,
+  kI32ReinterpretF32 = 0xBC,
+  kI64ReinterpretF64 = 0xBD,
+  kF32ReinterpretI32 = 0xBE,
+  kF64ReinterpretI64 = 0xBF,
+  // For the quantized paired-single forms and the gather pipe.
+  kI32Load8S = 0x2C,
+  kI32Load16S = 0x2E,
+  kI32Load16U = 0x2F,
+  kI32Store16 = 0x3B,
+  kF32Const = 0x43,
+  kF32Mul = 0x94,
+  kF32Min = 0x96,
+  kF32Max = 0x97,
+  kF32ConvertI32S = 0xB2,
+  kI32TruncSatF32S = 0x00,  // after kPrefixFC: saturating, NaN -> 0
+  // For the float compares and the condition-register moves.
+  kF64Eq = 0x61,
+  kF64Lt = 0x63,
+  kF64Gt = 0x64,
+  kI64GtS = 0x55,
 };
 
 // Signed LEB128 for i64.const.

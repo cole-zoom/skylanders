@@ -492,11 +492,13 @@ contended** — that is the generalisable part, and it applies to every later br
 
 ### Phase 2 — `ppc2wasm`, the recompiler · ~4–6 months
 
-> **Status: the boot runs at 150% of real time** in Chrome — 2.0 emulated seconds in 1.3 s
-> of wall clock, about 600 MIPS of real instructions with idle loops skipped and 830 without.
-> Twenty emulated seconds past the boot, with input and a figure on the portal, run at
-> 250–300%. Every floating-point *arithmetic* instruction still runs through the interpreter,
-> in place, from inside compiled code; that is the next thing to move.
+> **Status: the boot runs at 145% of real time** in Chrome — 2.0 emulated seconds in 1.4 s
+> of wall clock — and the game plays: pressing A takes it from the title into the tutorial
+> level with the character on screen, 390 emulated seconds in 527 s of wall clock (74%), and
+> the gameplay window itself, a 3D scene at 60 frames per emulated second, at 59% of real
+> time. CPU-side, with the Null video backend. The remaining factor is the emitted code
+> itself: about a billion guest instructions per emulated second at ~2 ns each, with the
+> interpreter's share (the fused multiply-adds through the hatch) under a tenth of the time.
 >
 > **The constraint was never code density.** A sampling profile put the dispatcher loop at
 > 35% of the run and the compiled blocks at 25%, with a hot set of ten functions; the same
