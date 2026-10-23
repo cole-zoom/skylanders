@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -211,6 +212,15 @@ inline void PutI64(Bytes& out, int64_t v)
       b |= 0x80;
     out.push_back(b);
   }
+}
+
+// An f64.const immediate: the IEEE bits, little-endian, not LEB128.
+inline void PutF64(Bytes& out, double v)
+{
+  uint64_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  for (int i = 0; i < 8; ++i)
+    out.push_back(static_cast<uint8_t>(bits >> (8 * i)));
 }
 
 // Builds a module exporting one function, optionally importing linear memory

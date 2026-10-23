@@ -37,22 +37,23 @@ record; §3's ranking is revised.
 
 CPU-side, Null video backend, nothing drawn. Chrome 155, Apple M4.
 
-| | before (`--no-dolphin-video-config`) | now |
-|---|---|---|
-| boot, first 2.0 emulated seconds | 139–145% | 141% |
-| 390 emulated s, title to tutorial level, pressing A, single core | 74% | **97%** |
-| the gameplay window (300–390 s, character on screen, 3D scene), single core | 59% | **80%** |
-| the same 390 s with the GPU on its own thread (`--dual-core`) | 88% | **109%** |
-| the gameplay window, dual core | 70% | **89–90%** |
+| | at `bbcaa3d` | video config (#87) | + madd inline (§4.2) |
+|---|---|---|---|
+| boot, first 2.0 emulated seconds | 139–145% | 141% | 141–142% |
+| 390 emulated s, title to tutorial level, pressing A, single core | 74% | 97% | **105%** |
+| the gameplay window (300–390 s, character on screen, 3D scene), single core | 59% | 80% | **88%** |
+| the same 390 s with the GPU on its own thread (`--dual-core`) | 88% | 109% | **119%** |
+| the gameplay window, dual core | 70% | 89–90% | **99%** |
 
 The game runs its frame loop at 59.6 frames per emulated second
-throughout, so 90% is about 54 frames a wall second in the level. Single
+throughout, so 99% is about 59 frames a wall second in the level. Single
 and dual core render the same 23,249 frames and the same 28,874 draws in
 the GX capture at 390 s, so the game takes the same path either way.
 
-**The Phase 2 gate is not met.** `docs/PLAN.md` asks for 100% with the
-Null backend before graphics are added. The gap is now about 10
-percentage points in gameplay, dual core, and it is on the CPU thread
+**The Phase 2 gate is at the line, not past it.** `docs/PLAN.md` asks for
+100% with the Null backend before graphics are added. Dual core, the
+gameplay window measured 99.4% — inside the ±3% runs vary by, so neither
+met nor missed on one run. Single core is 88%. The CPU thread still binds
 (§3).
 
 What the recompiler does today: compiled blocks are 99.9% of executed
@@ -143,6 +144,11 @@ order:
    (§4.2), about 0.15 s; the compiled part is flat and needs the general
    shape of the emitted code to improve (§4.3). Getting to 1.0 s means
    taking about 0.13 s off this thread.
+
+   *After §4.2:* 1.01 s per emulated second — compiled blocks 0.87 s,
+   interpreter 0.03 s, VideoCommon's gather-pipe flush 0.05 s, dispatcher
+   0.04 s; 90% busy against the GPU thread's 0.64 s. The compiled part is
+   now nearly all of it, and §4.3 is the next work.
 2. **The GPU thread's remaining VideoCommon work**, 0.50 s per emulated
    second, with 43% of its time spent waiting. Not on the critical path
    until the CPU thread drops below it; `SetCPStatusFromGPU` (§4.1 item 4)
@@ -292,6 +298,26 @@ thread in `threads.txt`, 0.18 s per emulated second today. Expect the
 hatch under 0.5% and the category under 0.03 s. Measure on the CPU
 thread's busy time per emulated second, not on the dual-core wall number
 (§3).
+
+*Outcome.* Done as described, `EmitPsMadd` in `block.h`, off with
+`--jit-no-madd`; one refinement to the argument above — the product is
+exact only if it also stays clear of overflow and the subnormal range,
+so the guard bounds the exponents of `a` and `c` to 2^±200 as well. The
+hatch went 1.37% → 0.35% of executed instructions (met); the interpreter
+category 0.186 s → 0.034 s per emulated second (just over the 0.03 s
+expected; what remains is `fctiwz`, `stw` and `psq_st`, 14%, 11% and 8%
+of a hatch a quarter of its old size). CPU thread 1.12 s → 1.01 s per
+emulated second; the gameplay window 88.9% → 99.4% dual core, 80.3% →
+88.3% single core, which executed the same 280,060,345,494 instructions
+with and without it.
+
+The differential needed three repairs to test it, all now in: op 4's
+xo 12, 14 and 15 are A-forms (they were generated with frC = 0, so
+`ps_muls0` and `ps_madds0` had never seen another frC); the "singles" in
+the FP seed were not singles; and directed cases now put a product
+exactly on a float rounding tie, which random operands reach about once
+in 2^25. Swapping the tie correction's direction, or removing it, each
+fails the differential at once.
 
 ### 4.3 Code quality in the emitted blocks
 
@@ -467,6 +493,18 @@ Each of these cost at least an hour this phase.
   compile line from `ninja -t commands Source/Core/<Lib>/lib<lib>.a`, run
   it under `emsdk_env.sh`, and `emar r` the object into the archive; a
   real reconfigure wants `-DUSE_SYSTEM_BZIP2=OFF`.
+- **The differential's memory: two traps.** Node 22 keeps alive every
+  wasm instance that imports the function table, with a structure sized
+  to the table (6,000 instances, 10,000 entries: 1.38 GB after `gc()`);
+  reusing a table slot does not free them. The per-instruction
+  differential therefore compiles with linking off, which drops the
+  import; add templates there freely, but a section that installs
+  thousands of LINKED modules will hit the worker's limit, which reports
+  as "Worker terminated due to reaching memory limit" mid-run. And the
+  block differential restores and compares a megabyte above each
+  scratch window, not just the window: a store outside what is restored
+  survives from the compiled run into the interpreter's and reads back as
+  a false mismatch.
 - **Commits need all five numbered sections** or CI rejects the PR.
   `docs/COMMIT_CONVENTION.md`; the template is `.gitmessage`.
 
@@ -500,8 +538,8 @@ harness/wasm-core/run-jit.sh 800000000 --jit --disasm=8037ac20,12   # read a hot
 
 **The recompiler's own number in gameplay** is the CPU thread's busy
 seconds per emulated second, by category, from `threads.txt` and the
-window's emulated seconds on the `window` line (1.13 s today: compiled
-0.84, interpreter 0.18, the rest 0.11). Busy seconds per emulated second
+window's emulated seconds on the `window` line (1.01 s today: compiled
+0.87, interpreter 0.03, the rest 0.11). Busy seconds per emulated second
 is the thread's busy share divided by the window's speed under the
 profiler. Report recompiler changes against
 that; the dual-core wall number moves only when the slower thread or the
@@ -510,6 +548,7 @@ waiting does.
 A/B flags: `--jit-no-idle`, `--jit-no-mtmsr`, `--jit-no-hatch`,
 `--jit-no-phys`, `--jit-no-gp`, `--jit-no-psq`, `--jit-no-l1`,
 `--jit-threshold=1`, `--jit-no-link`, `--no-sync-idle`, `--dual-core`,
+`--jit-no-madd` (the paired multiply-adds through the hatch),
 `--no-dolphin-video-config` (video as it was set up before: member
 defaults, whole-texture hashing), `--tex-samples=N` (hash samples alone;
 0 = every byte).

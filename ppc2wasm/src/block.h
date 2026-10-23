@@ -317,6 +317,11 @@ struct StateLayout
   // Branches, mtmsr and the forms translated inline never take this path.
   bool interp_hatch = false;
   uint32_t pc_offset = 0;  // offsetof(PowerPCState, pc)
+  // With the hatch, the paired fused multiply-adds (ps_madds0/1, ps_madd,
+  // ps_msub, ps_nmadd, ps_nmsub) inline for float-exact operands, the
+  // hatch for the rest; see EmitPsMadd. Off, all of them go through the
+  // hatch as before.
+  bool paired_madd = false;
   // With the hatch, a load or store whose address is in the hardware
   // register space -- 0xCC00xxxx and 0xCD00xxxx, above all the GX
   // write-gather pipe at 0xCC008000 that every graphics command goes
@@ -2600,6 +2605,65 @@ inline void EmitFcmp(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc,
   b.push_back(kEnd);
 }
 
+// ForceSingle on the double in i64 local `src`, into the float bits in i32
+// local `dst`, for a result that is about to be written. Under NI a value
+// below the smallest normal single is flushed to a signed zero before
+// rounding (the quirk); otherwise it rounds to float, which may give a
+// denormal, kept as it is. An infinite (or NaN) float result is the
+// interpreter's: the hatch runs the whole instruction and the enclosing
+// block is left, so this must be emitted one `if` deep in that block.
+inline void EmitForceSingleOrHatch(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc,
+                                   uint32_t n, uint32_t src, uint32_t dst)
+{
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto i32c = [&](int32_t v) { op(kI32Const); PutI32(b, v); };
+  auto i64c = [&](int64_t v) { op(kI64Const); PutI64(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
+  lget(0); op(kI32Load); u(2); u(l.fpscr_offset); i32c(4); op(kI32And); i32c(0); op(kI32Ne);
+  lget(src); i64c(0x7FFFFFFFFFFFFFFFll); op(kI64And); i64c(0x3810000000000000ll); op(kI64LtU);
+  op(kI32And);
+  op(kIf); op(kVoid);
+  lget(src); i64c(static_cast<int64_t>(0x8000000000000000ull)); op(kI64And); lset(src);
+  op(kEnd);
+  lget(src); op(kF64ReinterpretI64); op(kF32DemoteF64); op(kI32ReinterpretF32); lset(dst);
+  lget(dst); i32c(0x7F800000); op(kI32And); i32c(0x7F800000); op(kI32Eq);
+  op(kIf); op(kVoid);
+  EmitHatchCall(b, l, ins, pc, n);
+  op(kBr); u(1);
+  op(kEnd);
+}
+
+// The writes of a single-precision result: ps0 (and ps1) from the float in
+// i32 local 2 (and 3 when `paired`; otherwise 2 fills both halves),
+// widened -- exact for a normal, zero or denormal single, and the
+// interpreter's Fill(float) is this same cast. Then FPRF's code for the
+// float in local 2 into local 6, using 5: normal 0x4/0x8, zero 0x2/0x12,
+// denormal 0x14/0x18 (positive/negative). `select` takes its first
+// operand when the condition holds, so the negative code goes first.
+inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired)
+{
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto i32c = [&](int32_t v) { op(kI32Const); PutI32(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
+  lget(0); lget(2); op(kF32ReinterpretI32); op(kF64PromoteF32); op(kI64ReinterpretF64);
+  op(kI64Store); u(3); u(pd);
+  lget(0); lget(paired ? 3 : 2); op(kF32ReinterpretI32); op(kF64PromoteF32);
+  op(kI64ReinterpretF64); op(kI64Store); u(3); u(pd + 8);
+  lget(2); i32c(31); op(kI32ShrU); lset(5);  // sign
+  // zero code | denormal code, by the mantissa
+  i32c(0x12); i32c(0x2); lget(5); op(kSelect);
+  i32c(0x18); i32c(0x14); lget(5); op(kSelect);
+  lget(2); i32c(0x007FFFFF); op(kI32And); op(kI32Eqz); op(kSelect);
+  // ... or the normal code, by the exponent
+  i32c(0x8); i32c(0x4); lget(5); op(kSelect);
+  lget(2); i32c(0x7F800000); op(kI32And); op(kI32Eqz); op(kSelect);
+  lset(6);
+}
+
 // ── floating-point arithmetic, the common case inline ──
 //
 // Interpreter_FloatingPoint.cpp is the specification. For add, subtract,
@@ -2702,22 +2766,7 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
 
     if (single)
     {
-      // ForceSingle. Under NI a value below the smallest normal single is
-      // flushed to a signed zero before rounding (the quirk); otherwise it
-      // rounds to float, which may give a denormal, kept as it is.
-      fpscr_load(); i32c(4); op(kI32And); i32c(0); op(kI32Ne);
-      lget(9); i64c(0x7FFFFFFFFFFFFFFFll); op(kI64And); i64c(0x3810000000000000ll); op(kI64LtU);
-      op(kI32And);
-      op(kIf); op(kVoid);
-      lget(9); i64c(static_cast<int64_t>(0x8000000000000000ull)); op(kI64And); lset(9);
-      op(kEnd);
-      lget(9); op(kF64ReinterpretI64); op(kF32DemoteF64); op(kI32ReinterpretF32); lset(2 + h);
-      // An infinite (or NaN) float result is the interpreter's.
-      lget(2 + h); i32c(0x7F800000); op(kI32And); i32c(0x7F800000); op(kI32Eq);
-      op(kIf); op(kVoid);
-      EmitHatchCall(b, l, ins, pc, n);
-      op(kBr); u(1);
-      op(kEnd);
+      EmitForceSingleOrHatch(b, l, ins, pc, n, 9, 2 + h);
     }
     else
     {
@@ -2740,24 +2789,7 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
   // ── the writes ──
   if (single)
   {
-    // ps0 (and ps1) from the float, widened: exact for a normal, zero or
-    // denormal single, and the interpreter's Fill(float) is this same cast.
-    lget(0); lget(2); op(kF32ReinterpretI32); op(kF64PromoteF32); op(kI64ReinterpretF64);
-    op(kI64Store); u(3); u(pd);
-    lget(0); lget(paired ? 3 : 2); op(kF32ReinterpretI32); op(kF64PromoteF32);
-    op(kI64ReinterpretF64); op(kI64Store); u(3); u(pd + 8);
-    // FPRF from the float in local 2: normal 0x4/0x8, zero 0x2/0x12,
-    // denormal 0x14/0x18 (positive/negative). `select` takes its first
-    // operand when the condition holds, so the negative code goes first.
-    lget(2); i32c(31); op(kI32ShrU); lset(5);  // sign
-    // zero code | denormal code, by the mantissa
-    i32c(0x12); i32c(0x2); lget(5); op(kSelect);
-    i32c(0x18); i32c(0x14); lget(5); op(kSelect);
-    lget(2); i32c(0x007FFFFF); op(kI32And); op(kI32Eqz); op(kSelect);
-    // ... or the normal code, by the exponent
-    i32c(0x8); i32c(0x4); lget(5); op(kSelect);
-    lget(2); i32c(0x7F800000); op(kI32And); op(kI32Eqz); op(kSelect);
-    lset(6);
+    EmitSingleWrites(b, pd, paired);
   }
   else
   {
@@ -2774,6 +2806,148 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
   lget(0);
   fpscr_load();
   i32c(static_cast<int32_t>(~((0x1Fu << 12) | ((kind == 2 && !paired) ? (0x3u << 17) : 0u))));
+  op(kI32And);
+  lget(6); i32c(12); op(kI32Shl); op(kI32Or);
+  op(kI32Store); u(2); u(l.fpscr_offset);
+  op(kEnd);
+}
+
+// ── the paired fused multiply-adds, the common case inline ──
+//
+// ps_madds0, ps_madds1, ps_madd, ps_msub, ps_nmadd, ps_nmsub. The
+// specification is Interpreter_Paired.cpp (each half through NI_madd or
+// NI_msub<single>, ForceSingle, negated unless NaN for the nm forms,
+// SetBoth, UpdateFPRFSingle(ps0)) and NI_madd_msub in
+// Interpreter_FPUtils.h, which computes fma(a, Force25Bit(c), +-b) and then
+// corrects a result that lands exactly on a float rounding tie, using an
+// error-free 2Sum whose one fma is fma(a, c_round, a').
+//
+// wasm has no fma; the interpreter's is musl's software one, and this
+// family was the whole of the interpreter's share of the CPU thread.
+// The common case needs no fma: when a has at most 24 significant bits
+// (its low 29 mantissa bits zero -- every value a paired-single
+// computation produces) and c_round has 25, the product has at most 49
+// and is EXACT in double, provided it stays clear of overflow and of the
+// subnormal range. Then f64.mul followed by f64.add rounds once, exactly
+// as the fma does, signed zeros included, and so does the 2Sum's
+// fma(a, c_round, a') as p + a'. The guard, per half and before anything
+// is written: a, b and c finite; a float-exact; a and c zero or with an
+// exponent within 2^+-200 (products within 2^+-400, comfortably normal).
+// Anything else goes to the interpreter through the hatch.
+//
+// sub: msub/nmsub. negate: nmadd/nmsub. c_half >= 0: ps_madds0/1, one
+// half of c for both.
+//
+// Locals: i64 9 a, 10 c_round, 11 +-b, 12 the product (then the error),
+// 13 the result, 14 a'; i32 2 and 3 the single results, 5 the slow-path
+// flag, 6 FPRF's code.
+inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc, uint32_t n,
+                       bool sub, bool negate, int c_half)
+{
+  const uint32_t fd = (ins >> 21) & 0x1F, fa = (ins >> 16) & 0x1F, fb = (ins >> 11) & 0x1F,
+                 fc = (ins >> 6) & 0x1F;
+  const uint32_t pd = l.ps_offset + fd * 16, pa = l.ps_offset + fa * 16,
+                 pb = l.ps_offset + fb * 16, pc_ = l.ps_offset + fc * 16;
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto i32c = [&](int32_t v) { op(kI32Const); PutI32(b, v); };
+  auto i64c = [&](int64_t v) { op(kI64Const); PutI64(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
+  auto load64 = [&](uint32_t off) { lget(0); op(kI64Load); u(3); u(off); };
+  auto fget = [&](uint32_t i) { lget(i); op(kF64ReinterpretI64); };
+  auto fset = [&](uint32_t i) { op(kI64ReinterpretF64); lset(i); };
+  // Fold "this operand is slow" (i32 on the stack) into the flag.
+  auto slow = [&]() { lget(5); op(kI32Or); lset(5); };
+  // x (i64 on the stack, consumed) is an infinity or a NaN.
+  auto is_special = [&]() {
+    i64c(0x7FF0000000000000ll); op(kI64And); i64c(0x7FF0000000000000ll); op(kI64Eq);
+  };
+  // The operand at `off` is nonzero with an exponent outside [-200, +200].
+  // Biased, that is outside [823, 1223]: (e - 823) >= 401 unsigned.
+  auto out_of_range = [&](uint32_t off) {
+    load64(off); i64c(0x7FFFFFFFFFFFFFFFll); op(kI64And); op(kI64Eqz); op(kI32Eqz);
+    load64(off); i64c(52); op(kI64ShrU); i64c(0x7FF); op(kI64And); i64c(823); op(kI64Sub);
+    i64c(400); op(kI64GtU);
+    op(kI32And);
+  };
+  auto c_off = [&](int h) { return pc_ + (c_half >= 0 ? c_half : h) * 8; };
+
+  op(kBlock);
+  op(kVoid);
+
+  // ── the tests, before anything is written ──
+  i32c(0);
+  lset(5);
+  for (int h = 0; h < 2; ++h)
+  {
+    load64(pa + h * 8); is_special(); slow();
+    load64(pb + h * 8); is_special(); slow();
+    load64(c_off(h)); is_special(); slow();
+    load64(pa + h * 8); i64c(0x1FFFFFFF); op(kI64And); op(kI64Eqz); op(kI32Eqz); slow();
+    out_of_range(pa + h * 8); slow();
+    out_of_range(c_off(h)); slow();
+  }
+  lget(5);
+  op(kIf); op(kVoid);
+  EmitHatchCall(b, l, ins, pc, n);
+  op(kBr); u(1);
+  op(kEnd);
+
+  // ── the arithmetic, one half at a time ──
+  for (int h = 0; h < 2; ++h)
+  {
+    load64(pa + h * 8); lset(9);
+    // Force25Bit: keep 25 mantissa bits, rounding up on the 26th. c is
+    // normal or zero here, which is the case EmitFpBinary handles too.
+    load64(c_off(h)); i64c(static_cast<int64_t>(0xFFFFFFFFF8000000ull)); op(kI64And);
+    load64(c_off(h)); i64c(0x0000000008000000ll); op(kI64And); op(kI64Add); lset(10);
+    load64(pb + h * 8);
+    if (sub)
+    {
+      i64c(static_cast<int64_t>(0x8000000000000000ull)); op(kI64Xor);
+    }
+    lset(11);
+    // p = a * c_round, exact; r = p + (+-b), rounded once.
+    fget(9); fget(10); op(kF64Mul); fset(12);
+    fget(12); fget(11); op(kF64Add); fset(13);
+
+    // An even tie for the float rounding: the low 29 bits are 1 followed
+    // by zeros. Then a' = b - r; error = (p + a') + (b - (r + a')), and a
+    // nonzero error moves r one ulp away from the tie, up when it agrees
+    // in sign with r.
+    lget(13); i64c(0x1FFFFFFF); op(kI64And); i64c(0x10000000); op(kI64Eq);
+    op(kIf); op(kVoid);
+    fget(11); fget(13); op(kF64Sub); fset(14);
+    fget(12); fget(14); op(kF64Add);
+    fget(11); fget(13); fget(14); op(kF64Add); op(kF64Sub);
+    op(kF64Add); fset(12);
+    fget(12); op(kF64Const); PutF64(b, 0.0); op(kF64Eq); op(kI32Eqz);
+    op(kIf); op(kVoid);
+    lget(13); i64c(1); op(kI64Add);
+    lget(13); i64c(1); op(kI64Sub);
+    fget(12); op(kF64Const); PutF64(b, 0.0); op(kF64Gt);
+    fget(13); op(kF64Const); PutF64(b, 0.0); op(kF64Gt);
+    op(kI32Eq);
+    op(kSelect);
+    lset(13);
+    op(kEnd);
+    op(kEnd);
+
+    EmitForceSingleOrHatch(b, l, ins, pc, n, 13, 2 + h);
+    if (negate)
+    {
+      // Never a NaN here: an infinite or NaN float went to the hatch.
+      lget(2 + h); i32c(static_cast<int32_t>(0x80000000u)); op(kI32Xor); lset(2 + h);
+    }
+  }
+
+  // ── the writes ──
+  EmitSingleWrites(b, pd, true);
+  // fpscr = (fpscr & ~FPRF) | code << 12; FI and FR are not touched.
+  lget(0);
+  lget(0); op(kI32Load); u(2); u(l.fpscr_offset);
+  i32c(static_cast<int32_t>(~(0x1Fu << 12)));
   op(kI32And);
   lget(6); i32c(12); op(kI32Shl); op(kI32Or);
   op(kI32Store); u(2); u(l.fpscr_offset);
@@ -3199,7 +3373,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     if (!fp_checked)
       EmitFpAvailable(body, layout, pc, before);
     fp_checked = true;
-    used_i64 = 2;
+    used_i64 = used_i64 < 2 ? 2 : used_i64;
   };
   auto need_pse = [&](uint32_t pc, uint32_t before) {
     need_fp(pc, before);
@@ -3573,6 +3747,22 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         else if (paired && xo5 == 12) { kind = 2; c_half = 0; }
         else if (paired && xo5 == 13) { kind = 2; c_half = 1; }
         const bool frsp = !paired && xo == 12;
+        // ps_madds0 14, ps_madds1 15, ps_msub 28, ps_madd 29, ps_nmsub 30,
+        // ps_nmadd 31.
+        const bool madd = paired && layout.paired_madd &&
+                          (xo5 == 14 || xo5 == 15 || (xo5 >= 28 && xo5 <= 31));
+        if (madd)
+        {
+          need_pse(this_pc, n);
+          used_i64 = used_i64 < 6 ? 6 : used_i64;
+          EmitPsMadd(body, layout, ins, this_pc, n, xo5 == 28 || xo5 == 30,
+                     xo5 == 30 || xo5 == 31, xo5 == 14 ? 0 : xo5 == 15 ? 1 : -1);
+          if (Rc(ins))
+            EmitUpdateCR1(body, layout);
+          touches_memory = true;
+          handled = true;
+          break;
+        }
         if (kind < 0 && !frsp)
           break;
         if (paired)
@@ -3728,14 +3918,14 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       if (xo == 19 && layout.cr_offset)
       {
         EmitMfcr(body, layout, RS(ins));
-        used_i64 = 2;
+        used_i64 = used_i64 < 2 ? 2 : used_i64;
         handled = true;
         break;
       }
       if (xo == 144 && layout.cr_offset && layout.cr_table_base && !(ins & (1u << 20)))
       {
         EmitMtcrf(body, layout, RS(ins), (ins >> 12) & 0xFF);
-        used_i64 = 2;
+        used_i64 = used_i64 < 2 ? 2 : used_i64;
         handled = true;
         break;
       }
@@ -3754,7 +3944,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         const uint32_t tbr = ((ins >> 16) & 0x1F) | (((ins >> 11) & 0x1F) << 5);
         if (tbr != 268 && tbr != 269)
           break;
-        used_i64 = 2;
+        used_i64 = used_i64 < 2 ? 2 : used_i64;
         // ticks = global_timer + (slice_length - downcount)
         body.push_back(kI32Const);
         PutI32(body, static_cast<int32_t>(layout.tb_global_timer_addr));
@@ -5475,7 +5665,8 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     PutI32(body, static_cast<int32_t>(r.end_pc));
   }
 
-  // The i64 locals are 9 and 10 by construction, so a block that uses them
+  // The i64 locals start at 9 by construction -- 9 and 10 for most forms,
+  // up to 14 for the paired multiply-adds -- so a block that uses them
   // declares all eight i32 locals whether or not it needs them.
   if (used_i64)
     used_locals = 8;
