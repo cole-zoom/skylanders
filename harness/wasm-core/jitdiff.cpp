@@ -47,6 +47,20 @@ static void check(bool ok, const char* what)
     ++g_failures;
 }
 
+// A condition-register field as its four PowerPC bits, LT GT EQ SO.
+//
+// Fields are compared through this, not as 64-bit words. Dolphin's
+// encoding has many words for the same four bits -- the interpreter's
+// compare takes s_crTable's, its CR0 update a sign-extended value, its
+// JIT a raw difference -- and every reader (GetBit, GetField, the emitted
+// branch tests, mfcr) decodes. Two engines agree exactly when the bits do.
+static u32 CrBits(u64 field)
+{
+  PowerPC::ConditionRegister cr{};
+  cr.fields[0] = field;
+  return cr.GetField(0);
+}
+
 // The interpreter hatch compiled blocks import; the same function the
 // dispatcher exports (bootgame.cpp), so what the differential runs is what
 // the emulator runs. See StateLayout::interp_hatch.
@@ -301,6 +315,9 @@ int main()
   // The paired multiply-adds inline (EmitPsMadd), as the dispatcher has
   // them unless --jit-no-madd.
   layout.paired_madd = true;
+  // Compares as the dispatcher has them unless --jit-no-crdiff: the
+  // operands' difference, not s_crTable (EmitCompareToCR).
+  layout.cr_diff = true;
   // The GQRs above, specialised on as the dispatcher does; the guard the
   // emitted code carries is exercised by the mtspr-to-GQR case below.
   layout.gqr_values = &state.spr[SPR_GQR0];
@@ -501,6 +518,14 @@ int main()
       // Indexed addressing.
       {"stwx then lwzx",
        {0x3C60'8000, 0x6063'7200, 0x3880'0010, 0x38A0'1234, 0x7CA3'212E, 0x7CC3'202E}},
+      // lwbrx is not translated: it runs in the interpreter through the
+      // hatch and writes r6 there. The addi after it must see what the
+      // interpreter wrote, not what r6 held when the block was entered --
+      // the case any caching of guest registers in the block has to get
+      // right, and which nothing here exercised before.
+      {"a hatched lwbrx writes a register the next instruction reads",
+       {0x3C60'8000, 0x6063'7200, 0x3880'0010, 0x38A0'1234, 0x7CA3'212E, 0x7CC3'242C,
+        0x38E6'0001}},
       // Update forms write the address back.
       {"lwzu updates the base",
        {0x3C60'8000, 0x6063'7300, 0x3880'4321, 0x9083'0004, 0x84A3'0004}},
@@ -651,7 +676,7 @@ int main()
     int bad_cr = -1;
     for (int i = 0; i < 8; ++i)
     {
-      if (state.cr.fields[i] != expect_cr[i])
+      if (CrBits(state.cr.fields[i]) != CrBits(expect_cr[i]))
       {
         same = false;
         if (bad_cr < 0)
@@ -1270,7 +1295,7 @@ int main()
         // the wrong CR0 would have passed.
         for (int i = 0; i < 8 && !bad; ++i)
         {
-          if (state.cr.fields[i] != want_cr[i])
+          if (CrBits(state.cr.fields[i]) != CrBits(want_cr[i]))
           {
             std::printf("  %-8s ins=%08x cr%d interpreter=%016llx recompiled=%016llx\n", t.name,
                         ins, i, static_cast<unsigned long long>(want_cr[i]),
@@ -1372,6 +1397,9 @@ int main()
         {31, 24}, {31, 536}, {31, 954}, {31, 922}, {31, 104},
         {31, 26}, {31, 60}, {31, 124}, {31, 235},
         {31, 23}, {31, 151}, {31, 87}, {31, 215}, {31, 83}, {31, 146},
+        // lwbrx and lhbrx run in the interpreter through the hatch and
+        // write rD there; a later read in the same block must see it.
+        {31, 534}, {31, 790},
         // Update forms, which write rA as well as the loaded register, and
         // mfspr, which writes a register from somewhere that is not
         // another register. Both are everywhere in the boot and neither
@@ -1687,7 +1715,7 @@ int main()
             bad = i;
         }
       for (int i = 0; i < 8; ++i)
-        if (state.cr.fields[i] != jit_cr[i])
+        if (CrBits(state.cr.fields[i]) != CrBits(jit_cr[i]))
           ok = false;
       if (state.spr[SPR_LR] != jit_lr)
         ok = false;
@@ -1725,7 +1753,7 @@ int main()
                       static_cast<unsigned long long>(jit_ps[bad_ps].PS0AsU64()),
                       static_cast<unsigned long long>(jit_ps[bad_ps].PS1AsU64()));
         for (int i = 0; i < 8; ++i)
-          if (state.cr.fields[i] != jit_cr[i])
+          if (CrBits(state.cr.fields[i]) != CrBits(jit_cr[i]))
             std::printf("      cr%d interpreter=%016llx recompiled=%016llx\n", i,
                         static_cast<unsigned long long>(state.cr.fields[i]),
                         static_cast<unsigned long long>(jit_cr[i]));
@@ -2284,7 +2312,7 @@ int main()
         }
       int bad_cr = -1;
       for (int i = 0; i < 8; ++i)
-        if (state.cr.fields[i] != jit_cr[i])
+        if (CrBits(state.cr.fields[i]) != CrBits(jit_cr[i]))
         {
           ok = false;
           if (bad_cr < 0)

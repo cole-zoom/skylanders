@@ -37,24 +37,27 @@ record; §3's ranking is revised.
 
 CPU-side, Null video backend, nothing drawn. Chrome 155, Apple M4.
 
-| | at `bbcaa3d` | video config (#87) | + madd inline (§4.2) |
-|---|---|---|---|
-| boot, first 2.0 emulated seconds | 139–145% | 141% | 141–142% |
-| 390 emulated s, title to tutorial level, pressing A, single core | 74% | 97% | **105%** |
-| the gameplay window (300–390 s, character on screen, 3D scene), single core | 59% | 80% | **88%** |
-| the same 390 s with the GPU on its own thread (`--dual-core`) | 88% | 109% | **119%** |
-| the gameplay window, dual core | 70% | 89–90% | **99%** |
+| | at `bbcaa3d` | video config (#87) | + madd inline (§4.2) | + compare encoding (§4.3 item 1) |
+|---|---|---|---|---|
+| boot, first 2.0 emulated seconds | 139–145% | 141% | 141–142% | 140–143% |
+| 390 emulated s, title to tutorial level, pressing A, single core | 74% | 97% | **105%** | — |
+| the gameplay window (300–390 s, character on screen, 3D scene), single core | 59% | 80% | **88%** | — |
+| the same 390 s with the GPU on its own thread (`--dual-core`) | 88% | 109% | 119% | **124%** |
+| the gameplay window, dual core | 70% | 89–90% | 99% | **103–104%** |
 
 The game runs its frame loop at 59.6 frames per emulated second
 throughout, so 99% is about 59 frames a wall second in the level. Single
 and dual core render the same 23,249 frames and the same 28,874 draws in
 the GX capture at 390 s, so the game takes the same path either way.
 
-**The Phase 2 gate is at the line, not past it.** `docs/PLAN.md` asks for
-100% with the Null backend before graphics are added. Dual core, the
-gameplay window measured 99.4% — inside the ±3% runs vary by, so neither
-met nor missed on one run. Single core is 88%. The CPU thread still binds
-(§3).
+**The Phase 2 gate is met, dual core.** `docs/PLAN.md` asks for 100% with
+the Null backend before graphics are added. Three runs of the gameplay
+window on the same tree, one at a time: 103.3%, 103.7%, 104.1% — all over
+100% and 0.8 points apart, against ±3% run to run; 124% over the whole
+390 s; the same 23,249 frames and 28,874 draws. Single core is 88% and
+does not meet it; Dolphin's own default is dual core, and so is the
+plan's runtime. The margin is thin and a WebGPU backend will change the
+GPU thread's cost (§4.4), so the CPU thread (§4.3) is not finished work.
 
 What the recompiler does today: compiled blocks are 99.9% of executed
 instructions; the hatch (an untranslated instruction calling the
@@ -365,6 +368,41 @@ today) and the CPU thread's compiled-blocks seconds per emulated second
 in the dual-core gameplay window (0.81 s today). Under 5% on both is not
 a result (runs vary ±3%); keep the flag that turns it off
 (`--jit-no-…`), as every other change has.
+
+*Outcome of items 1 and 2.* Neither met the gate, and the second made
+things worse.
+
+Item 1 is in, as `StateLayout::cr_diff` (off with `--jit-no-crdiff`): the
+compare stores the 64-bit difference with bit 59 replaced by XER[SO] and
+bit 63 set when equal. **Dolphin's JIT does not do those two
+corrections** — a negative difference has bit 59 set by sign extension,
+so its compares read SO as set after every "less than"; the paragraph
+above is wrong to say SO comes along from XER. The differentials now
+compare decoded CR bits (`CrBits`), not raw words. Measured: boot about
++2%, gameplay window 100.9% → 102.6% — the same direction every time, and
+inside the noise. Kept because it is correct, simpler than the table
+load, and never measured slower.
+
+Item 2 was built and removed. Write-through caching (reads from locals
+loaded at block entry, every write to the local and the struct, a reload
+after each hatch call that continues the block, two compile passes to
+learn the read set) passed the differentials, and both mutations — no
+reload, no write-through — failed them. It measured +1.5% in the gameplay
+window and **−20% in the boot**, where a block entry runs 4.8 instructions
+on average and the entry loads cover the whole superblock; compile time
+went from 4.7 to 8.0 µs a block. Loading per segment, at each point a
+superblock can exit, might rescue the boot, but +1.5% in gameplay says
+register loads are not where the compiled code's time goes.
+
+Nor, then, is the hand-written loop's 2.8× (§1 of the findings) a guide:
+it was a three-instruction loop where the call per iteration dominated.
+Real blocks cost 2.67 ns a guest instruction in gameplay against 0.59 in
+that loop, and V8's profiles do not resolve inside a wasm function (one
+`line 1` per block), so where the difference goes is unmeasured. Item 3
+(a real `loop` for a self-targeting back edge) is untried. Finding the
+cost first — by A/B probes that duplicate an idempotent piece of emitted
+code, or a per-category instruction count weighted by block hits — is the
+next step before any more emitter work.
 
 ### 4.4 The CPU–GPU hand-off
 

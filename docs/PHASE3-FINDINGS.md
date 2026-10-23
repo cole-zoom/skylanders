@@ -189,6 +189,8 @@ seconds (title to tutorial level, pressing A) and its last 90 seconds:
 | the same, single core | **97.2%** | **80.3%** | against 73.5% / 58.5% with `--no-dolphin-video-config` in the same session; **280,060,345,494 executed instructions both ways**, same hatch count, frames and draws: identical guest work |
 | the paired fused multiply-adds inline (`EmitPsMadd`): f64 multiply then add, exact for a float-exact `a` and exponents within 2^±200, with NI_madd_msub's tie correction; dual core | **119.2%** | **99.4%** | against 107.2% / 88.9% with `--jit-no-madd` in the same session; hatch 1.37% → 0.35%; CPU thread 1.12 → 1.01 s per emulated second, interpreter 0.186 → 0.034 s; same frames and draws |
 | the same, single core | **105.3%** | **88.3%** | 280,060,345,494 executed instructions again |
+| compares store the operands' difference, corrected for SO and equality (`cr_diff`), not `s_crTable`; dual core, three runs | **124.0%** | **103.3–104.1%** | against 100.9% with `--jit-no-crdiff` in the A/B session (+1.7%, inside the noise; boot +2%); same frames and draws. **The Phase 2 gate, met** |
+| guest registers cached in locals, write-through, loaded at block entry (built, measured, removed) | — | +1.5% | boot **−20%**: a block entry runs 4.8 instructions there, the entry loads cover the superblock; compile 4.7 → 8.0 µs a block |
 
 The video config, in more detail. The harness never called
 `g_Config.Refresh()`, so every `VideoConfig` field was its C++ member

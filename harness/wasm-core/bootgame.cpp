@@ -722,6 +722,7 @@ int main(int argc, char** argv)
   bool want_gp = true;
   bool want_psq = true;
   bool want_madd = true;
+  bool want_crdiff = true;
   bool want_l1 = true;
   bool want_dual_core = false;
   int tex_samples = -1;  // --tex-samples=N: the texture cache's hash samples, -1 = untouched
@@ -870,6 +871,10 @@ int main(int argc, char** argv)
     // as they did before EmitPsMadd.
     else if (std::strcmp(argv[i], "--jit-no-madd") == 0)
       want_madd = false;
+    // --jit-no-crdiff: compares index s_crTable, as they did before they
+    // stored the operands' difference.
+    else if (std::strcmp(argv[i], "--jit-no-crdiff") == 0)
+      want_crdiff = false;
     // --jit-no-l1: accesses to the locked L1 cache bail to the interpreter
     // (and retire the block when first), as they used to.
     else if (std::strcmp(argv[i], "--jit-no-l1") == 0)
@@ -1735,6 +1740,7 @@ int main(int argc, char** argv)
   if (want_psq && want_hatch)
     jit_layout.gqr_values = &state.spr[SPR_GQR0];
   jit_layout.paired_madd = want_madd && want_hatch;
+  jit_layout.cr_diff = want_crdiff;
   // The write-gather pipe, when the DBATs map it where every Wii game
   // has it; see StateLayout::gather_pipe_ea. The physical tier runs the
   // exception handlers, which issue no GX commands, and keeps the hatch.
