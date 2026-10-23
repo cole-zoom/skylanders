@@ -492,6 +492,12 @@ contended** — that is the generalisable part, and it applies to every later br
 
 ### Phase 2 — `ppc2wasm`, the recompiler · ~4–6 months
 
+> **Gate met (dual core), 2026-10-23:** the gameplay window at 103–104% of real time in
+> three runs, 124% over 390 emulated seconds, Null backend — after the harness's video
+> config, the paired multiply-adds inline and an exact compare encoding
+> ([PHASE3-HANDOFF.md](PHASE3-HANDOFF.md) §1). Single core is 88%. The text below is the
+> status before those.
+>
 > **Status: the boot runs at 145% of real time** in Chrome — 2.0 emulated seconds in 1.4 s
 > of wall clock — and the game plays: pressing A takes it from the title into the tutorial
 > level with the character on screen, 390 emulated seconds in 444 s of wall clock (88%), and

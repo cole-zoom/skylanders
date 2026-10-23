@@ -202,6 +202,9 @@ struct StateLayout
   bool low_dcbz_hack = false;
 
   uint32_t cr_offset = 0;        // offsetof(PowerPCState, cr)
+  // Compares store the operands' 64-bit difference, corrected for SO and
+  // equality, instead of indexing s_crTable; see EmitCompareToCR.
+  bool cr_diff = false;
   uint32_t xer_so_ov_offset = 0; // offsetof(PowerPCState, xer_so_ov)
   uint32_t cr_table_base = 0;    // host address of ConditionRegister::s_crTable
   uint32_t spr_offset = 0;       // offsetof(PowerPCState, spr)
@@ -847,6 +850,61 @@ inline void EmitCompareToCR(Bytes& b, const StateLayout& l, uint32_t crf, bool i
   // Address for the i64 store comes first: the value is built on top of it.
   b.push_back(kLocalGet);
   PutU32(b, 0);
+
+  if (l.cr_diff)
+  {
+    // The encoding Dolphin's JIT uses (Jit64::cmpXX), made exact. The
+    // difference of the two operands widened to 64 bits -- sign-extended
+    // for cmp/cmpi, zero-extended for cmpl/cmpli -- lies strictly between
+    // -2^32 and 2^32, so it already reads as LT (bit 62), GT ((s64)v > 0)
+    // and EQ (low word zero). Dolphin's JIT stops there and gets SO wrong:
+    // a negative difference has bit 59 set by the sign extension. Here bit
+    // 59 is replaced by XER[SO], and an equal pair also gets bit 63 so
+    // that SO set on a zero difference does not read as GT -- the same two
+    // corrections Interpreter::Helper_UpdateCR0 makes to a value. A
+    // different word from s_crTable's for the same four bits; every
+    // reader decodes, and the differentials compare the bits.
+    const uint8_t extend = is_signed ? kI64ExtendI32S : kI64ExtendI32U;
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(extend);
+    b.push_back(kLocalGet);
+    PutU32(b, 2);
+    b.push_back(extend);
+    b.push_back(kI64Sub);
+    b.push_back(kI64Const);
+    PutI64(b, ~(int64_t{1} << 59));
+    b.push_back(kI64And);
+    // | XER[SO] << 59; the byte holds (SO << 1) | OV
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load8U);
+    PutU32(b, 0);
+    PutU32(b, l.xer_so_ov_offset);
+    b.push_back(kI32Const);
+    PutI32(b, 2);
+    b.push_back(kI32And);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 58);
+    b.push_back(kI64Shl);
+    b.push_back(kI64Or);
+    // | (a == b) << 63
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kLocalGet);
+    PutU32(b, 2);
+    b.push_back(kI32Eq);
+    b.push_back(kI64ExtendI32U);
+    b.push_back(kI64Const);
+    PutI64(b, 63);
+    b.push_back(kI64Shl);
+    b.push_back(kI64Or);
+    b.push_back(kI64Store);
+    PutU32(b, 3);
+    PutU32(b, l.cr_offset + crf * 8);
+    return;
+  }
 
   // (a < b) << 3
   b.push_back(kLocalGet);
