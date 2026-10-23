@@ -538,6 +538,10 @@ emission and the runtime promotion tier.
 
 ### Phase 3 — WebGPU backend · ~3 months
 
+> **Plan: [PHASE3-WEBGPU.md](PHASE3-WEBGPU.md)** — the backend's shape, the shader and
+> readback questions, and the order of work. Spike S1 (a WebGPU device on Dolphin's GPU
+> thread, through JSPI) is done: `spikes/webgpu-thread/FINDINGS.md`.
+
 A new backend beside Metal and Vulkan: command encoding, pipeline state, TEV shader generation
 targeting WGSL, texture decode in compute shaders, and the EFB-to-RAM paths. Expect the accuracy
 work to concentrate in blending, where WebGPU gives us less than any native API.
