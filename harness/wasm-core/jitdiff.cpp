@@ -14,6 +14,7 @@
 // nothing to execute it with natively. The encoder half is tested separately
 // in jittest.cpp, which does run in CI.
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -91,7 +92,12 @@ EM_JS(void, JitImportsInit, (), {
 // to die partway through with "Worker terminated due to reaching memory
 // limit", which reads as a harness crash rather than an out-of-memory and
 // lands in the middle of a passing run. Reusing a slot lets the previous
-// instance be collected, so the suite runs on a default node heap.
+// instance be collected -- but only if it did not import the TABLE. Node
+// 22's V8 keeps every instance that imports a table alive from that table,
+// with a structure sized to it: measured, 6,000 instances importing a
+// 10,000-entry table hold 1.38 GB after gc(), against 11 MB with a
+// 4-entry one. A block imports wasmTable when linking is on, so the
+// per-instruction differential compiles without it (see there).
 EM_JS(int, InstallModuleAt, (const uint8_t* ptr, int len, int slot), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
@@ -292,6 +298,9 @@ int main()
   layout.reserve_address_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, reserve_address));
   layout.interp_hatch = true;
   layout.pc_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, pc));
+  // The paired multiply-adds inline (EmitPsMadd), as the dispatcher has
+  // them unless --jit-no-madd.
+  layout.paired_madd = true;
   // The GQRs above, specialised on as the dispatcher does; the guard the
   // emitted code carries is exercised by the mtspr-to-GQR case below.
   layout.gqr_values = &state.spr[SPR_GQR0];
@@ -352,8 +361,19 @@ int main()
         v = kSpecials[rnd() % (sizeof(kSpecials) / sizeof(kSpecials[0]))];
       else if (pick == 1)
         v = (static_cast<u64>(rnd()) << 32) | rnd();
-      else
+      else if (pick == 2)
         v = std::bit_cast<u64>(static_cast<double>(static_cast<s32>(rnd())) / 1024.0);
+      else
+      {
+        // A single widened as lfs widens it -- what a paired-single
+        // computation holds, and the operand EmitPsMadd's fast path needs.
+        // Half the time any float pattern, half the time a modest exponent
+        // so that arithmetic between two of them stays finite.
+        u32 f = rnd();
+        if (rnd() & 1)
+          f = (f & 0x807FFFFFu) | ((107u + rnd() % 41) << 23);
+        v = std::bit_cast<u64>(static_cast<double>(std::bit_cast<float>(f)));
+      }
       state.ps[i].SetPS0(v);
       state.ps[i].SetPS1((rnd() & 1) ? v : ((static_cast<u64>(rnd()) << 32) | rnd()));
     }
@@ -969,7 +989,7 @@ int main()
         {4, 21, "ps_add"},  {4, 20, "ps_sub"}, {4, 25, "ps_mul"}, {4, 18, "ps_div"},
         {4, 29, "ps_madd"}, {4, 28, "ps_msub"}, {4, 10, "ps_sum0"}, {4, 11, "ps_sum1"},
         {4, 12, "ps_muls0"}, {4, 13, "ps_muls1"}, {4, 14, "ps_madds0"}, {4, 0, "ps_cmpu0"},
-        {4, 24, "ps_res"},
+        {4, 24, "ps_res"},  {4, 15, "ps_madds1"}, {4, 30, "ps_nmsub"}, {4, 31, "ps_nmadd"},
         {56, 0, "psq_l"},   {60, 0, "psq_st"}, {57, 0, "psq_lu"}, {61, 0, "psq_stu"},
         {4, 6, "psq_lx"},   {4, 7, "psq_stx"}, {4, 38, "psq_lux"}, {4, 39, "psq_stux"},
         {31, 19, "mfcr"},   {31, 144, "mtcrf"}, {19, 193, "crxor"}, {19, 449, "cror"},
@@ -983,6 +1003,16 @@ int main()
       seed ^= seed << 5;
       return seed;
     };
+
+    // Linking off: what is compared here is one instruction's effect on
+    // the state, which linking does not change -- it decides how a block
+    // EXITS, and the block and chain differentials below test that with it
+    // on. A linked block imports the function table, and Node keeps every
+    // instance that does (see InstallModuleAt); some 24,000 single-
+    // instruction modules held about 2.5 GB, and three more templates took
+    // the worker past its limit at the start of the block differential.
+    ppc2wasm::StateLayout single_layout = layout;
+    single_layout.enable_linking = false;
 
     int rand_fail = 0;
     for (const T& t : templates)
@@ -1039,7 +1069,10 @@ int main()
           // compares put a CR field where rD would be; everything else is
           // an X-form with the full ten-bit XO.
           const u32 c = rnd() % 32;
-          const bool a_form = t.xo < 32 && t.xo != 0 && t.xo != 12 && t.xo != 14 && t.xo != 15;
+          // 12, 14 and 15 are X-forms on op 63 (frsp, fctiw, fctiwz) and
+          // A-forms on op 4 (ps_muls0, ps_madds0, ps_madds1), with an frC.
+          const bool a_form = t.xo < 32 && t.xo != 0 &&
+                              (t.primary == 4 || (t.xo != 12 && t.xo != 14 && t.xo != 15));
           if (a_form)
             ins = (t.primary << 26) | (d << 21) | (a << 16) | (b << 11) | (c << 6) | (t.xo << 1);
           else if (t.xo == 0 || t.xo == 32)  // fcmpu, fcmpo, ps_cmpu0
@@ -1130,6 +1163,46 @@ int main()
         u32 before[32];
         std::memcpy(before, state.gpr, sizeof(before));
         seed_ps(rnd);
+        // The paired multiply-adds, one trial in four: operands whose
+        // product lands EXACTLY on a float rounding tie, which is the only
+        // case where NI_madd_msub corrects the fma's rounding, and which
+        // random operands reach about once in 2^25. a is +-2^k; c is a
+        // single plus exactly half its ulp (bit 28, which Force25Bit
+        // keeps), so a * c has the tie pattern; b is a signed zero (the
+        // tie stands, error zero), a tiny value of either sign far below
+        // the product's last bit (the tie stands, the error rounds it up
+        // or down), or a single (the tie usually breaks).
+        if (t.primary == 4 && (t.xo == 14 || t.xo == 15 || (t.xo >= 28 && t.xo <= 31)) &&
+            trial % 4 == 0)
+        {
+          const u32 fa = (ins >> 16) & 0x1F, fb = (ins >> 11) & 0x1F, fc = (ins >> 6) & 0x1F;
+          u64 av[2], cv[2], bv[2];
+          for (int h = 0; h < 2; ++h)
+          {
+            const int k = static_cast<int>(rnd() % 41) - 20;
+            av[h] = (static_cast<u64>(1023 + k) << 52) | ((rnd() & 1) ? 0x8000000000000000ull : 0);
+            const u32 f = (rnd() & 0x807FFFFFu) | ((107u + rnd() % 41) << 23);
+            cv[h] = std::bit_cast<u64>(static_cast<double>(std::bit_cast<float>(f))) | 0x10000000ull;
+            const double p = std::bit_cast<double>(av[h]) * std::bit_cast<double>(cv[h]);
+            const u32 kind = rnd() % 4;
+            const double sign = (rnd() & 1) ? -1.0 : 1.0;
+            if (kind == 0)
+              bv[h] = std::bit_cast<u64>(sign * 0.0);
+            else if (kind == 3)
+              bv[h] = std::bit_cast<u64>(static_cast<double>(std::bit_cast<float>(
+                  (rnd() & 0x807FFFFFu) | ((107u + rnd() % 41) << 23))));
+            else
+              bv[h] = std::bit_cast<u64>(sign * std::ldexp(1.0 + (rnd() & 0xFFFF) / 65536.0,
+                                                           std::ilogb(p) - 60 -
+                                                               static_cast<int>(rnd() % 20)));
+          }
+          state.ps[fc].SetPS0(cv[0]);
+          state.ps[fc].SetPS1(cv[1]);
+          state.ps[fb].SetPS0(bv[0]);
+          state.ps[fb].SetPS1(bv[1]);
+          state.ps[fa].SetPS0(av[0]);
+          state.ps[fa].SetPS1(av[1]);
+        }
         PowerPC::PairedSingle before_ps[32];
         std::memcpy(before_ps, state.ps, sizeof(before_ps));
         // FPSCR too: the Rc forms copy its top bits into CR1.
@@ -1156,7 +1229,7 @@ int main()
         PowerPC::PairedSingle want_ps[32];
         std::memcpy(want_ps, state.ps, sizeof(want_ps));
 
-        auto rr = ppc2wasm::CompileBlock(&ins, BASE, 1, layout);
+        auto rr = ppc2wasm::CompileBlock(&ins, BASE, 1, single_layout);
         if (rr.instructions != 1)
           continue;  // refused; nothing to compare
         // One slot, reused for every trial: 8,800 pinned instances is what
@@ -1273,6 +1346,19 @@ int main()
     constexpr u32 kScratch = 0x8001'0000;
     constexpr u32 kScratch2 = 0x9001'0000;
     constexpr u32 kScratchWords = 256;
+    // ...and the megabyte above each, saved before the compiled run,
+    // restored before the interpreter's, and compared after both. An
+    // indexed form adds two registers, and a scratch pointer plus a 16-bit
+    // value lands up to 64 KB past the window -- outside what reset()
+    // rewrites. A store there by the compiled run used to survive into the
+    // interpreter's, which then loaded what the compiled run had stored: a
+    // psq_lx after an stwux to the same address read back a value it never
+    // had and reported a mismatch that was the harness's.
+    constexpr u32 kWideBytes = 1u << 20;
+    u8* const wide[2] = {memory.GetRAM() + (kScratch & 0x01FFFFFFu),
+                         memory.GetEXRAM() + (kScratch2 & 0x03FFFFFFu)};
+    std::vector<u8> init_wide[2] = {std::vector<u8>(kWideBytes), std::vector<u8>(kWideBytes)};
+    std::vector<u8> jit_wide[2] = {std::vector<u8>(kWideBytes), std::vector<u8>(kWideBytes)};
 
     // Instructions the generator draws from. Deliberately a mix of
     // arithmetic, memory, compares and branches, because a block of pure
@@ -1318,6 +1404,7 @@ int main()
         {63, 21}, {63, 25}, {63, 29}, {63, 12}, {63, 15}, {63, 0}, {63, 32},
         {59, 21}, {59, 25}, {59, 29}, {59, 20}, {59, 18},
         {4, 21}, {4, 25}, {4, 29}, {4, 10}, {4, 12}, {4, 0},
+        {4, 14}, {4, 15}, {4, 28}, {4, 31},
         {56, 0}, {60, 0}, {57, 0}, {61, 0}, {4, 6}, {4, 7}, {4, 38}, {4, 39},
         {31, 19}, {31, 144}, {19, 193},
     };
@@ -1396,7 +1483,8 @@ int main()
         else if (g.primary == 63 || g.primary == 4 || g.primary == 59)
         {
           const u32 c = rnd() % 32;
-          const bool a_form = g.xo < 32 && g.xo != 0 && g.xo != 12 && g.xo != 14 && g.xo != 15;
+          const bool a_form = g.xo < 32 && g.xo != 0 &&
+                              (g.primary == 4 || (g.xo != 12 && g.xo != 14 && g.xo != 15));
           if (a_form)
             ins = (g.primary << 26) | (d << 21) | (a << 16) | (b << 11) | (c << 6) | (g.xo << 1);
           else if (g.xo == 0 || g.xo == 32)
@@ -1528,7 +1616,11 @@ int main()
       // against an interpreter that ran the whole block would report a
       // difference that is the harness's fault.
       reset();
+      for (int w = 0; w < 2; ++w)
+        std::memcpy(init_wide[w].data(), wide[w], kWideBytes);
       const u32 ret = RunBlock(ix, state, ppc);
+      for (int w = 0; w < 2; ++w)
+        std::memcpy(jit_wide[w].data(), wide[w], kWideBytes);
       // How far it got comes from the DOWNCOUNT, not the returned PC.
       //
       // The PC said how much of a block had run only while a block had
@@ -1563,12 +1655,16 @@ int main()
       const u32 ran = ran_i < 0 ? 0u : static_cast<u32>(ran_i);
 
       reset();
+      for (int w = 0; w < 2; ++w)
+        std::memcpy(wide[w], init_wide[w].data(), kWideBytes);
       for (u32 k = 0; k < ran; ++k)
         ppc.SingleStep();
       const u64 int_mem = digest();
+      const bool wide_ok = std::memcmp(jit_wide[0].data(), wide[0], kWideBytes) == 0 &&
+                           std::memcmp(jit_wide[1].data(), wide[1], kWideBytes) == 0;
 
       ++blocks_run;
-      bool ok = (jit_mem == int_mem) && (state.xer_ca == jit_ca) &&
+      bool ok = (jit_mem == int_mem) && wide_ok && (state.xer_ca == jit_ca) &&
                 (state.xer_so_ov == jit_so_ov) && (state.xer_stringctrl == jit_sc) &&
                 (state.reserve == jit_reserve) &&
                 (!state.reserve || state.reserve_address == jit_reserve_address) &&
@@ -1609,6 +1705,14 @@ int main()
                       jit_gpr[bad]);
         if (jit_mem != int_mem)
           std::printf("      memory digests differ\n");
+        for (int w = 0; w < 2 && !wide_ok; ++w)
+          for (u32 o = 0; o < kWideBytes; ++o)
+            if (jit_wide[w][o] != wide[w][o])
+            {
+              std::printf("      memory differs from %08x: interpreter=%02x recompiled=%02x\n",
+                          (w ? kScratch2 : kScratch) + o, wide[w][o], jit_wide[w][o]);
+              break;
+            }
         if (state.xer_ca != jit_ca || state.xer_so_ov != jit_so_ov || state.xer_stringctrl != jit_sc)
           std::printf("      XER interpreter=ca%u so_ov%u sc%04x recompiled=ca%u so_ov%u sc%04x\n",
                       state.xer_ca, state.xer_so_ov, state.xer_stringctrl, jit_ca, jit_so_ov, jit_sc);

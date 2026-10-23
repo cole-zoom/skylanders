@@ -187,6 +187,8 @@ seconds (title to tutorial level, pressing A) and its last 90 seconds:
 | `--dual-core --no-sync-idle`: the CPU not waiting for the GPU thread at each skipped idle loop (Dolphin's "Sync on skip idle" off) | 251% | 275% | **not comparable**: 11,754 frames instead of 23,249 and 15.9 per emulated second in the window -- the GPU falls behind and the game drops frames. Different work, so not a speed |
 | texture-hash counters by call site (`texhash` with `--jit-stats`), which found every hash unsampled: video set up as `Core.cpp` does it (`PopulateBackendInfo`: `g_Config.Refresh()`, `InitBackendInfo`, `VerifyValidity`) plus `SSP.ini`'s line, instead of `ActivateBackend` alone; dual core | **108.8%** | **89.9%** | hashes 528 a frame, 40.8 MB → 0.85 MB read; GPU thread 1.17 → 0.71 s and the hash 0.53 → 0.01 s per emulated second; same frames and draws. `--tex-samples=128` alone: 108.4% / 88.8% |
 | the same, single core | **97.2%** | **80.3%** | against 73.5% / 58.5% with `--no-dolphin-video-config` in the same session; **280,060,345,494 executed instructions both ways**, same hatch count, frames and draws: identical guest work |
+| the paired fused multiply-adds inline (`EmitPsMadd`): f64 multiply then add, exact for a float-exact `a` and exponents within 2^±200, with NI_madd_msub's tie correction; dual core | **119.2%** | **99.4%** | against 107.2% / 88.9% with `--jit-no-madd` in the same session; hatch 1.37% → 0.35%; CPU thread 1.12 → 1.01 s per emulated second, interpreter 0.186 → 0.034 s; same frames and draws |
+| the same, single core | **105.3%** | **88.3%** | 280,060,345,494 executed instructions again |
 
 The video config, in more detail. The harness never called
 `g_Config.Refresh()`, so every `VideoConfig` field was its C++ member
