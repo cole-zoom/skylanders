@@ -24,6 +24,12 @@ class Texture;
 // land before the command buffer they are recorded for is submitted; the
 // one thing to avoid is overwriting a range a recorded-but-unsubmitted
 // draw still reads, which Allocate prevents by submitting before it wraps.
+//
+// Each queue write is a call out to JavaScript, and a frame makes hundreds
+// (a batch's vertices, its indices, each uniform block that changed). With
+// Context::fast_path, Write gathers them instead: allocations only move
+// forward between submits, so what was written since the last one is one
+// range, written by FlushWrites as the submit is made.
 struct StreamBuffer
 {
   wgpu::Buffer buffer;
@@ -33,6 +39,27 @@ struct StreamBuffer
   void Create(u64 bytes, wgpu::BufferUsage usage, const char* label);
   // An offset `alignment`-aligned with `bytes` free after it.
   u64 Allocate(u64 bytes, u64 alignment);
+  // `bytes` a multiple of 4, at an offset Allocate returned.
+  void Write(u64 at, const void* data, u64 bytes);
+  void FlushWrites();
+
+private:
+  std::vector<u8> m_pending;
+  u64 m_pending_at = 0;
+};
+
+// What a texture bind group holds: each slot's texture (by Texture::GetId,
+// 0 for none) and sampler state.
+using TextureGroupKey = std::array<u64, 16>;
+struct TextureGroupKeyHash
+{
+  size_t operator()(const TextureGroupKey& key) const
+  {
+    u64 h = 0;
+    for (u64 v : key)
+      h = (h ^ v) * 0x100000001b3ull + (h >> 29);
+    return static_cast<size_t>(h);
+  }
 };
 
 class Gfx final : public ::AbstractGfx
@@ -93,6 +120,8 @@ public:
   // 1 vertex, 2 geometry), one block for both stages for utility draws.
   void SetGXUniforms(u32 slot, const void* data, u32 size);
   void SetUtilityUniforms(const void* data, u32 size);
+  // Drops the cached bind groups that hold a texture being destroyed.
+  void ForgetTexture(const Texture* texture);
 
 private:
   void EnsureEncoder();
@@ -123,6 +152,15 @@ private:
   u64 m_utility_uniform = 0;
 
   std::unordered_map<u64, wgpu::Sampler> m_sampler_cache;
+  // Group 0, made once: the uniform buffer, with each block's offset
+  // given per draw.
+  wgpu::BindGroup m_uniform_group;
+  std::unordered_map<TextureGroupKey, wgpu::BindGroup, TextureGroupKeyHash> m_texture_groups;
+  // What the open pass has set, so a draw sets only what changed.
+  const Pipeline* m_pass_pipeline = nullptr;
+  std::array<u32, 3> m_pass_uniforms{};
+  TextureGroupKey m_pass_textures{};
+  bool m_pass_state_set = false;
   std::unique_ptr<Texture> m_null_texture;
   // The presenter draws into this, not into the canvas: a canvas texture
   // is valid only until the worker yields, and any wait -- a readback, a

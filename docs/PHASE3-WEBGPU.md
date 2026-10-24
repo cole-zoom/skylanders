@@ -241,6 +241,67 @@ backend drawing, against the CPU thread's. *Gate:* the gameplay window at or
 above 100%. Expect work here: per-draw state changes, uniform uploads, and
 the readbacks of §4.
 
+*First step* (2026-10-24): **87.0% → 94.3%** in the gameplay window (dual
+core, 300-400 emulated s; two runs each, from one build, with
+`--webgpu-per-draw` selecting M1's path: 87.0 / 87.0 against 94.2 / 94.5).
+The gate is not met; the Null backend does 104.3% on the same build.
+
+What a frame cost, counted by the backend (every 600 presents it logs
+`stats/frame`):
+
+| per frame | M1's path | now |
+|---|---|---|
+| draws | 388 | 388 |
+| `writeBuffer` calls | 1,727 | 4 |
+| bytes written | 5.4 MB | 5.4 MB |
+| bind groups made | 776 | 21 |
+| bind groups set | 776 | 714 |
+| readbacks (`mapAsync`) | 0 | 0 |
+| submits | 1.3 | 1.3 |
+
+- **Buffer writes gathered.** Allocations in a stream buffer only move
+  forward between submits, so everything written since the last submit is
+  one range: `StreamBuffer::Write` copies into it and `Flush` writes it in
+  one call per buffer, before the submit.
+- **The uniform group made once**, with each block's offset given per
+  draw (dynamic offsets) rather than a group made per draw for the offsets.
+- **Texture groups cached**, keyed by each slot's texture (an id, never
+  reused, not the address) and sampler state; a texture's destruction
+  clears the cache (0.03 times a frame), and it is bounded at 4,096.
+- **State a pass already has is not set again**: pipeline, groups, vertex
+  and index buffers.
+
+No readbacks at all in gameplay: the EFB peeks and copies to RAM §4 worried
+about do not happen in this window, so the blocking wait is not a factor.
+
+Where the rest goes, from runs with parts of the backend switched off
+(temporary flags, not kept):
+
+| variant | window |
+|---|---|
+| now | 94.5% |
+| no yield per present | 95.9% |
+| draws not recorded | 97.6% |
+| draws not recorded and no buffer writes | 101.1% |
+| Null backend | 104.3% |
+
+The cost is latency, not throughput. The GPU thread is 59% busy and Chrome's
+GPU process about 11% of a core, so nothing is saturated, but the CPU thread
+waits for the GPU thread to drain the FIFO at every skipped idle loop
+(`SyncOnSkipIdle`; 95% of its waiting is in `CoreTiming::Idle`), so
+whatever the GPU thread does is on the critical path. What remains of it is
+spread thin: recording the draws (~3 points), copying 5.4 MB a frame into
+`writeBuffer` (~3.5; 3.7 MB of it vertices and indices, the rest uniform
+blocks, of which 80 of 322 vertex-shader uploads repeat the one before), and
+the rest (passes, texture uploads, the present). Under the profiler the GPU
+thread's own functions are within a point of the Null backend's --
+`SetCPStatusFromGPU` and the GPU loop's polling are ~22% of it under both.
+
+Next, in the order they would pay: making the GPU loop itself cheaper
+(Dolphin's, so it would speed the Null backend up too), and on the CPU
+thread the recompiler, which is 88% busy here; smaller, in this backend,
+uploading only the vertex-shader constants that changed.
+
 **M5 — the browser shell.** `web/`: the page, the canvas, input, the disc
 streaming that already works in the harness. Overlaps Phase 4.
 

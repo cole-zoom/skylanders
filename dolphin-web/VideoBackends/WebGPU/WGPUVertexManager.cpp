@@ -49,9 +49,9 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
   const u32 isize = num_indices * sizeof(u16);
   const u64 iat = indices.Allocate((isize + 3) & ~3u, 4);
   if (vsize)
-    g_context.queue.WriteBuffer(vertices.buffer, vat, m_cpu_vertices.data(), (vsize + 3) & ~3u);
+    vertices.Write(vat, m_cpu_vertices.data(), (vsize + 3) & ~3u);
   if (isize)
-    g_context.queue.WriteBuffer(indices.buffer, iat, m_cpu_indices.data(), (isize + 3) & ~3u);
+    indices.Write(iat, m_cpu_indices.data(), (isize + 3) & ~3u);
   ADDSTAT(g_stats.this_frame.bytes_vertex_streamed, vsize);
   ADDSTAT(g_stats.this_frame.bytes_index_streamed, isize);
   *out_base_vertex = vertex_stride ? static_cast<u32>(vat / vertex_stride) : 0;

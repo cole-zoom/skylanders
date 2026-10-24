@@ -61,6 +61,7 @@
 #include <emscripten/threading.h>
 #include <pthread.h>
 #include "VideoBackends/WebGPU/WGPUBackend.h"
+#include "VideoBackends/WebGPU/WGPUContext.h"
 #endif
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/HW/GCKeyboard.h"
@@ -825,6 +826,7 @@ int main(int argc, char** argv)
   bool want_dolphin_video_config = true;
   bool want_dump_shaders = false;
   bool want_webgpu = false;
+  bool want_webgpu_per_draw = false;
   bool want_osd = true;
   std::string fifo_path;
   u64 record_fifo_at = 0;  // --record-fifo=TICKS
@@ -1014,6 +1016,11 @@ int main(int argc, char** argv)
     // Null backend. Needs a WEBGPU=1 build.
     else if (std::strcmp(argv[i], "--webgpu") == 0)
       want_webgpu = true;
+    // --webgpu-per-draw: the WebGPU backend's M1 path, a bind group made
+    // and every buffer write sent per draw, to measure M4's against
+    // (docs/PHASE3-WEBGPU.md M4).
+    else if (std::strcmp(argv[i], "--webgpu-per-draw") == 0)
+      want_webgpu_per_draw = true;
     // --fifo=FILE: replay a FIFO capture (.dff) with Dolphin's FifoPlayer
     // instead of running the game: the same GX commands and memory, frame
     // for frame, whatever the backend -- what docs/PHASE3-WEBGPU.md M3
@@ -1622,6 +1629,7 @@ int main(int argc, char** argv)
     g_Config.Refresh();
     g_backend_info = {};
     g_video_backend = &webgpu_backend;
+    WebGPU::g_context.fast_path = !want_webgpu_per_draw;
     g_backend_info.DisplayName = g_video_backend->GetDisplayName();
     g_video_backend->InitBackendInfo(wsi);
     g_Config.VerifyValidity();
