@@ -543,6 +543,13 @@ Each of these cost at least an hour this phase.
   scratch window, not just the window: a store outside what is restored
   survives from the compiled run into the interpreter's and reads back as
   a false mismatch.
+- **Stack size.** `main()` -- the CPU thread under PROXY_TO_PTHREAD -- has a
+  frame of kilobytes and calls deep into Dolphin, and sat within bytes of
+  Emscripten's 64 KB default stack until 2026-10-24. Overflow is silent: it
+  writes into static data (here zlib-ng's function table) and shows up much
+  later as a "null function" somewhere unrelated. `link.sh` now gives 4 MB
+  and 2 MB per thread; if a run dies with "null function" after a change
+  that only added code, suspect the stack before anything else.
 - **Commits need all five numbered sections** or CI rejects the PR.
   `docs/COMMIT_CONVENTION.md`; the template is `.gitmessage`.
 
