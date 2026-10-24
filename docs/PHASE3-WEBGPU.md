@@ -185,6 +185,57 @@ the pause screen (`SSP.ini`'s blur) — rendered by native Dolphin and by the
 browser from the same captures, diffed per pixel with a tolerance. *Gate:*
 `PLAN.md`'s — indistinguishable across the set.
 
+*Done* (2026-10-24), with one stated gap. The suite is
+`harness/wasm-core/run-m3.sh`: each FIFO capture is replayed in the browser
+harness (`bootgame --fifo=`, Dolphin's FifoPlayer) once with the Software
+renderer -- Dolphin's reference rasteriser -- and once with the WebGPU
+backend writing its XFB to RAM (`--xfb-to-ram`), and the last frames are
+compared (`harness/src/compare_frames.py`). Scenes: boot, title, the
+save-slot menu (the three captures in `harness/traces`), and the tutorial
+level at 390 s, recorded by the harness itself (`--record-fifo=TICKS`).
+
+| scene | per pixel > 8 | edge-tolerant > 32 | 8x8 blocks: p99 / > 8 | verdict |
+|---|---|---|---|---|
+| boot | 0.00% | 0.000% | 0.00 / 0.00% | PASS |
+| title | 7.46% | 0.077% | 4.92 / 0.00% | PASS |
+| save-slot menu | 3.63% | 0.036% | 3.45 / 0.02% | PASS |
+| tutorial level | 17.56% | 0.276% | 10.28 / 3.20% | PASS |
+
+Every difference is one of two kinds, each looked at, not assumed:
+
+- **Edges**, a pixel either way, between a GPU's coverage rules and the
+  Software rasteriser's. The edge-tolerant figures forgive exactly that.
+- **Colour depth.** The Software renderer emulates the EFB's 6-bit format
+  with dithering -- a visible cross-hatch in its sky -- and truncates on
+  every write, so it runs a level or two darker, more where layers blend
+  (the clouds). Dolphin's hardware backends default to "Force 24-bit
+  color", which does neither; so does this one. Per pixel this is noise of
+  sd 3.5-5 everywhere; over 8x8 blocks it cancels to a bias of +1.1.
+
+Nothing else: no missing or wrong geometry, texture, colour or blend in any
+scene. The verdict's thresholds sit just above the level's figures, and it
+has teeth: the same backend with blending switched off fails the title
+(block p99 167).
+
+The gap: `PLAN.md` says *native* Dolphin, and a native hardware backend
+could not be rendered headless here (Metal never presents without a
+surface, so no screenshot is taken; the native build has no Vulkan
+library). The reference is Dolphin's own rasteriser instead, and the
+differences above are the ones any hardware backend has from it. A
+windowed native Metal render of the same captures would close this.
+
+Open: with "Force 24-bit color" off (`--no-true-color`) the WebGPU frame
+runs *brighter* against the Software one (+2.3 rather than +1.1) and fails
+the verdict, where a correct 6-bit path should remove the bias. Whether
+Dolphin's hardware backends do the same in that mode is the windowed
+comparison's question too. Not the default, and not this game's setting.
+
+Found on the way: every non-WebGPU build of the harness had `main()` within
+bytes of Emscripten's 64 KB default stack; a few more locals overflowed it
+into static data and zeroed zlib-ng's function table, which surfaced as
+"null function" in `crc32_z`. Every build now gets a 4 MB main stack and 2 MB
+for other threads (`link.sh`).
+
 **M4 — speed.** The GPU thread's busy seconds per emulated second with the
 backend drawing, against the CPU thread's. *Gate:* the gameplay window at or
 above 100%. Expect work here: per-draw state changes, uniform uploads, and

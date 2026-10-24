@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <thread>
@@ -74,6 +75,9 @@
 #include "InputCommon/InputConfig.h"
 #include "Core/HW/EXI/EXI_Device.h"
 #include "Core/HW/CPU.h"
+#include "Core/FifoPlayer/FifoDataFile.h"
+#include "Core/FifoPlayer/FifoPlayer.h"
+#include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/DSPEmulator.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/HW.h"
@@ -675,6 +679,12 @@ static HarnessThread SpawnGpuThread(std::function<void()> body, bool with_canvas
   return t;
 }
 
+// --record-fifo: set from the recorder's callback, which may run on the GPU
+// thread.
+static bool g_fifo_recording_started = false;
+static std::atomic<bool> g_fifo_recording_done{false};
+static std::atomic<bool> g_fifo_recorded_ok{false};
+
 static void InitMark(const char* msg)
 {
   std::size_t i = 0;
@@ -780,7 +790,7 @@ int main(int argc, char** argv)
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
   const std::string location = argc > 1 ? argv[1] : "/tmp/ssa.iso";
-  const u64 steps = argc > 2 ? std::strtoull(argv[2], nullptr, 0) : 2000;
+  u64 steps = argc > 2 ? std::strtoull(argv[2], nullptr, 0) : 2000;
   bool want_trace = false;
   // --until-fifo: treat the step count as a cap and stop at the first FIFO
   // write instead of running it out. Reaching the FIFO takes far more
@@ -816,6 +826,10 @@ int main(int argc, char** argv)
   bool want_dump_shaders = false;
   bool want_webgpu = false;
   bool want_osd = true;
+  std::string fifo_path;
+  u64 record_fifo_at = 0;  // --record-fifo=TICKS
+  bool want_xfb_to_ram = false;
+  bool want_true_color = true;
   bool want_sync_idle = true;
   bool want_nunchuk = true;
   bool want_disc_files = false;
@@ -1000,6 +1014,29 @@ int main(int argc, char** argv)
     // Null backend. Needs a WEBGPU=1 build.
     else if (std::strcmp(argv[i], "--webgpu") == 0)
       want_webgpu = true;
+    // --fifo=FILE: replay a FIFO capture (.dff) with Dolphin's FifoPlayer
+    // instead of running the game: the same GX commands and memory, frame
+    // for frame, whatever the backend -- what docs/PHASE3-WEBGPU.md M3
+    // compares backends on. In the browser FILE is fetched from the page's
+    // server. The disc still opens, for the console type and the memory
+    // map; nothing from it runs.
+    else if (std::strncmp(argv[i], "--fifo=", 7) == 0)
+      fifo_path = argv[i] + 7;
+    // --record-fifo=TICKS: at this emulated time, record three frames with
+    // Dolphin's FifoRecorder -- what nogui's --fifo-record does, at a point
+    // this harness reaches deterministically -- and emit the .dff as base64
+    // on "D " lines, then stop.
+    else if (std::strncmp(argv[i], "--record-fifo=", 14) == 0)
+      record_fifo_at = std::strtoull(argv[i] + 14, nullptr, 0);
+    // --xfb-to-ram: XFB copies are written to guest memory even by a
+    // backend that keeps them in VRAM, so --dump-xfb sees what it drew.
+    else if (std::strcmp(argv[i], "--xfb-to-ram") == 0)
+      want_xfb_to_ram = true;
+    // --no-true-color: Dolphin's "Force 24-bit color" off, so a hardware
+    // backend truncates to the EFB's 6-bit format and dithers, as the GX --
+    // and the Software renderer -- do. On by default in Dolphin.
+    else if (std::strcmp(argv[i], "--no-true-color") == 0)
+      want_true_color = false;
     // --no-osd: no on-screen messages over the presented frame.
     else if (std::strcmp(argv[i], "--no-osd") == 0)
       want_osd = false;
@@ -1561,6 +1598,17 @@ int main(int argc, char** argv)
   // Dolphin also layers the game's GameSettings INI over the base config
   // (SConfig::SetRunningGameMetadata). The harness has no Sys directory to
   // load it from, so this game's one line is set here by hand.
+  if (want_xfb_to_ram)
+    Config::SetCurrent(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM, false);
+  if (!want_true_color)
+    Config::SetCurrent(Config::GFX_ENHANCE_FORCE_TRUE_COLOR, false);
+  if (!fifo_path.empty())
+  {
+    // Play the capture once, through, and stop: no looping, and memory
+    // updates at the point in the frame where they were recorded.
+    Config::SetCurrent(Config::MAIN_FIFOPLAYER_LOOP_REPLAY, false);
+    Config::SetCurrent(Config::MAIN_FIFOPLAYER_EARLY_MEMORY_UPDATES, false);
+  }
 #if defined(HARNESS_WEBGPU)
   static WebGPU::VideoBackend webgpu_backend;
   if (want_webgpu)
@@ -1727,12 +1775,13 @@ int main(int argc, char** argv)
 
   const u32 pc_before = system.GetPPCState().pc;
   bool booted = false;
+  if (fifo_path.empty())
   {
     const Core::CPUThreadGuard guard(system);
     INIT_MARK("CBoot::BootUp");
     booted = CBoot::BootUp(system, guard, std::move(boot));
+    check(booted, "CBoot::BootUp returned success");
   }
-  check(booted, "CBoot::BootUp returned success");
 
   // Arm GPU/CPU syncing. Core.cpp:656 does this immediately after boot, and it
   // is not optional: FifoManager::Prepare() both registers the SyncGPUCallback
@@ -1768,7 +1817,59 @@ int main(int argc, char** argv)
   std::printf("  region    %d  lowmem[0x800000CC]=%08x\n",
               static_cast<int>(SConfig::GetInstance().m_region),
               system.GetMemory().Read_U32(0x800000CC));
-  check(state.pc != 0 && state.pc != pc_before, "boot left the CPU at an entry point");
+  if (fifo_path.empty())
+    check(state.pc != 0 && state.pc != pc_before, "boot left the CPU at an entry point");
+
+  // ── a FIFO capture instead of the game ──
+  if (!fifo_path.empty())
+  {
+    std::string local = fifo_path;
+#if defined(__EMSCRIPTEN__)
+    // Fetched whole from the page's server into the in-memory filesystem.
+    {
+      emscripten_fetch_attr_t attr;
+      emscripten_fetch_attr_init(&attr);
+      std::strcpy(attr.requestMethod, "GET");
+      attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS |
+                        EMSCRIPTEN_FETCH_REPLACE;
+      emscripten_fetch_t* fetch =
+          emscripten_fetch(&attr, ("http://127.0.0.1:8102/" + fifo_path).c_str());
+      const bool got = fetch && fetch->status == 200;
+      check(got, "FIFO capture fetched");
+      local = "/tmp/replay.dff";
+      if (got)
+      {
+        std::FILE* f = std::fopen(local.c_str(), "wb");
+        std::fwrite(fetch->data, 1, fetch->numBytes, f);
+        std::fclose(f);
+        std::printf("  fifo      %s, %llu bytes\n", fifo_path.c_str(),
+                    static_cast<unsigned long long>(fetch->numBytes));
+      }
+      if (fetch)
+        emscripten_fetch_close(fetch);
+    }
+#endif
+    auto& player = system.GetFifoPlayer();
+    check(player.Open(local), "FIFO capture opened");
+    std::unique_ptr<CPUCoreBase> core = player.GetCPUCore();
+    check(core != nullptr, "FIFO capture has frames");
+    if (core)
+    {
+      // FifoPlayer's own CPU core: Init loads the capture's memory and
+      // registers; Run writes every frame into the FIFO and returns when
+      // the last has been drawn (it powers the CPU down).
+      core->Init();
+      const auto t0 = std::chrono::steady_clock::now();
+      core->Run();
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      std::printf("  fifo      %u frames replayed in %.0f ms\n", player.GetFile()->GetFrameCount(),
+                  ms);
+      core->Shutdown();
+    }
+    // The step loop has nothing to run.
+    steps = 0;
+  }
 
   // ── execute ──
   INIT_MARK("stepping");
@@ -2995,6 +3096,22 @@ int main(int argc, char** argv)
         EmitBase64(ppm);
       }
     }
+    if (record_fifo_at && !g_fifo_recording_started)
+    {
+      const u64 t = static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start);
+      if (t >= record_fifo_at)
+      {
+        g_fifo_recording_started = true;
+        std::printf("  fifo      recording 3 frames at %.1f emulated s\n", t / 729e6);
+        system.GetFifoRecorder().StartRecording(3, [&system] {
+          FifoDataFile* file = system.GetFifoRecorder().GetRecordedFile();
+          g_fifo_recorded_ok = file && file->Save("/tmp/recorded.dff");
+          g_fifo_recording_done = true;
+        });
+      }
+    }
+    if (g_fifo_recording_done)
+      break;
     if ((gx_from && !g_gx_armed) || (speed_from && !window_open))
     {
       const u64 t = static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start);
@@ -3083,6 +3200,42 @@ int main(int argc, char** argv)
     // CPU wrote last.
     system.GetFifo().ExitGpuLoop();
     gpu_thread.join();
+  }
+  if (record_fifo_at)
+  {
+    check(g_fifo_recorded_ok, "FIFO capture recorded");
+    if (g_fifo_recorded_ok)
+    {
+      std::FILE* f = std::fopen("/tmp/recorded.dff", "rb");
+      std::vector<u8> bytes;
+      if (f)
+      {
+        u8 buf[65536];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+          bytes.insert(bytes.end(), buf, buf + n);
+        std::fclose(f);
+      }
+      std::printf("  fifo      %zu bytes recorded, emitting as base64\n", bytes.size());
+      static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      std::string line;
+      for (size_t k = 0; k < bytes.size(); k += 3)
+      {
+        const u32 v = (bytes[k] << 16) | (k + 1 < bytes.size() ? bytes[k + 1] << 8 : 0) |
+                      (k + 2 < bytes.size() ? bytes[k + 2] : 0);
+        line += T[(v >> 18) & 63];
+        line += T[(v >> 12) & 63];
+        line += k + 1 < bytes.size() ? T[(v >> 6) & 63] : '=';
+        line += k + 2 < bytes.size() ? T[v & 63] : '=';
+        if (line.size() >= 76)
+        {
+          std::printf("D %s\n", line.c_str());
+          line.clear();
+        }
+      }
+      if (!line.empty())
+        std::printf("D %s\n", line.c_str());
+    }
   }
   if (g_dump_shaders)
   {
@@ -3315,7 +3468,8 @@ int main(int argc, char** argv)
   check(early_stop_ok ? state.pc != 0 : executed >= steps,
         early_stop_ok ? "ran until the stop condition without falling off"
                       : "ran at least the full step count without falling off");
-  check(state.pc != 0, "pc is still valid");
+  if (fifo_path.empty())
+    check(state.pc != 0, "pc is still valid");
 
   // Is anything draining the FIFO? If CPReadWriteDistance only grows, the GPU
   // side never ran and a game waiting for FIFO space would stall -- a very

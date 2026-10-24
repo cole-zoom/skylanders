@@ -44,12 +44,20 @@ if [ -n "${WEBGPU:-}" ]; then
     -DTINT_BUILD_MSL_WRITER=0 -DTINT_BUILD_SPV_WRITER=0 -DTINT_BUILD_NULL_WRITER=0
     -DTINT_BUILD_IR_BINARY=0 -DTINT_BUILD_TINTD=0 -DTINT_BUILD_IS_LINUX=1 -DTINT_BUILD_IS_MAC=0
     -DTINT_BUILD_IS_WIN=0 -DTINT_ENABLE_IR_DUMPING=0 -DTINT_ENABLE_IR_VALIDATION_ASSERTS=0
-    -Wno-deprecated-pragma -sSTACK_SIZE=4MB"
+    -Wno-deprecated-pragma"
   WEBGPU_SRC="$(ls dolphin-web/VideoBackends/WebGPU/*.cpp)"
   WEBGPU_LIBS="$B/Externals/glslang/glslang/SPIRV/libSPIRV.a $B/Externals/glslang/glslang/glslang/libglslang.a
     -Wl,--start-group $(find $DAWN/out/wasm/src/tint $DAWN/out/wasm/third_party -name '*.a' | sort | tr '\n' ' ') -Wl,--end-group"
 fi
+# Stacks: main() -- the CPU thread, under PROXY_TO_PTHREAD -- has a frame of
+# several kilobytes and calls deep into Dolphin, and ran within bytes of
+# Emscripten's 64 KB default. A few more locals overflowed it, silently: the
+# stack ran down into static data and zeroed zlib-ng's function table, which
+# surfaced much later as "null function" in crc32_z. 4 MB for main, 2 MB for
+# every other thread (the GPU thread runs VideoCommon and, with WEBGPU=1,
+# glslang and Tint).
 em++ -std=c++23 -O2 ${PROFILING:+--profiling-funcs} -pthread -sPROXY_TO_PTHREAD -sEXIT_RUNTIME=1 \
+  -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=2MB \
   $WEBGPU_FLAGS \
   -D_M_GENERIC=1 -D_ARCH_32=1 \
   -sASSERTIONS=1 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
@@ -90,5 +98,5 @@ em++ -std=c++23 -O2 ${PROFILING:+--profiling-funcs} -pthread -sPROXY_TO_PTHREAD 
   $B/Externals/liblzma/liblzma.a \
   $B/Externals/zlib-ng/zlib-ng/libz.a \
   $B/Externals/zstd/zstd/build/cmake/lib/libzstd.a \
-  $WEBGPU_LIBS \
+  $WEBGPU_LIBS ${LINK_EXTRA:-} \
   -o "$OUT"
