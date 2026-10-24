@@ -14,6 +14,7 @@
 namespace WebGPU
 {
 Context g_context;
+Stats g_stats_wgpu;
 
 EM_ASYNC_JS(void, WebGPUYieldOnce, (), {
   if (!globalThis.__wgpuYield) {
@@ -115,6 +116,8 @@ bool Context::Create()
       entries[i].binding = i;
       entries[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
       entries[i].buffer.type = wgpu::BufferBindingType::Uniform;
+      // Where a block is, is given per draw (Gfx::PrepareDraw).
+      entries[i].buffer.hasDynamicOffset = true;
     }
     wgpu::BindGroupLayoutDescriptor desc{};
     desc.entryCount = 3;

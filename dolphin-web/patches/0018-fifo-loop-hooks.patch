@@ -1,0 +1,189 @@
+diff --git a/Source/Core/VideoCommon/Fifo.cpp b/Source/Core/VideoCommon/Fifo.cpp
+index d396d31..7a47403 100644
+--- a/Source/Core/VideoCommon/Fifo.cpp
++++ b/Source/Core/VideoCommon/Fifo.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "VideoCommon/Fifo.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstring>
+ 
+@@ -32,6 +33,39 @@
+ #include "VideoCommon/VertexManagerBase.h"
+ #include "VideoCommon/VideoBackendBase.h"
+ 
++// Harness instrumentation hooks (weak), for docs/PHASE3-WEBGPU.md M4.
++//
++// harness_fifo_loop reports each run of the GPU loop's payload: the 32-byte
++// chunks it ran (0 when it found nothing to do -- between the CPU thread's
++// sync points the loop spins until SystemTimers lets it sleep), the runs of
++// the opcode decoder they took, and the CP's enables OR-ed over the run: bit
++// 0 a breakpoint, bit 1 the high-watermark interrupt, bit 2 the low.
++//
++// harness_fifo_batch returns how many chunks the loop may run through the
++// opcode decoder before it updates the CP's status and pulls the CPU
++// thread's events. 1 is Dolphin's loop. More is taken only while no
++// breakpoint is enabled and SyncGPU is off, and never across the FIFO's
++// end.
++//
++// Weak DEFINITIONS, not weak declarations: see TextureCacheBase.cpp.
++extern "C" __attribute__((weak)) void harness_fifo_loop(u32 chunks, u32 batches, u32 enables)
++{
++  (void)chunks;
++  (void)batches;
++  (void)enables;
++}
++extern "C" __attribute__((weak)) u32 harness_fifo_batch()
++{
++  return 1;
++}
++// harness_fifo_spin_limit: after this many runs that found nothing, the
++// loop lets itself sleep rather than spin until SystemTimers' 1 kHz
++// AllowSleep. 0 is Dolphin's loop.
++extern "C" __attribute__((weak)) u32 harness_fifo_spin_limit()
++{
++  return 0;
++}
++
+ namespace Fifo
+ {
+ static constexpr int GPU_TIME_SLOT_SIZE = 1000;
+@@ -219,16 +253,15 @@ void* FifoManager::PopFifoAuxBuffer(size_t size)
+ }
+ 
+ // Description: RunGpuLoop() sends data through this function.
+-void FifoManager::ReadDataFromFifo(u32 read_ptr)
++void FifoManager::ReadDataFromFifo(u32 read_ptr, u32 bytes)
+ {
+-  if (GPFifo::GATHER_PIPE_SIZE >
+-      static_cast<size_t>(m_video_buffer + FIFO_SIZE - m_video_buffer_write_ptr))
++  if (bytes > static_cast<size_t>(m_video_buffer + FIFO_SIZE - m_video_buffer_write_ptr))
+   {
+     const size_t existing_len = m_video_buffer_write_ptr - m_video_buffer_read_ptr;
+-    if (GPFifo::GATHER_PIPE_SIZE > static_cast<size_t>(FIFO_SIZE - existing_len))
++    if (bytes > static_cast<size_t>(FIFO_SIZE - existing_len))
+     {
+-      PanicAlertFmt("FIFO out of bounds (existing {} + new {} > {})", existing_len,
+-                    GPFifo::GATHER_PIPE_SIZE, FIFO_SIZE);
++      PanicAlertFmt("FIFO out of bounds (existing {} + new {} > {})", existing_len, bytes,
++                    FIFO_SIZE);
+       return;
+     }
+     memmove(m_video_buffer, m_video_buffer_read_ptr, existing_len);
+@@ -237,8 +270,8 @@ void FifoManager::ReadDataFromFifo(u32 read_ptr)
+   }
+   // Copy new video instructions to m_video_buffer for future use in rendering the new picture
+   auto& memory = m_system.GetMemory();
+-  memory.CopyFromEmu(m_video_buffer_write_ptr, read_ptr, GPFifo::GATHER_PIPE_SIZE);
+-  m_video_buffer_write_ptr += GPFifo::GATHER_PIPE_SIZE;
++  memory.CopyFromEmu(m_video_buffer_write_ptr, read_ptr, bytes);
++  m_video_buffer_write_ptr += bytes;
+ }
+ 
+ // The deterministic_gpu_thread version.
+@@ -320,6 +353,9 @@ void FifoManager::RunGpuLoop()
+           auto& fifo = command_processor.GetFifo();
+           command_processor.SetCPStatusFromGPU();
+ 
++          const u32 batch = m_config_sync_gpu ? 1 : std::max<u32>(1, harness_fifo_batch());
++          u32 chunks_run = 0, batches_run = 0, enables = 0;
++
+           // check if we are able to run this buffer
+           while (!command_processor.IsInterruptWaiting() &&
+                  fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) &&
+@@ -331,16 +367,33 @@ void FifoManager::RunGpuLoop()
+ 
+             u32 cyclesExecuted = 0;
+             u32 readPtr = fifo.CPReadPointer.load(std::memory_order_relaxed);
+-            ReadDataFromFifo(readPtr);
+-
+-            if (readPtr == fifo.CPEnd.load(std::memory_order_relaxed))
++            const u32 cp_end = fifo.CPEnd.load(std::memory_order_relaxed);
++            const u32 bp_enable = fifo.bFF_BPEnable.load(std::memory_order_relaxed);
++            // Chunks before the next status update (harness_fifo_batch above):
++            // what the FIFO holds, up to its end.
++            u32 chunks = 1;
++            if (batch > 1 && !bp_enable)
++            {
++              chunks = std::min(batch, fifo.CPReadWriteDistance.load(std::memory_order_relaxed) /
++                                           GPFifo::GATHER_PIPE_SIZE);
++              chunks = std::min(chunks, (cp_end - readPtr) / GPFifo::GATHER_PIPE_SIZE + 1);
++              chunks = std::max<u32>(chunks, 1);
++            }
++            enables |= (bp_enable ? 1 : 0) |
++                       (fifo.bFF_HiWatermarkInt.load(std::memory_order_relaxed) ? 2 : 0) |
++                       (fifo.bFF_LoWatermarkInt.load(std::memory_order_relaxed) ? 4 : 0);
++            const u32 bytes = chunks * GPFifo::GATHER_PIPE_SIZE;
++            ReadDataFromFifo(readPtr, bytes);
++
++            const u32 last_chunk = readPtr + bytes - GPFifo::GATHER_PIPE_SIZE;
++            if (last_chunk == cp_end)
+               readPtr = fifo.CPBase.load(std::memory_order_relaxed);
+             else
+-              readPtr += GPFifo::GATHER_PIPE_SIZE;
++              readPtr = last_chunk + GPFifo::GATHER_PIPE_SIZE;
+ 
+             const s32 distance =
+                 static_cast<s32>(fifo.CPReadWriteDistance.load(std::memory_order_relaxed)) -
+-                GPFifo::GATHER_PIPE_SIZE;
++                static_cast<s32>(bytes);
+             ASSERT_MSG(COMMANDPROCESSOR, distance >= 0,
+                        "Negative fifo.CPReadWriteDistance = {} in FIFO Loop !\nThat can produce "
+                        "instability in the game. Please report it.",
+@@ -351,12 +404,14 @@ void FifoManager::RunGpuLoop()
+                 DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
+ 
+             fifo.CPReadPointer.store(readPtr, std::memory_order_relaxed);
+-            fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
++            fifo.CPReadWriteDistance.fetch_sub(bytes, std::memory_order_seq_cst);
+             if ((write_ptr - m_video_buffer_read_ptr) == 0)
+             {
+               fifo.SafeCPReadPointer.store(fifo.CPReadPointer.load(std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
+             }
++            chunks_run += chunks;
++            ++batches_run;
+ 
+             command_processor.SetCPStatusFromGPU();
+ 
+@@ -390,6 +445,15 @@ void FifoManager::RunGpuLoop()
+           // Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
+           g_vertex_manager->Flush();
+           g_framebuffer_manager->RefreshPeekCache();
++          harness_fifo_loop(chunks_run, batches_run, enables);
++          static u32 empty_runs = 0;
++          if (chunks_run != 0)
++            empty_runs = 0;
++          else if (const u32 limit = harness_fifo_spin_limit(); limit && ++empty_runs >= limit)
++          {
++            empty_runs = 0;
++            m_gpu_mainloop.AllowSleep();
++          }
+         }
+       },
+       100);
+@@ -462,7 +526,8 @@ int FifoManager::RunGpuOnCpu(int ticks)
+         Common::FPU::LoadDefaultSIMDState();
+         reset_simd_state = true;
+       }
+-      ReadDataFromFifo(fifo.CPReadPointer.load(std::memory_order_relaxed));
++      ReadDataFromFifo(fifo.CPReadPointer.load(std::memory_order_relaxed),
++                       GPFifo::GATHER_PIPE_SIZE);
+       u32 cycles = 0;
+       m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
+           DataReader(m_video_buffer_read_ptr, m_video_buffer_write_ptr), &cycles);
+diff --git a/Source/Core/VideoCommon/Fifo.h b/Source/Core/VideoCommon/Fifo.h
+index 2afa110..ce60899 100644
+--- a/Source/Core/VideoCommon/Fifo.h
++++ b/Source/Core/VideoCommon/Fifo.h
+@@ -78,7 +78,7 @@ public:
+ 
+ private:
+   void RefreshConfig();
+-  void ReadDataFromFifo(u32 read_ptr);
++  void ReadDataFromFifo(u32 read_ptr, u32 bytes);
+   void ReadDataFromFifoOnCPU(u32 read_ptr);
+   int RunGpuOnCpu(int ticks);
+   int WaitForGpuThread(int ticks);

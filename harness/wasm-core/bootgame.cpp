@@ -54,6 +54,7 @@
 #include "Common/WindowSystemInfo.h"
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/CPMemory.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
@@ -61,6 +62,7 @@
 #include <emscripten/threading.h>
 #include <pthread.h>
 #include "VideoBackends/WebGPU/WGPUBackend.h"
+#include "VideoBackends/WebGPU/WGPUContext.h"
 #endif
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/HW/GCKeyboard.h"
@@ -529,6 +531,137 @@ static u64 MurmurWork(u32 len, u32 samples)
   return 8ull * ((nblocks + step - 1) / step) + (len & 7);
 }
 
+// The GPU loop's counters (dolphin-web/patches/0018-fifo-loop-hooks.patch):
+// runs of its payload, those that found nothing (spins), the 32-byte
+// chunks run and the opcode-decoder runs they took, and the CP's enables
+// seen. --fifo-batch=N is what harness_fifo_batch returns.
+static std::atomic<u64> g_fifo_payloads{0}, g_fifo_spins{0}, g_fifo_chunks{0},
+    g_fifo_batches{0};
+static std::atomic<u32> g_fifo_enables{0};
+static u32 g_fifo_batch = 1;
+static bool g_skip_vertex_convert = false;
+extern "C" bool harness_skip_vertex_convert()
+{
+  return g_skip_vertex_convert;
+}
+// --vertex-stats: vertices per vertex format over the run (GPU thread),
+// printed at the end. The key is the format's VCD and VAT words.
+static bool g_vertex_stats = false;
+struct VertexFormatTally
+{
+  u64 vertices = 0, runs = 0;
+  u32 raw_size = 0, stride = 0;
+};
+static std::mutex g_vertex_tally_lock;
+static std::map<std::array<u32, 5>, VertexFormatTally> g_vertex_tally;
+extern "C" void harness_vertex_run(u32 desc_low, u32 desc_high, u32 g0, u32 g1, u32 g2,
+                                   u32 raw_size, u32 stride, int count)
+{
+  if (!g_vertex_stats)
+    return;
+  std::lock_guard<std::mutex> lk(g_vertex_tally_lock);
+  VertexFormatTally& t = g_vertex_tally[{desc_low, desc_high, g0, g1, g2}];
+  t.vertices += static_cast<u64>(count);
+  ++t.runs;
+  t.raw_size = raw_size;
+  t.stride = stride;
+}
+static void PrintVertexTally()
+{
+  std::lock_guard<std::mutex> lk(g_vertex_tally_lock);
+  std::vector<std::pair<std::array<u32, 5>, VertexFormatTally>> rows(g_vertex_tally.begin(),
+                                                                     g_vertex_tally.end());
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.second.vertices > b.second.vertices; });
+  u64 total = 0;
+  for (const auto& r : rows)
+    total += r.second.vertices;
+  std::printf("  vertices  %llu over the run in %zu formats; the top ones (index mode per "
+              "attribute: - none, D direct, 8/6 index 8/16; VAT formats as Dolphin's enums)\n",
+              static_cast<unsigned long long>(total), rows.size());
+  auto mode = [](u32 v) { return "-D86"[v & 3]; };
+  int shown = 0;
+  for (const auto& [key, t] : rows)
+  {
+    if (shown++ == 12)
+      break;
+    TVtxDesc desc;
+    desc.low.Hex = key[0];
+    desc.high.Hex = key[1];
+    VAT vat;
+    vat.g0.Hex = key[2];
+    vat.g1.Hex = key[3];
+    vat.g2.Hex = key[4];
+    std::printf("  vertices  %5.1f%%  %10llu in %7llu runs  raw %2u -> %2u bytes  pos %c "
+                "fmt %u x%u  nrm %c fmt %u  col %c%c comp %u/%u  tex %c%c%c%c fmt %u x%u  "
+                "vcd %08x %08x vat %08x %08x %08x\n",
+                100.0 * t.vertices / total, static_cast<unsigned long long>(t.vertices),
+                static_cast<unsigned long long>(t.runs), t.raw_size, t.stride,
+                mode(static_cast<u32>(desc.low.Position.Value())),
+                static_cast<u32>(vat.g0.PosFormat.Value()),
+                static_cast<u32>(vat.g0.PosElements.Value()) + 2,
+                mode(static_cast<u32>(desc.low.Normal.Value())),
+                static_cast<u32>(vat.g0.NormalFormat.Value()),
+                mode(static_cast<u32>(desc.low.Color0.Value())),
+                mode(static_cast<u32>(desc.low.Color1.Value())),
+                static_cast<u32>(vat.g0.Color0Comp.Value()),
+                static_cast<u32>(vat.g0.Color1Comp.Value()),
+                mode(static_cast<u32>(desc.high.Tex0Coord.Value())),
+                mode(static_cast<u32>(desc.high.Tex1Coord.Value())),
+                mode(static_cast<u32>(desc.high.Tex2Coord.Value())),
+                mode(static_cast<u32>(desc.high.Tex3Coord.Value())),
+                static_cast<u32>(vat.g0.Tex0CoordFormat.Value()),
+                static_cast<u32>(vat.g0.Tex0CoordElements.Value()) + 1, key[0], key[1], key[2],
+                key[3], key[4]);
+  }
+}
+extern "C" void harness_fifo_loop(u32 chunks, u32 batches, u32 enables)
+{
+  g_fifo_payloads.fetch_add(1, std::memory_order_relaxed);
+  if (chunks == 0)
+    g_fifo_spins.fetch_add(1, std::memory_order_relaxed);
+  g_fifo_chunks.fetch_add(chunks, std::memory_order_relaxed);
+  g_fifo_batches.fetch_add(batches, std::memory_order_relaxed);
+  if (enables)
+    g_fifo_enables.fetch_or(enables, std::memory_order_relaxed);
+}
+extern "C" u32 harness_fifo_batch()
+{
+  return g_fifo_batch;
+}
+static u32 g_fifo_spin_limit = 0;
+extern "C" u32 harness_fifo_spin_limit()
+{
+  return g_fifo_spin_limit;
+}
+
+// The CPU thread's idle syncs (CoreTiming::Idle -> FlushGpu): how many,
+// and how long each waited for the GPU thread, in buckets of microseconds.
+// Read at the window's edges by main.
+// --idle-stats turns the timing on (two performance.now() calls per sync,
+// 38,000 a second in gameplay: about half a percent).
+static bool g_idle_stats = false;
+static u64 g_idle_n = 0;
+static double g_idle_ms = 0, g_idle_longest_ms = 0;
+static u64 g_idle_bucket[5] = {};  // <= 5 us (no wait), <= 50, <= 500, <= 2000, more
+// For the waits over 2 ms: the FIFO's backlog (CPReadWriteDistance) as
+// the CPU thread entered them.
+static u64 g_idle_long_n = 0, g_idle_long_backlog = 0, g_idle_long_backlog_max = 0;
+static void NoteIdleWait(double ms, u32 backlog)
+{
+  ++g_idle_n;
+  g_idle_ms += ms;
+  g_idle_longest_ms = std::max(g_idle_longest_ms, ms);
+  const double us = ms * 1000.0;
+  ++g_idle_bucket[us <= 5 ? 0 : us <= 50 ? 1 : us <= 500 ? 2 : us <= 2000 ? 3 : 4];
+  if (us > 2000)
+  {
+    ++g_idle_long_n;
+    g_idle_long_backlog += backlog;
+    g_idle_long_backlog_max = std::max<u64>(g_idle_long_backlog_max, backlog);
+  }
+}
+
 extern "C" void harness_texture_hash(int site, u32 len, u32 samples, u32 rows)
 {
   if (!g_texhash_on || site < 0 || site >= kTexHashSites)
@@ -825,12 +958,16 @@ int main(int argc, char** argv)
   bool want_dolphin_video_config = true;
   bool want_dump_shaders = false;
   bool want_webgpu = false;
+  bool want_webgpu_per_draw = false;
+  bool want_webgpu_no_upload = false;
+  bool want_webgpu_no_draws = false;
   bool want_osd = true;
   std::string fifo_path;
   u64 record_fifo_at = 0;  // --record-fifo=TICKS
   bool want_xfb_to_ram = false;
   bool want_true_color = true;
   bool want_sync_idle = true;
+  int sync_gpu_ticks = 0;
   bool want_nunchuk = true;
   bool want_disc_files = false;
   u64 gx_from = 0;      // --gx-from=TICKS: arm the GX capture at this emulated time
@@ -1014,6 +1151,21 @@ int main(int argc, char** argv)
     // Null backend. Needs a WEBGPU=1 build.
     else if (std::strcmp(argv[i], "--webgpu") == 0)
       want_webgpu = true;
+    // --webgpu-per-draw: the WebGPU backend's M1 path, a bind group made
+    // and every buffer write sent per draw, to measure M4's against
+    // (docs/PHASE3-WEBGPU.md M4).
+    else if (std::strcmp(argv[i], "--webgpu-per-draw") == 0)
+      want_webgpu_per_draw = true;
+    // --webgpu-no-upload: the backend writes nothing to its buffers (the
+    // draws read stale data). What the uploads cost -- on the GPU thread,
+    // and on the CPU thread through the caches (docs/PHASE3-WEBGPU.md M4).
+    else if (std::strcmp(argv[i], "--webgpu-no-upload") == 0)
+      want_webgpu_no_upload = true;
+    // --webgpu-no-draws: the backend records no draws (frames stay blank).
+    // What the draws cost, and what Chrome's GPU-side work costs the CPU
+    // thread.
+    else if (std::strcmp(argv[i], "--webgpu-no-draws") == 0)
+      want_webgpu_no_draws = true;
     // --fifo=FILE: replay a FIFO capture (.dff) with Dolphin's FifoPlayer
     // instead of running the game: the same GX commands and memory, frame
     // for frame, whatever the backend -- what docs/PHASE3-WEBGPU.md M3
@@ -1047,6 +1199,36 @@ int main(int argc, char** argv)
     // bounds how far ahead the CPU can get.
     else if (std::strcmp(argv[i], "--no-sync-idle") == 0)
       want_sync_idle = false;
+    // --fifo-batch=N: the GPU thread runs up to N 32-byte FIFO chunks
+    // through the opcode decoder per CP status update, instead of
+    // Dolphin's one (dolphin-web/patches/0018-fifo-loop-hooks.patch; for
+    // docs/PHASE3-WEBGPU.md M4).
+    else if (std::strncmp(argv[i], "--fifo-batch=", 13) == 0)
+      g_fifo_batch = static_cast<u32>(std::strtoul(argv[i] + 13, nullptr, 0));
+    // --gpu-spin=N: the GPU loop sleeps after N runs that found nothing
+    // (patch 0018), instead of spinning until SystemTimers' 1 kHz tick.
+    // The spin holds a core; this measures what that costs the CPU thread.
+    else if (std::strncmp(argv[i], "--gpu-spin=", 11) == 0)
+      g_fifo_spin_limit = static_cast<u32>(std::strtoul(argv[i] + 11, nullptr, 0));
+    // --idle-stats: time every idle sync with the GPU thread and report
+    // them for the window (the "idle" line).
+    else if (std::strcmp(argv[i], "--idle-stats") == 0)
+      g_idle_stats = true;
+    // --skip-vertex-convert: the vertex loader converts nothing (patch
+    // 0019); draws go out with stale vertex data. For measuring what the
+    // loader costs, with a backend that draws nothing.
+    else if (std::strcmp(argv[i], "--skip-vertex-convert") == 0)
+      g_skip_vertex_convert = true;
+    // --vertex-stats: vertices per vertex format over the run, at the end.
+    else if (std::strcmp(argv[i], "--vertex-stats") == 0)
+      g_vertex_stats = true;
+    // --sync-gpu=TICKS: Dolphin's "SyncGPU" (MAIN_SYNC_GPU): the CPU thread
+    // may run at most TICKS of emulated time ahead of the GPU thread's
+    // progress, as the opcode decoder estimates it, and blocks there --
+    // instead of, or as well as, stopping at every skipped idle loop. For
+    // docs/PHASE3-WEBGPU.md M4; with --no-sync-idle.
+    else if (std::strncmp(argv[i], "--sync-gpu=", 11) == 0)
+      sync_gpu_ticks = static_cast<int>(std::strtol(argv[i] + 11, nullptr, 0));
     // --no-nunchuk: leave the Wiimote without an extension. The game asks
     // for a Nunchuk before it will go anywhere, so one is attached by
     // default; this is for comparing against baselines recorded without.
@@ -1349,6 +1531,13 @@ int main(int argc, char** argv)
   //     the FIFO is consumed.
   Config::SetCurrent(Config::MAIN_CPU_THREAD, want_dual_core);
   Config::SetCurrent(Config::MAIN_SYNC_ON_SKIP_IDLE, want_sync_idle);
+  if (sync_gpu_ticks > 0)
+  {
+    Config::SetCurrent(Config::MAIN_SYNC_GPU, true);
+    Config::SetCurrent(Config::MAIN_SYNC_GPU_MAX_DISTANCE, sync_gpu_ticks);
+    Config::SetCurrent(Config::MAIN_SYNC_GPU_MIN_DISTANCE, -sync_gpu_ticks);
+    Config::SetCurrent(Config::MAIN_SYNC_GPU_OVERCLOCK, 1.0f);
+  }
 
   // 1c. Null video backend. It registers the CP/PE MMIO the game writes to
   //     and consumes the FIFO, but rasterises nothing -- which is exactly the
@@ -1622,6 +1811,9 @@ int main(int argc, char** argv)
     g_Config.Refresh();
     g_backend_info = {};
     g_video_backend = &webgpu_backend;
+    WebGPU::g_context.fast_path = !want_webgpu_per_draw;
+    WebGPU::g_context.no_upload = want_webgpu_no_upload;
+    WebGPU::g_context.no_draws = want_webgpu_no_draws;
     g_backend_info.DisplayName = g_video_backend->GetDisplayName();
     g_video_backend->InitBackendInfo(wsi);
     g_Config.VerifyValidity();
@@ -2769,7 +2961,24 @@ int main(int argc, char** argv)
       const int rest = state.downcount;
       if (rest > 0)
       {
+#if defined(__EMSCRIPTEN__)
+        if (g_idle_stats)
+        {
+          const u32 backlog = Core::System::GetInstance()
+                                  .GetCommandProcessor()
+                                  .GetFifo()
+                                  .CPReadWriteDistance.load(std::memory_order_relaxed);
+          const double idle_t0 = JitNow();
+          jit_timing.Idle();
+          NoteIdleWait(JitNow() - idle_t0, backlog);
+        }
+        else
+        {
+          jit_timing.Idle();
+        }
+#else
         jit_timing.Idle();
+#endif
         jit_idled_ticks += static_cast<u64>(rest);
       }
     }
@@ -2889,6 +3098,8 @@ int main(int argc, char** argv)
   // no instruction count can.
   u64 next_thumb = xfb_every;
   bool window_open = false;
+  u64 window_idle_n0 = 0, window_idle_bucket0[5] = {}, window_fifo0[4] = {};
+  double window_idle_ms0 = 0;
   double window_t0 = 0.0;
   u64 window_exec0 = 0;
   s64 window_ticks0 = 0;
@@ -3125,6 +3336,15 @@ int main(int argc, char** argv)
 #endif
         window_exec0 = executed;
         window_ticks0 = system.GetCoreTiming().GetTicks();
+        window_idle_n0 = g_idle_n;
+        window_idle_ms0 = g_idle_ms;
+        g_idle_long_n = g_idle_long_backlog = g_idle_long_backlog_max = 0;
+        std::copy(std::begin(g_idle_bucket), std::end(g_idle_bucket), window_idle_bucket0);
+        g_idle_longest_ms = 0;
+        window_fifo0[0] = g_fifo_payloads.load();
+        window_fifo0[1] = g_fifo_spins.load();
+        window_fifo0[2] = g_fifo_chunks.load();
+        window_fifo0[3] = g_fifo_batches.load();
         window_frames0 = frames;
         window_texhash0 = TexHashNow();
       }
@@ -3189,6 +3409,31 @@ int main(int argc, char** argv)
                   "%.1f%% of real time, %.1f frames per emulated second\n",
                   speed_from / 729e6, wms, (executed - window_exec0) / (wms / 1000.0) / 1e6, wemu,
                   100.0 * wemu / (wms / 1000.0), wemu > 0 ? (frames - window_frames0) / wemu : 0.0);
+      const u64 idle_n = g_idle_n - window_idle_n0;
+      const double idle_ms = g_idle_ms - window_idle_ms0;
+      if (g_idle_stats)
+      std::printf("  idle      %llu idle syncs, waited %.0f ms (%.1f%% of the window), longest "
+                  "%.2f ms; <=5us %llu, <=50us %llu, <=500us %llu, <=2ms %llu, more %llu\n",
+                  static_cast<unsigned long long>(idle_n), idle_ms, 100.0 * idle_ms / wms,
+                  g_idle_longest_ms,
+                  static_cast<unsigned long long>(g_idle_bucket[0] - window_idle_bucket0[0]),
+                  static_cast<unsigned long long>(g_idle_bucket[1] - window_idle_bucket0[1]),
+                  static_cast<unsigned long long>(g_idle_bucket[2] - window_idle_bucket0[2]),
+                  static_cast<unsigned long long>(g_idle_bucket[3] - window_idle_bucket0[3]),
+                  static_cast<unsigned long long>(g_idle_bucket[4] - window_idle_bucket0[4]));
+      if (g_idle_stats && g_idle_long_n)
+        std::printf("  idle      the %llu waits over 2 ms entered with a FIFO backlog of %.0f KB "
+                    "on average, %.0f KB at most\n",
+                    static_cast<unsigned long long>(g_idle_long_n),
+                    g_idle_long_backlog / 1024.0 / g_idle_long_n, g_idle_long_backlog_max / 1024.0);
+      const double fp = (g_fifo_payloads.load() - window_fifo0[0]) / wemu;
+      const double fs = (g_fifo_spins.load() - window_fifo0[1]) / wemu;
+      const double fc = (g_fifo_chunks.load() - window_fifo0[2]) / wemu;
+      const double fb = (g_fifo_batches.load() - window_fifo0[3]) / wemu;
+      std::printf("  fifo      per emulated second: GPU loop runs %.0f (%.0f found nothing), "
+                  "decoder runs %.0f over %.0f chunks (%.0f KB); CP enables seen %u "
+                  "(1 breakpoint, 2 high watermark, 4 low)\n",
+                  fp, fs, fb, fc, fc * 32 / 1024, g_fifo_enables.load());
     }
   }
 #endif
@@ -3474,6 +3719,8 @@ int main(int argc, char** argv)
   // Is anything draining the FIFO? If CPReadWriteDistance only grows, the GPU
   // side never ran and a game waiting for FIFO space would stall -- a very
   // different diagnosis from a game waiting on an interrupt.
+  if (g_vertex_stats)
+    PrintVertexTally();
   std::printf("  fifo state  rwdist=%u rd=%08x wr=%08x base=%08x end=%08x gpread=%u\n",
               fifo.CPReadWriteDistance.load(), fifo.CPReadPointer.load(),
               fifo.CPWritePointer.load(), fifo.CPBase.load(), fifo.CPEnd.load(),

@@ -44,6 +44,17 @@ struct Context
   u32 surface_width = 0;
   u32 surface_height = 0;
   bool has_unorm16 = false;
+  // docs/PHASE3-WEBGPU.md M4: bind groups made once and reused, uniform
+  // blocks bound at dynamic offsets, state a pass already has not set
+  // again, and buffer writes gathered into one per buffer per submit.
+  // False is M1's path -- everything per draw -- kept to measure against.
+  bool fast_path = true;
+  // Measurement only: no buffer writes at all, so the draws read whatever
+  // the buffers hold. What the uploads cost, on either thread.
+  bool no_upload = false;
+  // Measurement only: draws are not recorded (nothing reaches the GPU
+  // process but passes, copies and the present).
+  bool no_draws = false;
 
   // The one layout every render pipeline shares (WGPUShader.h has the
   // numbering): group 0 the three uniform blocks, group 1 eight textures
@@ -81,6 +92,24 @@ struct Context
 };
 
 extern Context g_context;
+
+// Counters for docs/PHASE3-WEBGPU.md M4, printed every 600 presents.
+struct Stats
+{
+  u64 presents = 0;
+  u64 maps = 0;          // staging readbacks: EFB peeks, copies to RAM
+  double map_ms = 0;     // time the GPU thread spent blocked on them
+  u64 submits = 0;
+  u64 write_buffers = 0;
+  u64 write_bytes = 0;
+  u64 bind_groups = 0;   // created
+  u64 bind_group_sets = 0;
+  u64 texture_group_clears = 0;
+  u64 draws = 0;
+  double yield_ms = 0;
+   // time in the per-present yield
+};
+extern Stats g_stats_wgpu;
 
 // Let the browser have this worker for one turn of its event loop. A
 // canvas owned by a worker shows a frame only once the worker's task ends,

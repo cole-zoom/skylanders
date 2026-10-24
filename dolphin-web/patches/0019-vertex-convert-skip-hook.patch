@@ -1,0 +1,62 @@
+diff --git a/Source/Core/VideoCommon/VertexLoaderManager.cpp b/Source/Core/VideoCommon/VertexLoaderManager.cpp
+index e3d3b9f..36346c2 100644
+--- a/Source/Core/VideoCommon/VertexLoaderManager.cpp
++++ b/Source/Core/VideoCommon/VertexLoaderManager.cpp
+@@ -33,6 +33,33 @@
+ #include "VideoCommon/VideoConfig.h"
+ #include "VideoCommon/XFMemory.h"
+ 
++// Harness experiment hook (weak), for docs/PHASE3-WEBGPU.md M4: when it
++// returns true, RunVertices advances over the FIFO's vertices and emits
++// the draw as it would, but converts nothing -- the vertex buffer holds
++// whatever it held. Only meaningful with a backend that draws nothing; it
++// measures what the vertex loader costs the GPU thread.
++//
++// Weak DEFINITION, not a weak declaration: see TextureCacheBase.cpp.
++extern "C" __attribute__((weak)) bool harness_skip_vertex_convert()
++{
++  return false;
++}
++// And a tally hook: each primitive's vertex format (the VCD and VAT words,
++// the raw and native vertex sizes) and its vertex count.
++extern "C" __attribute__((weak)) void harness_vertex_run(u32 desc_low, u32 desc_high, u32 g0,
++                                                         u32 g1, u32 g2, u32 raw_size,
++                                                         u32 stride, int count)
++{
++  (void)desc_low;
++  (void)desc_high;
++  (void)g0;
++  (void)g1;
++  (void)g2;
++  (void)raw_size;
++  (void)stride;
++  (void)count;
++}
++
+ namespace VertexLoaderManager
+ {
+ // Used by zfreeze
+@@ -444,6 +471,12 @@ int RunVertices(int vtx_attr_group, OpcodeDecoder::Primitive primitive, int coun
+                           primitive < OpcodeDecoder::Primitive::GX_DRAW_LINES);
+ 
+     const int stride = loader->m_native_vtx_decl.stride;
++    {
++      const VAT& vat = g_main_cp_state.vtx_attr[vtx_attr_group];
++      harness_vertex_run(g_main_cp_state.vtx_desc.low.Hex, g_main_cp_state.vtx_desc.high.Hex,
++                         vat.g0.Hex, vat.g1.Hex, vat.g2.Hex, loader->m_vertex_size, stride,
++                         count);
++    }
+     do
+     {
+       const int max_vertices = 16380;  // Max is 16383, but 16380 is divisible by both 4 and 3
+@@ -452,7 +485,9 @@ int RunVertices(int vtx_attr_group, OpcodeDecoder::Primitive primitive, int coun
+       DataReader dst = g_vertex_manager->PrepareForAdditionalData(primitive, run, stride,
+                                                                   cullall || can_cpu_cull);
+ 
+-      const int num_loaded = loader->RunVertices(src, dst.GetPointer(), run);
++      const int num_loaded = harness_skip_vertex_convert() ?
++                                 run :
++                                 loader->RunVertices(src, dst.GetPointer(), run);
+       src += loader->m_vertex_size * max_vertices;
+ 
+       if (can_cpu_cull && !cullall)

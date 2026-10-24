@@ -36,8 +36,11 @@ public:
   // One layer and level, as a render pass attaches it.
   wgpu::TextureView CreateAttachmentView(u32 layer, u32 level) const;
   bool IsDepth() const { return IsDepthFormat(m_config.format); }
+  // Never reused, unlike the address: what Gfx's bind group cache keys on.
+  u64 GetId() const { return m_id; }
 
 private:
+  u64 m_id;
   wgpu::Texture m_texture;
   wgpu::TextureView m_sample_view;
 };

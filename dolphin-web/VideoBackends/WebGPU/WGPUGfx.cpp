@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include <emscripten.h>
+
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
 #include "VideoCommon/VideoConfig.h"
@@ -66,6 +68,37 @@ u64 StreamBuffer::Allocate(u64 bytes, u64 alignment)
   return at;
 }
 
+void StreamBuffer::Write(u64 at, const void* data, u64 bytes)
+{
+  g_stats_wgpu.write_bytes += bytes;
+  if (g_context.no_upload)
+    return;
+  if (!g_context.fast_path)
+  {
+    g_context.queue.WriteBuffer(buffer, at, data, bytes);
+    g_stats_wgpu.write_buffers++;
+    return;
+  }
+  // Behind what is gathered: only after a wrap, which submitted it, so
+  // this cannot happen -- but if it did, the gathered range goes first.
+  if (!m_pending.empty() && at < m_pending_at + m_pending.size())
+    FlushWrites();
+  if (m_pending.empty())
+    m_pending_at = at;
+  const u64 from = at - m_pending_at;
+  m_pending.resize(from + bytes);
+  std::memcpy(m_pending.data() + from, data, bytes);
+}
+
+void StreamBuffer::FlushWrites()
+{
+  if (m_pending.empty())
+    return;
+  g_context.queue.WriteBuffer(buffer, m_pending_at, m_pending.data(), m_pending.size());
+  g_stats_wgpu.write_buffers++;
+  m_pending.clear();
+}
+
 Gfx::Gfx()
 {
   // g_ActiveConfig is what VideoCommon reads from here on (sample counts,
@@ -74,6 +107,20 @@ Gfx::Gfx()
   m_vertices.Create(kVertexBufferSize, wgpu::BufferUsage::Vertex, "vertices");
   m_indices.Create(kIndexBufferSize, wgpu::BufferUsage::Index, "indices");
   m_uniforms.Create(kUniformBufferSize, wgpu::BufferUsage::Uniform, "uniforms");
+  {
+    wgpu::BindGroupEntry entries[3] = {};
+    for (u32 i = 0; i < 3; ++i)
+    {
+      entries[i].binding = i;
+      entries[i].buffer = m_uniforms.buffer;
+      entries[i].size = kUniformWindow;
+    }
+    wgpu::BindGroupDescriptor desc{};
+    desc.layout = g_context.uniform_layout;
+    desc.entryCount = 3;
+    desc.entries = entries;
+    m_uniform_group = g_context.device.CreateBindGroup(&desc);
+  }
 
   // What an unbound texture slot samples.
   wgpu::TextureDescriptor tdesc{};
@@ -229,6 +276,8 @@ void Gfx::BeginPass()
   }
   m_clear_pending = false;
   m_pass = m_encoder.BeginRenderPass(&desc);
+  m_pass_pipeline = nullptr;
+  m_pass_state_set = false;
   // A pass starts with the viewport and scissor at their defaults.
   SetViewport(m_viewport[0], m_viewport[1], m_viewport[2], m_viewport[3], m_viewport[4],
               m_viewport[5]);
@@ -246,10 +295,15 @@ void Gfx::EndPass()
 void Gfx::Flush()
 {
   EndPass();
+  // Queue writes land before any command buffer submitted after them.
+  m_vertices.FlushWrites();
+  m_indices.FlushWrites();
+  m_uniforms.FlushWrites();
   if (!m_encoder)
     return;
   wgpu::CommandBuffer commands = m_encoder.Finish();
   g_context.queue.Submit(1, &commands);
+  g_stats_wgpu.submits++;
   m_encoder = nullptr;
 }
 
@@ -335,6 +389,18 @@ void Gfx::SetSamplerState(u32 index, const SamplerState& state)
     m_samplers[index] = state;
 }
 
+void Gfx::ForgetTexture(const Texture* texture)
+{
+  // Rare (the texture cache keeps its textures for reuse), so the whole
+  // cache goes rather than a search of it.
+  if (!m_texture_groups.empty())
+  {
+    m_texture_groups.clear();
+    g_stats_wgpu.texture_group_clears++;
+  }
+  m_pass_state_set = false;
+}
+
 void Gfx::UnbindTexture(const AbstractTexture* texture)
 {
   for (const Texture*& t : m_textures)
@@ -383,7 +449,7 @@ u64 Gfx::WriteUniforms(const void* data, u32 size)
   // Room for the whole window a binding covers, past the data itself.
   const u64 at = m_uniforms.Allocate(std::max<u64>(size, kUniformWindow), kUniformAlignment);
   m_uniforms.offset = at + Align(size, kUniformAlignment);
-  g_context.queue.WriteBuffer(m_uniforms.buffer, at, data, Align(size, 4));
+  m_uniforms.Write(at, data, Align(size, 4));
   return at;
 }
 
@@ -401,72 +467,140 @@ bool Gfx::PrepareDraw()
 {
   if (!m_pipeline || !m_framebuffer)
     return false;
+
+  // The shared layout (WGPUContext.h): every texture slot, whether this
+  // pipeline's shaders use it or not.
+  std::array<const Texture*, 8> textures;
+  TextureGroupKey key;
+  for (u32 i = 0; i < 8; ++i)
+  {
+    const Texture* t = m_textures[i];
+    // Every slot is bound, used or not, so one still holding a texture
+    // this pass renders to would make the pass both write and sample it,
+    // which WebGPU rejects. No shader samples its own target; such a
+    // slot is stale.
+    if (t && (t == m_framebuffer->GetColorAttachment() ||
+              t == m_framebuffer->GetDepthAttachment()))
+    {
+      t = nullptr;
+    }
+    if (t && t->IsDepth())
+    {
+      // A float texture binding cannot take a depth texture; the depth
+      // paths are M2's (docs/PHASE3-WEBGPU.md).
+      return false;
+    }
+    textures[i] = t;
+    key[i] = t ? t->GetId() : 0;
+    key[8 + i] = m_samplers[i].Hex();
+  }
+  std::array<u32, 3> uniforms;
+  for (u32 i = 0; i < 3; ++i)
+    uniforms[i] = static_cast<u32>(m_pipeline->IsUtility() ? m_utility_uniform : m_gx_uniform[i]);
+
   BeginPass();
   if (!m_pass)
     return false;
-  m_pass.SetPipeline(m_pipeline->GetPipeline());
+  const bool fast = g_context.fast_path;
+  const bool state_set = fast && m_pass_state_set;
 
-  // The shared layout (WGPUContext.h): every uniform block and every
-  // texture slot, whether this pipeline's shaders use it or not.
+  if (!fast || m_pass_pipeline != m_pipeline)
+  {
+    m_pass.SetPipeline(m_pipeline->GetPipeline());
+    m_pass_pipeline = m_pipeline;
+  }
+
+  if (fast)
+  {
+    if (!state_set || uniforms != m_pass_uniforms)
+    {
+      m_pass.SetBindGroup(0, m_uniform_group, 3, uniforms.data());
+      g_stats_wgpu.bind_group_sets++;
+    }
+  }
+  else
   {
     wgpu::BindGroupEntry entries[3] = {};
     for (u32 i = 0; i < 3; ++i)
     {
       entries[i].binding = i;
       entries[i].buffer = m_uniforms.buffer;
-      entries[i].offset = m_pipeline->IsUtility() ? m_utility_uniform : m_gx_uniform[i];
+      entries[i].offset = uniforms[i];
       entries[i].size = kUniformWindow;
     }
     wgpu::BindGroupDescriptor desc{};
     desc.layout = g_context.uniform_layout;
     desc.entryCount = 3;
     desc.entries = entries;
-    m_pass.SetBindGroup(0, g_context.device.CreateBindGroup(&desc));
+    const u32 zero[3] = {};
+    m_pass.SetBindGroup(0, g_context.device.CreateBindGroup(&desc), 3, zero);
+    g_stats_wgpu.bind_groups++;
+    g_stats_wgpu.bind_group_sets++;
   }
+
+  if (!state_set || key != m_pass_textures)
   {
-    wgpu::BindGroupEntry entries[16] = {};
-    for (u32 i = 0; i < 8; ++i)
+    wgpu::BindGroup group;
+    auto it = fast ? m_texture_groups.find(key) : m_texture_groups.end();
+    if (it != m_texture_groups.end())
     {
-      const Texture* t = m_textures[i];
-      // Every slot is bound, used or not, so one still holding a texture
-      // this pass renders to would make the pass both write and sample it,
-      // which WebGPU rejects. No shader samples its own target; such a
-      // slot is stale.
-      if (t && (t == m_framebuffer->GetColorAttachment() ||
-                t == m_framebuffer->GetDepthAttachment()))
-      {
-        t = nullptr;
-      }
-      if (t && t->IsDepth())
-      {
-        // A float texture binding cannot take a depth texture; the depth
-        // paths are M2's (docs/PHASE3-WEBGPU.md).
-        return false;
-      }
-      entries[i].binding = i;
-      entries[i].textureView = (t ? t : m_null_texture.get())->GetSampleView();
-      entries[8 + i].binding = kSamplerBase + i;
-      entries[8 + i].sampler = GetSampler(m_samplers[i]);
+      group = it->second;
     }
-    wgpu::BindGroupDescriptor desc{};
-    desc.layout = g_context.texture_layout;
-    desc.entryCount = 16;
-    desc.entries = entries;
-    m_pass.SetBindGroup(1, g_context.device.CreateBindGroup(&desc));
+    else
+    {
+      wgpu::BindGroupEntry entries[16] = {};
+      for (u32 i = 0; i < 8; ++i)
+      {
+        entries[i].binding = i;
+        entries[i].textureView = (textures[i] ? textures[i] : m_null_texture.get())->GetSampleView();
+        entries[8 + i].binding = kSamplerBase + i;
+        entries[8 + i].sampler = GetSampler(m_samplers[i]);
+      }
+      wgpu::BindGroupDescriptor desc{};
+      desc.layout = g_context.texture_layout;
+      desc.entryCount = 16;
+      desc.entries = entries;
+      group = g_context.device.CreateBindGroup(&desc);
+      g_stats_wgpu.bind_groups++;
+      if (fast)
+      {
+        // Bounded: a group holds its textures alive.
+        if (m_texture_groups.size() >= 4096)
+        {
+          m_texture_groups.clear();
+          g_stats_wgpu.texture_group_clears++;
+        }
+        m_texture_groups.emplace(key, group);
+      }
+    }
+    m_pass.SetBindGroup(1, group);
+    g_stats_wgpu.bind_group_sets++;
   }
-  m_pass.SetVertexBuffer(0, m_vertices.buffer);
-  m_pass.SetIndexBuffer(m_indices.buffer, wgpu::IndexFormat::Uint16);
+
+  if (!state_set)
+  {
+    m_pass.SetVertexBuffer(0, m_vertices.buffer);
+    m_pass.SetIndexBuffer(m_indices.buffer, wgpu::IndexFormat::Uint16);
+  }
+  m_pass_uniforms = uniforms;
+  m_pass_textures = key;
+  m_pass_state_set = true;
+  g_stats_wgpu.draws++;
   return true;
 }
 
 void Gfx::Draw(u32 base_vertex, u32 num_vertices)
 {
+  if (g_context.no_draws)
+    return;
   if (PrepareDraw())
     m_pass.Draw(num_vertices, 1, base_vertex, 0);
 }
 
 void Gfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
 {
+  if (g_context.no_draws)
+    return;
   if (PrepareDraw())
     m_pass.DrawIndexed(num_indices, 1, base_index, static_cast<s32>(base_vertex), 0);
 }
@@ -494,7 +628,23 @@ void Gfx::PresentBackbuffer()
   }
   Flush();
   // The frame reaches the canvas once this worker's task ends.
+  const double t0 = emscripten_get_now();
   YieldToBrowser();
+  Stats& st = g_stats_wgpu;
+  st.yield_ms += emscripten_get_now() - t0;
+  if (++st.presents % 600 == 0)
+  {
+    const double f = 600.0;
+    WGPU_LOG("stats/frame: maps {:.2f} ({:.3f} ms wait), submits {:.1f}, writeBuffer {:.0f} "
+             "({:.0f} KB), bind groups {:.0f} made {:.0f} set ({:.2f} cache clears), draws {:.0f}, "
+             "yield {:.3f} ms",
+             st.maps / f, st.map_ms / f, st.submits / f, st.write_buffers / f,
+             st.write_bytes / f / 1024, st.bind_groups / f, st.bind_group_sets / f,
+             st.texture_group_clears / f, st.draws / f, st.yield_ms / f);
+    const u64 presents = st.presents;
+    st = {};
+    st.presents = presents;
+  }
 }
 
 SurfaceInfo Gfx::GetSurfaceInfo() const
