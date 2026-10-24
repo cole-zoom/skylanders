@@ -5,6 +5,8 @@
 
 #include <algorithm>
 
+#include <emscripten.h>
+
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
 
@@ -59,6 +61,8 @@ static wgpu::TextureAspect AspectOf(AbstractTextureFormat format)
 Texture::Texture(const TextureConfig& config, wgpu::Texture texture)
     : AbstractTexture(config), m_texture(std::move(texture))
 {
+  static u64 next_id = 1;
+  m_id = next_id++;
   wgpu::TextureViewDescriptor vdesc{};
   vdesc.dimension = wgpu::TextureViewDimension::e2DArray;
   vdesc.aspect = AspectOf(config.format);
@@ -68,7 +72,10 @@ Texture::Texture(const TextureConfig& config, wgpu::Texture texture)
 Texture::~Texture()
 {
   if (g_gfx)
+  {
     static_cast<Gfx*>(g_gfx.get())->UnbindTexture(this);
+    static_cast<Gfx*>(g_gfx.get())->ForgetTexture(this);
+  }
 }
 
 wgpu::TextureView Texture::CreateAttachmentView(u32 layer, u32 level) const
@@ -198,6 +205,7 @@ bool StagingTexture::Map()
     Flush();
   const bool read = m_type == StagingTextureType::Readback;
   bool ok = false;
+  const double t0 = emscripten_get_now();
   g_context.Wait(m_buffer.MapAsync(read ? wgpu::MapMode::Read : wgpu::MapMode::Write, 0,
                                    m_buffer.GetSize(), wgpu::CallbackMode::WaitAnyOnly,
                                    [&](wgpu::MapAsyncStatus status, wgpu::StringView message) {
@@ -207,6 +215,8 @@ bool StagingTexture::Map()
                                                      std::string_view(message.data,
                                                                       message.length));
                                    }));
+  g_stats_wgpu.maps++;
+  g_stats_wgpu.map_ms += emscripten_get_now() - t0;
   if (!ok)
     return false;
   m_map_pointer = read ? const_cast<char*>(static_cast<const char*>(
