@@ -16,6 +16,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+// Refuse to start while anything holds the ports. A Chrome or a server left
+// over from a killed run keeps them, the new ones fail to bind with their
+// stdio ignored, and this runner then attaches to the OLD page and reports
+// what it printed -- the same output for every run, whatever was built.
+// That cost two misleading A/Bs before this check.
+{
+  const { createServer } = await import('node:net');
+  for (const port of [8101, 8102, 9341]) {
+    const free = await new Promise(res => {
+      const srv = createServer().once('error', () => res(false))
+                                .once('listening', () => srv.close(() => res(true)));
+      srv.listen(port, '127.0.0.1');
+    });
+    if (!free) {
+      console.log(`port ${port} is in use -- a process from an earlier run? ` +
+                  `lsof -nP -iTCP:${port} -sTCP:LISTEN`);
+      process.exit(2);
+    }
+  }
+}
 const profile = mkdtempSync(join(tmpdir(), 'disc-'));
 // Absolute script paths: the page server runs with cwd=/tmp/bootweb so it
 // serves the built module, and a relative script path would be resolved
@@ -43,6 +64,14 @@ try {
   // therefore arrive here and nowhere else.
   chrome = spawn(CHROME, ['--headless', '--no-sandbox', '--remote-debugging-port=9341',
                           '--enable-logging=stderr', '--v=0',
+                          // WebGPU in headless Chrome (the WebGPU backend,
+                          // docs/PHASE3-WEBGPU.md); without it a WEBGPU=1
+                          // build's canvas setup failed at startup.
+                          '--enable-unsafe-webgpu',
+                          // Room for the whole 640x528 canvas: the default
+                          // headless viewport is shorter, and a screenshot
+                          // of what lies below it comes back white.
+                          '--window-size=1024,768',
                           `--user-data-dir=${profile}`, 'http://127.0.0.1:8102/index.html'],
                  { stdio: ['ignore', 'ignore', 'pipe'] });
   chrome.stderr.setEncoding('utf8');
@@ -141,14 +170,16 @@ try {
         var chunk = L.slice(${from}, ${from} + 4000);
         return JSON.stringify({ n: L.length, done: !!window.__done, stage: stage, chunk: chunk });
       })()` });
-    const v = r.result?.result?.value;
+    // A timed-out call resolves to null (see send()); that is a bad poll
+    // like any other, not a reason for the runner itself to die.
+    const v = r?.result?.result?.value;
     if (typeof v !== 'string') {
       // One bad poll is not a dead page -- at startup the document may not
       // have run its inline script yet. Only a sustained run of failures
       // means the page is actually gone (crash, OOM, navigation), and that
       // has to be reported rather than quietly yielding a partial trace.
-      const why = r.result?.exceptionDetails?.exception?.description
-               ?? r.result?.exceptionDetails?.text ?? JSON.stringify(r.result ?? null);
+      const why = r?.result?.exceptionDetails?.exception?.description
+               ?? r?.result?.exceptionDetails?.text ?? JSON.stringify(r?.result ?? null);
       if (++badPolls === 1) console.log(`poll failed (${i}): ${String(why).slice(0, 200)}`);
       if (badPolls > 20) {
         console.log(`PAGE LOST after ${out.length} lines (poll ${i})`);
@@ -200,5 +231,21 @@ try {
     if (i === 14399) console.log(`TIMEOUT (stage=[${stage}], ${from} lines)`);
   }
   console.log(out.join('\n'));
+  // SCREENSHOT=<file.png>: what the canvas shows at the end of the run --
+  // the last frame the WebGPU backend presented.
+  if (process.env.SCREENSHOT) {
+    const box = await send(9002, 'Runtime.evaluate', { returnByValue: true,
+      expression: 'JSON.stringify(document.getElementById("canvas").getBoundingClientRect())' });
+    console.log(`canvas box ${box?.result?.result?.value}`);
+    const shot = await send(9001, 'Page.captureScreenshot',
+      { format: 'png', clip: { x: 0, y: 0, width: 640, height: 528, scale: 1 } });
+    if (shot?.result?.data) {
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(process.env.SCREENSHOT, Buffer.from(shot.result.data, 'base64'));
+      console.log(`screenshot -> ${process.env.SCREENSHOT}`);
+    } else {
+      console.log('screenshot failed');
+    }
+  }
   ws.close();
 } finally { await cleanup(); }
