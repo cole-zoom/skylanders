@@ -49,6 +49,12 @@ struct Context
   // again, and buffer writes gathered into one per buffer per submit.
   // False is M1's path -- everything per draw -- kept to measure against.
   bool fast_path = true;
+  // Measurement only: no buffer writes at all, so the draws read whatever
+  // the buffers hold. What the uploads cost, on either thread.
+  bool no_upload = false;
+  // Measurement only: draws are not recorded (nothing reaches the GPU
+  // process but passes, copies and the present).
+  bool no_draws = false;
 
   // The one layout every render pipeline shares (WGPUShader.h has the
   // numbering): group 0 the three uniform blocks, group 1 eight textures

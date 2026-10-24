@@ -59,6 +59,11 @@ does not meet it; Dolphin's own default is dual core, and so is the
 plan's runtime. The margin is thin and a WebGPU backend will change the
 GPU thread's cost (§4.4), so the CPU thread (§4.3) is not finished work.
 
+*Since then (2026-10-24):* the WebGPU backend exists and draws the game
+(`docs/PHASE3-WEBGPU.md`, M1–M3 done); with it drawing, the gameplay
+window is 94%, and what the hand-off of §4.4 actually is has been
+measured — see that document's M4 section, which is the current plan.
+
 What the recompiler does today: compiled blocks are 99.9% of executed
 instructions; the hatch (an untranslated instruction calling the
 interpreter's handler in place) carries the rest, 1.4% over the 390-s
@@ -431,6 +436,15 @@ the idle rule to follow `bl` into a leaf (`trace_uncond` exists for the
 tracer) and to admit the `mfmsr`/`rlwinm`/`mtmsr` shape when only EE
 changes. In dual core the idle rule already catches the waits that
 matter, so this is a single-core item.
+
+*Outcome (2026-10-24).* Measured, in `docs/PHASE3-WEBGPU.md` M4: the
+CPU thread's waiting is one wait per 30-fps game frame, entered with the
+FIFO at its 240 KB high watermark — the game's FIFO-overflow wait, which
+"sync on skip idle" extends to a full drain — and the drain is mostly
+vertex conversion in the generic loader. The SyncGPU family was tried:
+pacing holds but the run is slower (the overflow wait becomes a spin the
+idle rule does not absorb). The GPU loop itself spins 17 million times a
+second between syncs and is not on the critical path.
 
 ### 4.5 Then Phase 3 proper: the WebGPU backend
 

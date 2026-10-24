@@ -285,22 +285,163 @@ Where the rest goes, from runs with parts of the backend switched off
 | draws not recorded and no buffer writes | 101.1% |
 | Null backend | 104.3% |
 
-The cost is latency, not throughput. The GPU thread is 59% busy and Chrome's
-GPU process about 11% of a core, so nothing is saturated, but the CPU thread
-waits for the GPU thread to drain the FIFO at every skipped idle loop
-(`SyncOnSkipIdle`; 95% of its waiting is in `CoreTiming::Idle`), so
-whatever the GPU thread does is on the critical path. What remains of it is
-spread thin: recording the draws (~3 points), copying 5.4 MB a frame into
-`writeBuffer` (~3.5; 3.7 MB of it vertices and indices, the rest uniform
-blocks, of which 80 of 322 vertex-shader uploads repeat the one before), and
-the rest (passes, texture uploads, the present). Under the profiler the GPU
-thread's own functions are within a point of the Null backend's --
-`SetCPStatusFromGPU` and the GPU loop's polling are ~22% of it under both.
+The cost is latency, not throughput: the GPU thread is 59% busy and
+Chrome's GPU process about 11% of a core, so nothing is saturated, but the
+CPU thread waits for the GPU thread at every skipped idle loop
+(`SyncOnSkipIdle`; 95% of its waiting is in `CoreTiming::Idle`). That first
+reading put the remainder down to the draws (~3 points), the buffer writes
+(~3.5) and the GPU loop's own overhead (~22% of the thread); the
+measurements below correct it.
 
-Next, in the order they would pay: making the GPU loop itself cheaper
-(Dolphin's, so it would speed the Null backend up too), and on the CPU
-thread the recompiler, which is 88% busy here; smaller, in this backend,
-uploading only the vertex-shader constants that changed.
+*What the gap is* (2026-10-24, later the same day). Instrumentation added
+for this, all in the tree: `--idle-stats` (times every idle sync of the CPU
+thread with the GPU thread and reports them for the window, with the FIFO
+backlog at the long ones; two `performance.now()` calls per sync, about
+half a percent), the `fifo` line (the GPU loop's runs, chunks and the CP's
+enables, from `dolphin-web/patches/0018-fifo-loop-hooks.patch`),
+`--fifo-batch=N` and `--gpu-spin=N` (the same patch), `--skip-vertex-convert`
+and `--vertex-stats` (`0019-vertex-convert-skip-hook.patch`),
+`--sync-gpu=TICKS`, `--webgpu-no-upload` and `--webgpu-no-draws`. The
+patched objects are rebuilt by hand (`PHASE3-HANDOFF.md` §5, the ninja
+regen trap). Gameplay window, dual core, one run each unless stated; runs
+vary ±3%, and the `frames` line (23,846 for this run) is the determinism
+check -- it held in every run below. "Own time" is the window's wall clock
+minus the waiting: the CPU thread's time for the same 36 billion guest
+instructions.
+
+| run | window | waited | own time |
+|---|---|---|---|
+| Null | 106.1% | 10.7% | 84.2 s |
+| Null, vertex conversion skipped | **115.0%** | -- | -- |
+| Null, GPU loop sleeps after 1,000 empty runs | 102.8% | 10.2% | 87.4 s |
+| WebGPU | 93.1% (94.2–94.5 without `--idle-stats`) | 11.8% | 94.7 s |
+| WebGPU, vertex conversion skipped | **97.4%** | 5.4% | 97.1 s |
+| WebGPU, no buffer uploads | 91.1% | 11.0% | 97.7 s |
+| WebGPU, no draws recorded | 90.3% | 11.2% | 98.3 s |
+| WebGPU, GPU loop sleeps after 1,000 / 100 empty runs | 92.2% / 82.2% | 11.5% / 10.4% | 96.0 / 109 s |
+| WebGPU, FIFO chunks batched 64 / 2,048 per status update | 94.8% / 92.3% | | |
+| Null, SyncGPU 200,000 / 2,000,000 ticks, no sync on idle | 97.8% / 101.7% | 1.1% / 1.7% | 101 / 97 s |
+
+**The waiting is one wait per game frame, for a full FIFO to drain.** The
+CPU thread makes 37,850 idle syncs an emulated second and 99.8% of them
+find the GPU thread already done (≤5 µs). About 30 a second -- one per
+30-fps game frame -- wait 2 to 13 ms, and those are all of the 11.8%.
+Every one of them begins with the FIFO's read-write distance at 240 KB:
+the FIFO is 256 KB and that is GX's default high watermark, 16 KB below
+the top. So the game writes a frame's commands (268 KB; 8 MB a second)
+faster than the GPU thread consumes them, overflows, and spins in its
+overflow handler; the handler's loop is an idle loop, and "sync on skip
+idle" holds the CPU thread there until the GPU thread has drained
+*everything* -- not to the low watermark the hardware would resume at. The
+wait is the GPU thread's time to process 240 KB of commands and the draws
+in them: 4.2 ms with this backend, 3.4 ms with Null.
+
+**Most of the drain is vertex conversion.** The wasm build gets Dolphin's
+generic `VertexLoader` -- a function-pointer call per attribute per vertex;
+the x64 and ARM64 JIT loaders do not exist here -- and the profile had it
+at 14% of the thread's samples. `--skip-vertex-convert` (the FIFO is
+advanced over the vertices and the draws go out with stale data) measures
+what it is worth: under Null the wait all but disappears and the run is
+CPU-bound (115%); under this backend 97.4%, with 5.4% still waited -- 1.85
+ms a game frame, of which about 1 ms is VideoCommon's other work in the
+drain that Null has too (the opcode decoder, index generation, texture
+hashing and lookup, pipeline state) and about 0.85 ms this backend's calls.
+The vertices: 2.2 billion over the 400-s run, 5.5 million an emulated
+second, in **359 distinct formats**; the top twelve cover 44%. The common
+shape is position, one colour and one texture coordinate, all 16-bit
+indexed, six raw bytes to 24 native, with the VATs differing in fraction
+bits. A long tail: a loader per format, as Dolphin's native loaders are,
+rather than a few hand-specialised ones.
+
+**The CPU thread itself runs 12% slower with the backend drawing.** 84 s
+of own time under Null, 95–98 s under WebGPU, for the same instructions --
+10.5 s of the 13 s between the two backends, more than the extra waiting
+(2.6 s). It is not the GPU loop's spin (sleeping instead is worse for both
+backends: the wake-ups land on the CPU thread's FIFO-write path, and the
+loop still runs 9 million times a second), and not the buffer uploads
+(91.1% with none, own time 97.7 s), and not the draws (90.3% with none
+recorded, own time 98.3 s -- nothing reaching the GPU process but texture
+uploads and the present). What remains with `--webgpu` at all: the present
+path (the canvas copy, the submit, the yield; Chrome compositing an
+animating canvas, which may change the renderer's scheduling or QoS),
+texture uploads, the package's power budget, or the machine: the later
+runs of this series came out 2–3 points lower on both backends (Null 106.1
+early, 102.8 late; WebGPU 93.1 to 90.3), so the no-upload and no-draws
+deltas are inside that drift, though the own-time gap is not. To test, in
+this order: `--webgpu` with the present skipped (the next bisect step; add
+the switch); `sudo powermetrics --samplers cpu_power -i 1000` during a Null
+run and a WebGPU run (the P-cluster's frequency); the window in a visible
+rather than headless Chrome; and from now on A/B pairs run alternately,
+compared to their neighbours.
+
+**What does not help, measured.** The GPU loop's per-chunk overhead
+(`SetCPStatusFromGPU` and the loop were 22% of the thread's samples): the
+counters show 17 million loop runs an emulated second, 17 million of them
+finding nothing -- the loop spins between the CPU thread's syncs until
+`SystemTimers` lets it sleep at 1 kHz -- so it is not on the critical path,
+and batching up to 64 or 2,048 chunks per status update changes nothing.
+The game enables CP breakpoints and both watermark interrupts (the `fifo`
+line's enables are 7), so the batching is only taken while no breakpoint
+is set; it stays in the patch, at 1, as the measurement. Dolphin's SyncGPU
+(`--sync-gpu=TICKS --no-sync-idle`: the CPU may run TICKS ahead of the
+GPU's estimated progress instead of stopping at idles): frames and pacing
+hold -- plain `--no-sync-idle` drops to 15.9 frames a second -- but it is
+slower, and the CPU thread executes 2.6× the guest instructions (927 MIPS
+against 381): the overflow wait becomes a spin the idle rule does not
+absorb. Open: with that loop recognised (`PHASE3-HANDOFF.md` §4.4 has its
+shape, for single core), SyncGPU could let the drain overlap the next
+frame's CPU work, which "sync on skip idle" never can. The present's yield:
+0.11–0.16 ms a frame, in the noise.
+
+*The plan, ranked by measured payoff.* The gate needs ~6 points. Under
+this backend vertex conversion is worth 3.5 (97.4%), the drain's other
+work about 2 (the 0.85 ms of calls, if taken off the thread), and the CPU
+thread's unexplained 12% up to 10 if its cause can be removed; the
+recompiler sets the ceiling (115% at zero waiting).
+
+1. **A wasm vertex-loader JIT on the GPU thread.** One wasm function per
+   `VertexLoaderUID`, laid out as `VertexLoaderARM64.cpp` lays its code
+   out (per attribute: index fetch, convert, scale by the fraction, write
+   at the native offset), installed the way `JitInstall` installs blocks
+   (`bootgame.cpp:199`: `WebAssembly.Module` and `Instance` with
+   `wasmMemory` and `wasmTable`, synchronous, allowed on a worker; the GPU
+   thread installs and calls on itself -- check whether the table is
+   shared between threads before growing it from two). It plugs into
+   `VertexLoaderBase::CreateVertexLoader` (`VertexLoaderBase.cpp:236`),
+   which already has `VertexLoaderType::Compare` wrapping a new loader in
+   `VertexLoaderTester` against the software one -- the differential, for
+   free: run the 390-s path and the M3 captures under it. Keep the generic
+   loader selectable (`VertexLoaderType::Software`). Gate: Null ≥110%,
+   WebGPU ≥97%, frames 23,846, M3 PASS; `--vertex-stats` for the formats.
+   About a week; the emitter (`ppc2wasm/src/wasm_emit.h`) and the install
+   path exist. Payoff measured: Null 106 → 115, WebGPU 94 → 97.
+2. **Find what slows the CPU thread** (above). Half a day of measurement
+   before anything is built: `powermetrics`, the synthetic-load run, and
+   `--idle-stats` own time on each variant. If it is power or core
+   placement, it is the machine's and will differ elsewhere -- say so and
+   move on; if it is the backend's thread work, it joins item 3.
+3. **The backend's work in the drain.** Either take the WebGPU calls off
+   the GPU thread -- a submission worker: `Gfx` records draws (buffer
+   offsets, bind-group keys, pipeline, pass changes, upload ranges) into a
+   queue and a third pthread issues the API calls, so the drain ends when
+   the frame is *generated*; Dolphin's Vulkan backend does this for its
+   submits, and here every call is a wire serialisation, so all of them
+   move; readbacks and the present need ordering; a design change, one to
+   two weeks -- or shave in place, each worth ≤2 points and read off
+   `stats/frame`: generate vertices straight into the gathered-write
+   buffer (`StreamBuffer::Write` copies 3.7 MB a frame), a
+   `mappedAtCreation` staging buffer per submit, skip the 80 of 322
+   vertex-constant uploads a frame that repeat the last, one uniform
+   bind-group set per draw instead of two.
+4. **The CPU thread** sets the ceiling: with the waiting gone the window
+   tops out near 115%. `PHASE3-HANDOFF.md` §4.3 stands: find where the
+   compiled code's 2.67 ns a guest instruction goes before more emitter
+   work.
+5. **Not worth doing**: the GPU loop's overhead or spin, FIFO batching,
+   the present's yield, SyncGPU as it stands.
+
+Order: 1; 2 alongside it (measurement only); then 3's shaves, and 3's
+worker if the gate is still unmet.
 
 **M5 — the browser shell.** `web/`: the page, the canvas, input, the disc
 streaming that already works in the harness. Overlaps Phase 4.

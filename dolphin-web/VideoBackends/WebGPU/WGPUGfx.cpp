@@ -71,6 +71,8 @@ u64 StreamBuffer::Allocate(u64 bytes, u64 alignment)
 void StreamBuffer::Write(u64 at, const void* data, u64 bytes)
 {
   g_stats_wgpu.write_bytes += bytes;
+  if (g_context.no_upload)
+    return;
   if (!g_context.fast_path)
   {
     g_context.queue.WriteBuffer(buffer, at, data, bytes);
@@ -589,12 +591,16 @@ bool Gfx::PrepareDraw()
 
 void Gfx::Draw(u32 base_vertex, u32 num_vertices)
 {
+  if (g_context.no_draws)
+    return;
   if (PrepareDraw())
     m_pass.Draw(num_vertices, 1, base_vertex, 0);
 }
 
 void Gfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
 {
+  if (g_context.no_draws)
+    return;
   if (PrepareDraw())
     m_pass.DrawIndexed(num_indices, 1, base_index, static_cast<s32>(base_vertex), 0);
 }
