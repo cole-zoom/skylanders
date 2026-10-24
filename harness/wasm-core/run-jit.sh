@@ -34,6 +34,8 @@ ARGS=""
 for a in "$@"; do ARGS="$ARGS, '$a'"; done
 cat > /tmp/bootweb/index.html <<HTML
 <!doctype html><meta charset=utf8><title>booting Skylanders</title>
+<style>body{margin:0} canvas{display:block;width:640px;height:528px;background:#000}</style>
+<canvas id=canvas width=640 height=528></canvas>
 <pre id=out>running…</pre>
 <script>
 window.__lines = [];
@@ -42,6 +44,7 @@ const tail = () => {
   document.getElementById('out').textContent = window.__lines.slice(-40).join('\n');
 };
 var Module = {
+  canvas: document.getElementById('canvas'),
   arguments: ['http://127.0.0.1:8101/', '$STEPS'$ARGS],
   print:    (t) => { window.__lines.push(t); if (window.__lines.length % 500 === 0) tail(); },
   printErr: (t) => { window.__lines.push('! ' + t); },

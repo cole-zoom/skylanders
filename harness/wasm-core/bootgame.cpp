@@ -56,6 +56,11 @@
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
+#if defined(HARNESS_WEBGPU)
+#include <emscripten/threading.h>
+#include <pthread.h>
+#include "VideoBackends/WebGPU/WGPUBackend.h"
+#endif
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/HW/GCKeyboard.h"
 #include "Core/HW/GCPad.h"
@@ -609,6 +614,67 @@ extern "C" void harness_shader_source(int stage, const char* source, unsigned lo
     g_shaders.emplace_back(stage, std::move(text));
 }
 
+// The GPU thread: a std::thread, or -- for the WebGPU backend -- a pthread
+// created with the page's canvas transferred to it, because a WebGPU
+// surface belongs to the worker that owns the canvas and std::thread has
+// no way to say which canvases a new thread should take.
+struct HarnessThread
+{
+  std::thread thread;
+#if defined(HARNESS_WEBGPU)
+  pthread_t pthread{};
+  bool is_pthread = false;
+#endif
+  bool joinable() const
+  {
+#if defined(HARNESS_WEBGPU)
+    if (is_pthread)
+      return true;
+#endif
+    return thread.joinable();
+  }
+  void join()
+  {
+#if defined(HARNESS_WEBGPU)
+    if (is_pthread)
+    {
+      pthread_join(pthread, nullptr);
+      is_pthread = false;
+      return;
+    }
+#endif
+    thread.join();
+  }
+};
+
+static HarnessThread SpawnGpuThread(std::function<void()> body, bool with_canvas)
+{
+  HarnessThread t;
+#if defined(HARNESS_WEBGPU)
+  if (with_canvas)
+  {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
+    auto* heap_body = new std::function<void()>(std::move(body));
+    pthread_create(
+        &t.pthread, &attr,
+        [](void* arg) -> void* {
+          std::unique_ptr<std::function<void()>> fn(static_cast<std::function<void()>*>(arg));
+          (*fn)();
+          return nullptr;
+        },
+        heap_body);
+    pthread_attr_destroy(&attr);
+    t.is_pthread = true;
+    return t;
+  }
+#endif
+  (void)with_canvas;
+  t.thread = std::thread(std::move(body));
+  return t;
+}
+
 static void InitMark(const char* msg)
 {
   std::size_t i = 0;
@@ -748,6 +814,8 @@ int main(int argc, char** argv)
   int tex_samples = -1;  // --tex-samples=N: the texture cache's hash samples, -1 = untouched
   bool want_dolphin_video_config = true;
   bool want_dump_shaders = false;
+  bool want_webgpu = false;
+  bool want_osd = true;
   bool want_sync_idle = true;
   bool want_nunchuk = true;
   bool want_disc_files = false;
@@ -927,6 +995,14 @@ int main(int argc, char** argv)
     // nothing.
     else if (std::strcmp(argv[i], "--dump-shaders") == 0)
       want_dump_shaders = true;
+    // --webgpu: draw with the WebGPU backend (dolphin-web/VideoBackends/
+    // WebGPU; docs/PHASE3-WEBGPU.md) into the page's canvas, instead of the
+    // Null backend. Needs a WEBGPU=1 build.
+    else if (std::strcmp(argv[i], "--webgpu") == 0)
+      want_webgpu = true;
+    // --no-osd: no on-screen messages over the presented frame.
+    else if (std::strcmp(argv[i], "--no-osd") == 0)
+      want_osd = false;
     // --no-sync-idle: with --dual-core, the CPU does not wait for the GPU
     // thread to drain the FIFO each time an idle loop is skipped
     // (Dolphin's "Sync on skip idle", on by default). The game still
@@ -1024,6 +1100,10 @@ int main(int argc, char** argv)
   logm->SetEnable(Common::Log::LogType::IOS_FS, true);
   logm->SetEnable(Common::Log::LogType::COMMON, true);
   logm->SetEnable(Common::Log::LogType::MEMMAP, true);
+  // The WebGPU backend reports why it refuses a shader, a pipeline or a
+  // texture through VIDEO; with Null there is nothing to report.
+  if (want_webgpu)
+    logm->SetEnable(Common::Log::LogType::VIDEO, true);
   logm->SetEnable(Common::Log::LogType::AUDIO, true);
   logm->EnableListener(Common::Log::LogListener::CONSOLE_LISTENER, true);
 
@@ -1481,6 +1561,25 @@ int main(int argc, char** argv)
   // Dolphin also layers the game's GameSettings INI over the base config
   // (SConfig::SetRunningGameMetadata). The harness has no Sys directory to
   // load it from, so this game's one line is set here by hand.
+#if defined(HARNESS_WEBGPU)
+  static WebGPU::VideoBackend webgpu_backend;
+  if (want_webgpu)
+  {
+    // PopulateBackendInfo's steps (VideoBackendBase.cpp), with this backend
+    // in place of the one the config names: it is not in Dolphin's backend
+    // list, which ActivateBackend picks from.
+    Config::SetCurrent(Config::GFX_HACK_EFB_EMULATE_FORMAT_CHANGES, true);
+    if (!want_osd)
+      Config::SetCurrent(Config::MAIN_OSD_MESSAGES, false);
+    g_Config.Refresh();
+    g_backend_info = {};
+    g_video_backend = &webgpu_backend;
+    g_backend_info.DisplayName = g_video_backend->GetDisplayName();
+    g_video_backend->InitBackendInfo(wsi);
+    g_Config.VerifyValidity();
+  }
+  else
+#endif
   if (want_dolphin_video_config)
   {
     // GameSettings/SSP.ini: "Properly emulates the blur in the pause screen."
@@ -1491,7 +1590,8 @@ int main(int argc, char** argv)
   {
     VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
   }
-  check(g_video_backend != nullptr, "Null video backend activated");
+  check(g_video_backend != nullptr, want_webgpu ? "WebGPU video backend activated" :
+                                                  "Null video backend activated");
   if (want_dump_shaders)
   {
     // What a WebGPU backend can honestly claim, written against Metal's
@@ -1552,11 +1652,11 @@ int main(int argc, char** argv)
   // backend, reports back, and runs the FIFO loop until ExitGpuLoop. This
   // thread stays the CPU thread.
   bool video_up = false;
-  std::thread gpu_thread;
+  HarnessThread gpu_thread;
   if (want_dual_core)
   {
     std::promise<bool> init_from_thread;
-    gpu_thread = std::thread([&] {
+    gpu_thread = SpawnGpuThread([&] {
       Common::SetCurrentThreadName("Video thread");
       Core::DeclareAsGPUThread();
       AsyncRequests::GetInstance()->SetPassthrough(false);
@@ -1565,7 +1665,7 @@ int main(int argc, char** argv)
       if (!ok)
         return;
       system.GetFifo().RunGpuLoop();
-    });
+    }, want_webgpu);
     video_up = init_from_thread.get_future().get();
   }
   else

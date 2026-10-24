@@ -134,6 +134,46 @@ presentation, clears. *Gate:* the game's frame appears in a canvas — the
 clear colour and the XFB copy — and the GX capture's frames and draws match
 the Null run.
 
+*Done, gate met — and most of M2 with it* (2026-10-23). The backend is in
+`dolphin-web/VideoBackends/WebGPU/` (~1,500 lines, Metal's layout),
+compiled into the harness by `WEBGPU=1` and selected with `--webgpu`. The
+game's own draws work too, because S2's shader rewrites are applied in the
+backend's compile step until VideoCommon emits them. Over the 390-s run,
+dual core: the same 23,249 frames and 28,874 GX draws as the Null run,
+**zero WebGPU errors**, and the tutorial level on the canvas, the same scene
+as the native `harness/reference/ssa-gameplay.png`. Screenshots are not
+committed (`harness/reference/*.png` is ignored: they are frames of the
+game); `SCREENSHOT=out.png WEBGPU=1 harness/wasm-core/run-jit.sh 300000000000
+--jit --dual-core --webgpu --no-osd --input=A --skylander
+--ticks=291600000000` reproduces this one, and `--ticks=29160000000` the
+menu at 40 s. Speed: the
+gameplay window **82.4%** (Null: 103–104%), the whole run 92.7%.
+
+How it is built, and what it does not do yet:
+
+- Shaders: Metal's GLSL dialect → glslang (VideoCommon's `Spirv.cpp`) →
+  Tint, with the split samplers mapped to group 1, binding 32+i → the
+  browser. One explicit pipeline layout for every pipeline (group 0: three
+  uniform blocks; group 1: eight 2D-array textures and eight samplers):
+  "auto" layouts drop what a shader declares but does not use, and Tint
+  declares all eight textures in every TEV shader.
+- Tint aborts, rather than failing, on SPIR-V it does not implement
+  (`OpIsNan`): one such shader took the GPU thread down. The compile step
+  refuses any source still calling `isnan`.
+- The presenter draws into an offscreen texture that `PresentBackbuffer`
+  copies to the canvas: a canvas texture is valid only until the worker
+  yields, and any wait yields (a readback, a shader's validation).
+- Not yet: depth textures as shader inputs (draws that sample one are
+  skipped), storage and texel buffers (GPU texture decoding, palette
+  conversion, the dynamic vertex loader, line/point expansion, bounding
+  box), occlusion queries, the generator changes as an `APIType::WebGPU`
+  in VideoCommon, a pixel comparison against native frames (M3).
+- Harness fixes found on the way: the runner refuses to start while an
+  earlier run's Chrome or servers hold its ports (a stale Chrome made two
+  A/Bs report the old page), survives a timed-out poll, gives headless
+  Chrome a window tall enough for the canvas, and `SCREENSHOT=file.png`
+  saves the canvas at the end of a run.
+
 **M2 — drawing.** Pipelines from VideoCommon's UIDs, vertex formats, the
 streaming buffers, textures (CPU decode first; CMPR as BC1), samplers, EFB
 copies to texture, blending including the destination-alpha pass, EFB format
