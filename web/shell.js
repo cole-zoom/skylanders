@@ -1,0 +1,94 @@
+// The browser shell: boot the emulator into the page's canvas and hand it
+// the player's input.
+//
+// Query parameters, all optional:
+//   speed=F       emulation speed limit, 1 = real time (default), 0 = unlimited
+//   figure=ID:VAR the Skylander on the portal (default Whirlwind, 0:0)
+//   log=1         show the emulator's output under the canvas
+import { attachInput } from './input.js';
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const status = $('status');
+const logEl = $('log');
+const lines = [];
+
+const say = (text, failed = false) => {
+  status.textContent = text;
+  status.hidden = !text;
+  status.classList.toggle('failed', failed);
+};
+const log = text => {
+  lines.push(text);
+  if (lines.length > 400) lines.splice(0, lines.length - 400);
+  if (!logEl.hidden) logEl.textContent = lines.join('\n');
+};
+logEl.hidden = params.get('log') !== '1';
+
+// What the build needs, checked up front: a missing feature otherwise
+// surfaces as an abort deep in startup.
+const missing = [];
+if (!crossOriginIsolated) missing.push('cross-origin isolation (serve with web/serve.mjs)');
+if (!navigator.gpu) missing.push('WebGPU');
+if (!('Suspending' in WebAssembly)) missing.push('JSPI (WebAssembly.Suspending)');
+if (missing.length) {
+  say(`This browser is missing: ${missing.join(', ')}. Use a current Chrome or Edge.`, true);
+  throw new Error('unsupported browser');
+}
+
+const speed = params.get('speed') ?? '1';
+const figure = params.get('figure');
+// The run never ends on its own; the step count is only a cap.
+const args = [new URL('disc', location.href).href, '1000000000000000000',
+              '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
+              `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander'];
+
+let stagePtr = 0, secondsPtr = 0;
+const readStage = () => {
+  const h = Module.HEAPU8;
+  let e = stagePtr;
+  while (h[e]) e++;
+  return new TextDecoder().decode(h.slice(stagePtr, e));
+};
+
+// The speed readout: emulated seconds per wall second, over the last second.
+let lastEmulated = 0, lastWall = 0;
+const hud = () => {
+  const stage = readStage();
+  if (!stage.startsWith('stepping')) {
+    say(`Booting… ${stage}`);
+  } else {
+    say('');
+    const emulated = new Float64Array(Module.HEAPU8.buffer, secondsPtr, 1)[0];
+    const wall = performance.now() / 1000;
+    if (lastWall) {
+      const pct = (100 * (emulated - lastEmulated)) / (wall - lastWall);
+      $('speed').textContent = `${pct.toFixed(0)}%`;
+    }
+    lastEmulated = emulated;
+    lastWall = wall;
+  }
+};
+
+window.Module = {
+  canvas: $('canvas'),
+  arguments: args,
+  print: log,
+  printErr: text => log('! ' + text),
+  onAbort: what => say(`The emulator stopped: ${what}`, true),
+  onExit: code => say(`The emulator exited (${code}).`, code !== 0),
+  onRuntimeInitialized() {
+    stagePtr = Module._harness_stage();
+    secondsPtr = Module._harness_emulated_seconds();
+    attachInput($('canvas'), Module.HEAPU8.buffer, Module._harness_live_input());
+    setInterval(hud, 1000);
+  },
+};
+
+$('fullscreen').addEventListener('click', () => $('screen').requestFullscreen?.());
+
+say('Loading…');
+const script = document.createElement('script');
+script.src = 'dist/skylanders.js';
+script.onerror = () => say('dist/skylanders.js is missing -- run web/build.sh first.', true);
+document.body.append(script);

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skylanders</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0d12; --fg: #d8dde6; --dim: #7c8596; --bad: #ff8a80; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, sans-serif; display: flex; flex-direction: column;
+         align-items: center; gap: 12px; padding: 16px; }
+  #screen { position: relative; width: min(100%, calc((100vh - 140px) * 640 / 528));
+            aspect-ratio: 640 / 528; background: #000; }
+  /* The canvas is 640x528 (the backend's surface); CSS scales it. */
+  #canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  #screen:fullscreen { width: auto; height: 100%; }
+  #status { position: absolute; inset: auto 0 0 0; margin: 0; padding: 10px 14px;
+            background: rgb(0 0 0 / 0.7); }
+  #status.failed { color: var(--bad); }
+  #speed { position: absolute; top: 8px; right: 10px; font: 12px ui-monospace, monospace;
+           color: var(--dim); }
+  #bar { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center;
+         color: var(--dim); max-width: 900px; }
+  kbd { font: 12px ui-monospace, monospace; border: 1px solid #333a46; border-radius: 4px;
+        padding: 1px 5px; color: var(--fg); }
+  button { font: inherit; color: var(--fg); background: #1b2030; border: 1px solid #333a46;
+           border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  #log { width: min(100%, 900px); max-height: 30vh; overflow: auto; margin: 0;
+         font: 11px ui-monospace, monospace; color: var(--dim); }
+</style>
+<div id="screen">
+  <canvas id="canvas" width="640" height="528"></canvas>
+  <div id="speed"></div>
+  <p id="status">Loading…</p>
+</div>
+<div id="bar">
+  <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> stick</span>
+  <span><kbd>Space</kbd>/click A</span>
+  <span><kbd>Shift</kbd>/right-click B</span>
+  <span><kbd>E</kbd> C</span>
+  <span><kbd>Q</kbd> Z</span>
+  <span><kbd>←↑↓→</kbd> D-pad</span>
+  <span><kbd>Enter</kbd> +</span>
+  <span><kbd>Backspace</kbd> −</span>
+  <span><kbd>1</kbd><kbd>2</kbd></span>
+  <span><kbd>H</kbd> Home</span>
+  <span>mouse: pointer · gamepad works too</span>
+  <button id="fullscreen">Fullscreen</button>
+</div>
+<pre id="log" hidden></pre>
+<script type="module" src="shell.js"></script>
+</html>
