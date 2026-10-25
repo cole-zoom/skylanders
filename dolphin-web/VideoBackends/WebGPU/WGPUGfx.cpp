@@ -63,6 +63,7 @@ u64 StreamBuffer::Allocate(u64 bytes, u64 alignment)
     // submitted, writes to them are ordered after it.
     static_cast<Gfx*>(g_gfx.get())->Flush();
     at = 0;
+    ++wraps;
   }
   offset = at + bytes;
   return at;
@@ -71,6 +72,7 @@ u64 StreamBuffer::Allocate(u64 bytes, u64 alignment)
 void StreamBuffer::Write(u64 at, const void* data, u64 bytes)
 {
   g_stats_wgpu.write_bytes += bytes;
+  bytes_written += bytes;
   if (g_context.no_upload)
     return;
   if (!g_context.fast_path)
@@ -455,7 +457,21 @@ u64 Gfx::WriteUniforms(const void* data, u32 size)
 
 void Gfx::SetGXUniforms(u32 slot, const void* data, u32 size)
 {
+  // VideoCommon marks a block dirty when anything in it is written, and
+  // the game often writes what is already there: about 400 draws a frame
+  // each re-sent several KB that had not changed. An upload of the same
+  // bytes, with the buffer not wrapped since, is the one already made.
+  std::vector<u8>& last = m_gx_uniform_last[slot];
+  if (g_context.uniform_dedup && last.size() == size &&
+      m_gx_uniform_wraps[slot] == m_uniforms.wraps && std::memcmp(last.data(), data, size) == 0)
+  {
+    g_stats_wgpu.uniform_skips++;
+    return;
+  }
   m_gx_uniform[slot] = WriteUniforms(data, size);
+  // WriteUniforms may have wrapped the buffer; the new upload is after it.
+  m_gx_uniform_wraps[slot] = m_uniforms.wraps;
+  last.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
 }
 
 void Gfx::SetUtilityUniforms(const void* data, u32 size)
@@ -643,6 +659,11 @@ void Gfx::PresentBackbuffer()
              st.maps / f, st.map_ms / f, st.submits / f, st.write_buffers / f,
              st.write_bytes / f / 1024, st.bind_groups / f, st.bind_group_sets / f,
              st.texture_group_clears / f, st.draws / f, st.yield_ms / f);
+    WGPU_LOG("stats/frame: KB written to vertices {:.0f}, indices {:.0f}, uniforms {:.0f} "
+             "({:.0f} uniform uploads skipped as unchanged)",
+             m_vertices.bytes_written / f / 1024, m_indices.bytes_written / f / 1024,
+             m_uniforms.bytes_written / f / 1024, st.uniform_skips / f);
+    m_vertices.bytes_written = m_indices.bytes_written = m_uniforms.bytes_written = 0;
     const u64 presents = st.presents;
     st = {};
     st.presents = presents;

@@ -35,6 +35,8 @@ struct StreamBuffer
   wgpu::Buffer buffer;
   u64 size = 0;
   u64 offset = 0;
+  u64 bytes_written = 0;  // since the last stats line
+  u64 wraps = 0;          // times Allocate went back to the start
 
   void Create(u64 bytes, wgpu::BufferUsage usage, const char* label);
   // An offset `alignment`-aligned with `bytes` free after it.
@@ -149,6 +151,10 @@ private:
   StreamBuffer m_uniforms;
   // Offsets into m_uniforms of the blocks the next draw binds.
   std::array<u64, 3> m_gx_uniform{};
+  // What each GX slot last uploaded, and the uniform buffer's wrap count
+  // then: the same bytes again, before a wrap, reuse that upload.
+  std::array<std::vector<u8>, 3> m_gx_uniform_last;
+  std::array<u64, 3> m_gx_uniform_wraps{};
   u64 m_utility_uniform = 0;
 
   std::unordered_map<u64, wgpu::Sampler> m_sampler_cache;

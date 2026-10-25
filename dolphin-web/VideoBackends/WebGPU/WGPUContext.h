@@ -62,6 +62,8 @@ struct Context
   // copy to it, no yield to the browser -- so Chrome has no animating
   // canvas to composite. The frames are still drawn and submitted.
   bool no_present = false;
+  // Skip GX uniform uploads equal to the slot's last (Gfx::SetGXUniforms).
+  bool uniform_dedup = true;
 
   // The one layout every render pipeline shares (WGPUShader.h has the
   // numbering): group 0 the three uniform blocks, group 1 eight textures
@@ -113,6 +115,7 @@ struct Stats
   u64 bind_group_sets = 0;
   u64 texture_group_clears = 0;
   u64 draws = 0;
+  u64 uniform_skips = 0;  // GX uniform uploads skipped: same bytes as the last
   double yield_ms = 0;
    // time in the per-present yield
 };

@@ -1102,6 +1102,7 @@ int main(int argc, char** argv)
   bool want_webgpu_no_upload = false;
   bool want_webgpu_no_draws = false;
   bool want_webgpu_no_present = false;
+  bool want_webgpu_uniform_dedup = true;
   bool want_osd = true;
   std::string fifo_path;
   u64 record_fifo_at = 0;  // --record-fifo=TICKS
@@ -1334,6 +1335,10 @@ int main(int argc, char** argv)
     // and on the CPU thread through the caches (docs/PHASE3-WEBGPU.md M4).
     else if (std::strcmp(argv[i], "--webgpu-no-upload") == 0)
       want_webgpu_no_upload = true;
+    // --webgpu-no-uniform-dedup: upload every dirty uniform block, changed
+    // or not, as before (Gfx::SetGXUniforms), for A/B.
+    else if (std::strcmp(argv[i], "--webgpu-no-uniform-dedup") == 0)
+      want_webgpu_uniform_dedup = false;
     // --webgpu-no-draws: the backend records no draws (frames stay blank).
     // What the draws cost, and what Chrome's GPU-side work costs the CPU
     // thread.
@@ -2060,6 +2065,7 @@ int main(int argc, char** argv)
     WebGPU::g_context.no_upload = want_webgpu_no_upload;
     WebGPU::g_context.no_draws = want_webgpu_no_draws;
     WebGPU::g_context.no_present = want_webgpu_no_present;
+    WebGPU::g_context.uniform_dedup = want_webgpu_uniform_dedup;
     g_backend_info.DisplayName = g_video_backend->GetDisplayName();
     g_video_backend->InitBackendInfo(wsi);
     g_Config.VerifyValidity();

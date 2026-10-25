@@ -616,6 +616,42 @@ the file in the browser (OPFS), so each session adds what it met, is the
 follow-up. The file is generated, not committed (a record of the game's
 render states); the page runs without it, with the stalls.
 
+*Walking, taken apart.* Same path, walking from 300 s, one run each
+unless stated, frames 23,846 in all but one:
+
+| walking window | speed | MIPS | CPU thread waiting |
+|---|---|---|---|
+| Null | **101.3%** | 394 | 3.6% |
+| WebGPU, uploads, draws and presenting all off | 97.5% | 380 | 3.9% |
+| WebGPU, no uploads | 95.0% | 369 | 4.3% |
+| WebGPU, no draws | 93.5% | 364 | 4.4% |
+| WebGPU (four runs) | 90.9–91.4% | 354–357 | 5.0% |
+| WebGPU, GPU loop sleeps after 1,000 empty runs | 88.4% | 344 | 4.9% |
+| WebGPU, GPU loop sleeps after 50 | 79.9% | 310 | 4.5% (frames 23,847) |
+
+- **The waiting hardly changes; the CPU thread's own speed does.** The
+  same guest code runs 10% slower under WebGPU than under Null, and 3.5%
+  slower even with every browser-side call off.
+- **Letting the GPU thread sleep makes it worse, not better.** It is not
+  a fight for a core. The likelier reading is clock speed: a busy
+  neighbour keeps the cluster's clock up, and the GPU's and Chrome's work
+  shares the fanless Air's power budget. `powermetrics` (which needs a
+  password) would confirm it.
+- **The ceiling for the backend is about 10 points**: about 6 for the
+  browser's work (uploads ~4, draws ~2.5, overlapping) and about 4 for
+  our own GPU-thread work with nothing sent. Null walking is 101%, so
+  getting walking clearly over 100% also needs the recompiler.
+- **What is uploaded, per present while walking:** vertices 3.7 MB,
+  uniforms 1.9 MB (about 4.8 KB per draw, ~400 draws), indices 0.28 MB.
+  Uniform blocks are re-sent whenever VideoCommon marks them dirty, and
+  574 of those uploads a present carried the same bytes as before. They
+  are skipped now (`Gfx::SetGXUniforms`; `--webgpu-no-uniform-dedup` for
+  A/B), which removed 18% of the uniform bytes but no measurable speed
+  (on 91.4 / 91.8%, off 91.6 / 91.4%): bytes are not what uploads cost.
+  It stays, because offering every block every draw also fixes a latent
+  bug. A clean block could point at bytes the uniform buffer had since
+  wrapped over; now its upload is re-sent after a wrap. M3 passes.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.
