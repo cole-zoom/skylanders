@@ -566,6 +566,11 @@ extern "C" void harness_vertex_run(u32 desc_low, u32 desc_high, u32 g0, u32 g1, 
   t.raw_size = raw_size;
   t.stride = stride;
 }
+// harness/wasm-core/vertexjit.cpp: the wasm vertex-loader JIT.
+// --vertex-loader=software|jit|compare (0, 1, 2).
+void VertexJitSetMode(int mode);
+void VertexJitReport();
+
 static void PrintVertexTally()
 {
   std::lock_guard<std::mutex> lk(g_vertex_tally_lock);
@@ -961,6 +966,7 @@ int main(int argc, char** argv)
   bool want_webgpu_per_draw = false;
   bool want_webgpu_no_upload = false;
   bool want_webgpu_no_draws = false;
+  bool want_webgpu_no_present = false;
   bool want_osd = true;
   std::string fifo_path;
   u64 record_fifo_at = 0;  // --record-fifo=TICKS
@@ -1166,6 +1172,11 @@ int main(int argc, char** argv)
     // thread.
     else if (std::strcmp(argv[i], "--webgpu-no-draws") == 0)
       want_webgpu_no_draws = true;
+    // --webgpu-no-present: frames are drawn and submitted but never reach
+    // the canvas (no copy, no yield to the browser). Bisects the CPU
+    // thread's slowdown under this backend (docs/PHASE3-WEBGPU.md M4).
+    else if (std::strcmp(argv[i], "--webgpu-no-present") == 0)
+      want_webgpu_no_present = true;
     // --fifo=FILE: replay a FIFO capture (.dff) with Dolphin's FifoPlayer
     // instead of running the game: the same GX commands and memory, frame
     // for frame, whatever the backend -- what docs/PHASE3-WEBGPU.md M3
@@ -1222,6 +1233,14 @@ int main(int argc, char** argv)
     // --vertex-stats: vertices per vertex format over the run, at the end.
     else if (std::strcmp(argv[i], "--vertex-stats") == 0)
       g_vertex_stats = true;
+    // --vertex-loader=software|jit|compare: Dolphin's generic vertex loader,
+    // the wasm vertex-loader JIT (vertexjit.cpp), or both on every call with
+    // the differences counted (the vtxjit line at the end).
+    else if (std::strncmp(argv[i], "--vertex-loader=", 16) == 0)
+    {
+      const char* v = argv[i] + 16;
+      VertexJitSetMode(std::strcmp(v, "jit") == 0 ? 1 : std::strcmp(v, "compare") == 0 ? 2 : 0);
+    }
     // --sync-gpu=TICKS: Dolphin's "SyncGPU" (MAIN_SYNC_GPU): the CPU thread
     // may run at most TICKS of emulated time ahead of the GPU thread's
     // progress, as the opcode decoder estimates it, and blocks there --
@@ -1814,6 +1833,7 @@ int main(int argc, char** argv)
     WebGPU::g_context.fast_path = !want_webgpu_per_draw;
     WebGPU::g_context.no_upload = want_webgpu_no_upload;
     WebGPU::g_context.no_draws = want_webgpu_no_draws;
+    WebGPU::g_context.no_present = want_webgpu_no_present;
     g_backend_info.DisplayName = g_video_backend->GetDisplayName();
     g_video_backend->InitBackendInfo(wsi);
     g_Config.VerifyValidity();
@@ -3721,6 +3741,7 @@ int main(int argc, char** argv)
   // different diagnosis from a game waiting on an interrupt.
   if (g_vertex_stats)
     PrintVertexTally();
+  VertexJitReport();
   std::printf("  fifo state  rwdist=%u rd=%08x wr=%08x base=%08x end=%08x gpread=%u\n",
               fifo.CPReadWriteDistance.load(), fifo.CPReadPointer.load(),
               fifo.CPWritePointer.load(), fifo.CPBase.load(), fifo.CPEnd.load(),

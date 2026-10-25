@@ -1,0 +1,33 @@
+diff --git a/Source/Core/VideoCommon/VertexLoaderBase.cpp b/Source/Core/VideoCommon/VertexLoaderBase.cpp
+index 98eb651..3dc0a6f 100644
+--- a/Source/Core/VideoCommon/VertexLoaderBase.cpp
++++ b/Source/Core/VideoCommon/VertexLoaderBase.cpp
+@@ -27,6 +27,19 @@
+ #include "VideoCommon/VertexLoaderX64.h"
+ #elif defined(_M_ARM_64)
+ #include "VideoCommon/VertexLoaderARM64.h"
++#else
++// Harness hook (weak), for docs/PHASE3-WEBGPU.md M4: the native loader on a
++// target with no JIT loader of Dolphin's own -- under Emscripten, the
++// harness's wasm vertex-loader JIT. nullptr keeps the software loader.
++//
++// Weak DEFINITION, not a weak declaration: see TextureCacheBase.cpp.
++__attribute__((weak)) std::unique_ptr<VertexLoaderBase>
++harness_create_vertex_loader(const TVtxDesc& vtx_desc, const VAT& vtx_attr)
++{
++  (void)vtx_desc;
++  (void)vtx_attr;
++  return nullptr;
++}
+ #endif
+ 
+ // a hacky implementation to compare two vertex loaders
+@@ -248,6 +261,8 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
+   native_loader = std::make_unique<VertexLoaderX64>(vtx_desc, vtx_attr);
+ #elif defined(_M_ARM_64)
+   native_loader = std::make_unique<VertexLoaderARM64>(vtx_desc, vtx_attr);
++#else
++  native_loader = harness_create_vertex_loader(vtx_desc, vtx_attr);
+ #endif
+ 
+   // Use the software loader as a fallback

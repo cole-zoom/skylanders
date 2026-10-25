@@ -443,6 +443,74 @@ recompiler sets the ceiling (115% at zero waiting).
 Order: 1; 2 alongside it (measurement only); then 3's shaves, and 3's
 worker if the gate is still unmet.
 
+*Item 1, the wasm vertex-loader JIT* (2026-10-25): **the gate is met --
+WebGPU 101.4 / 101.5%**, Null 121.2 / 121.1%. Gameplay window, dual core,
+one build, two A/B pairs run back to back, the second in reverse order
+(JIT then generic, then generic then JIT), every run under `caffeinate
+-dims`; `frames` 23,846 in all eight:
+
+| gameplay window | generic loader | JIT |
+|---|---|---|
+| WebGPU, pair 1 / pair 2 | 96.2 / 96.1% | **101.4 / 101.5%** |
+| Null, pair 1 / pair 2 | 113.8 / 110.8% | **121.2 / 121.1%** |
+
+Both baselines came out above the earlier series' (94% and 104-106%) on
+the same code -- a quiet, idle machine -- so the A/B within a pair is the
+result: +5.3 points under WebGPU, +7 to +10 under Null. Under Null the
+JIT beats the "conversion skipped" bound measured earlier (115%), which
+was measured in a slower series; the bounds above are not a ceiling to
+compare against across sessions.
+
+`harness/wasm-core/vertexjit.cpp`, through a weak hook in
+`VertexLoaderBase::CreateVertexLoader`
+(`dolphin-web/patches/0020-vertex-loader-hook.patch`; only on targets
+without Dolphin's x64 or ARM64 loader). One module per `VertexLoaderUID`,
+one function `(src, dst, count) -> loaded`: the array bases and strides
+the format uses loaded once before the loop, then per vertex each
+attribute's index read, its address computed, its components converted
+and stored at the native offset, the z-freeze caches written for the last
+vertices, and a vertex whose position index is 0xFF/0xFFFF skipped. The
+output is the **generic loader's, bit for bit** -- including where the
+ARM64 loader differs from it (the position scale applies whether or not
+ByteDequant is set; texture-matrix indices are masked to six bits) --
+because the generic loader is what has drawn every frame until now.
+Float components are copied as their bits, so a NaN keeps its payload.
+
+- **Correctness.** `--vertex-loader=compare` runs both loaders on every
+  call from the same caches and compares the counts, the output and the
+  five caches. The 400-s path: all 359 formats compiled, 157.8 million
+  runs compared, **0 differed**. M3 passes (4 scenes) with the JIT as the
+  default; the level-390 capture alone makes 140 loaders.
+- **Cost.** 199 KB of modules for the 359 formats, 14-18 ms installing
+  over the whole run (one module each, ~45 us).
+- **Threads.** A function-table entry exists only on the thread that
+  added it, so a loader installs on the first thread that runs it and any
+  other thread gets the generic loader (counted: 0 calls in this run --
+  in dual core every loader runs on the GPU thread).
+- **Switches.** `--vertex-loader=jit` (default), `software` (Dolphin's
+  generic loader, unchanged), `compare`. The `vtxjit` line at the end of
+  a run reports what was compiled.
+
+*A measuring trap found on the way:* long runs started while nobody is at
+the machine crawl from their first 30 seconds (415 million instructions
+in them against 6,646 million, 16x slower) and time out after an hour -- the generic loader as much as the JIT, so
+not the code. A run started at the machine is normal. The cause is not
+pinned down (display sleep or idle throttling of the headless Chrome is
+the suspect; the MacBook Air is fanless, but heat alone is not 16x).
+Start every series under `caffeinate -dims` and check the first `--- t=30s`
+line (~6.5 billion instructions for the gameplay command) before
+trusting it; kill the headless Chrome (`pkill -f "Chrome --headless"`)
+after killing a run, or it stays at 100% of a core.
+
+*What is left.* The margin is 1.5 points, inside the run-to-run variance
+of a different session, so the gate is met but not by much. Item 2 is
+unchanged and not yet run: `--webgpu-no-present` (frames drawn and
+submitted, nothing copied to the canvas, no yield) is in the tree as its
+first bisect step, and `powermetrics` needs a password. Item 3's shaves
+(vertices generated straight into the gathered-write buffer; repeated
+vertex-constant uploads skipped) and a SIMD conversion path in the JIT are
+the next points to buy headroom.
+
 **M5 — the browser shell.** `web/`: the page, the canvas, input, the disc
 streaming that already works in the harness. Overlaps Phase 4.
 

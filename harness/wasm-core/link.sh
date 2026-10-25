@@ -67,7 +67,7 @@ em++ -std=c++23 -O2 ${PROFILING:+--profiling-funcs} -pthread -sPROXY_TO_PTHREAD 
   -sPTHREAD_POOL_SIZE=8 \
   -I$D/Source/Core -I$B/Source/Core \
   -I$D/Externals/fmt/fmt/include -I$D/Externals/picojson \
-  "$SRC" harness/wasm-core/host_stubs.cpp $WEBGPU_SRC \
+  "$SRC" harness/wasm-core/host_stubs.cpp harness/wasm-core/vertexjit.cpp $WEBGPU_SRC \
   $B/Source/Core/Core/libcore.a \
   $B/Source/Core/VideoCommon/libvideocommon.a \
   $B/Source/Core/VideoBackends/Null/libvideonull.a \
