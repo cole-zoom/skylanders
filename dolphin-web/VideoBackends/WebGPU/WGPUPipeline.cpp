@@ -153,6 +153,7 @@ Pipeline::~Pipeline() = default;
 
 std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
 {
+  const CompileTimer timer;
   const Shader* vs = static_cast<const Shader*>(config.vertex_shader);
   const Shader* ps = static_cast<const Shader*>(config.pixel_shader);
   if (!vs)
@@ -271,8 +272,10 @@ std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
   }
 
   wgpu::RenderPipeline pipeline;
+  std::optional<CompileTimer> phase(kPipeline);
   const std::string error = g_context.CaptureValidation(
       [&] { pipeline = g_context.device.CreateRenderPipeline(&desc); });
+  phase.reset();
   if (!error.empty())
   {
     WGPU_LOG("WebGPU: pipeline rejected: {}", error);

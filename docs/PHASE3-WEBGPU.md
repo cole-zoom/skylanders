@@ -556,6 +556,66 @@ real menu (mapped, not tested), and the canvas at the game's own aspect
 JavaScript modules, not TypeScript as `ARCHITECTURE.md` planned. There is
 no build step to justify yet.
 
+**Headroom (after M5).** A person playing in a visible Chrome saw the
+readout usually at ~80%, now and then ~28%, and 0% for a few seconds
+while Eon spoke. The gameplay window (101%) sees none of that: it taps A
+in place. Two new switches measure what play feels like:
+
+- `--frame-times`: every frame's wall time against its emulated time,
+  the speed in each wall second (what the page's readout shows: median,
+  p25, p10, p1, worst), and each frame over 100 ms with what happened
+  during it. The extra counters: GPU-thread compile time by phase
+  (glslang, Tint, `CreateShaderModule`, `CreateRenderPipeline`), time in
+  synchronous disc reads, and the CPU thread's idle waits.
+- `--walk-from=TICKS`: from then on the Nunchuk stick walks a square
+  (a quarter turn every 2 s) while `--input` keeps pressing.
+
+*What they found* (WebGPU, JIT, the 400-s path, frames 23,846 in every
+run):
+
+| | taps A (the gate) | walks from 300 s |
+|---|---|---|
+| gameplay window | 100.6% | **91.3%** |
+| per wall second in it: median / worst | 101% / 97% | 91% / 82% |
+| whole run: frames over 100 ms | 13 | 13 (the same frames) |
+
+- **The stalls are shader compiles.** Every frame that stalled (wall
+  time far above its emulated time) had the GPU thread compiling, with
+  the CPU thread waiting for it. The worst: 864 ms at 110 s, in the
+  intro, 808 ms of it compiling. Disc reads totalled under 40 ms. Over
+  the run: 364 shaders and 433 pipelines, 3.9 s. By phase: Tint 1.8 s,
+  glslang 0.9 s, pipelines 0.7 s, modules 0.5 s.
+- **Walking is the CPU thread.** A profile of the walking window: the
+  CPU thread is busy 95% of the time, 83% of it in compiled guest code,
+  spread thin (the top 500 blocks are 45% of block time). It waits on the
+  GPU thread 5% of the time; the GPU thread is busy 47%. Walking's
+  shortfall is the game's own code, not the backend.
+
+*Stalls, fixed.* Dolphin's shader cache already records every pipeline a
+run makes in `Cache/<game id>.uidcache`, and compiles all of them at
+startup. The harness never created `Cache/`, so no run kept one; now it
+does.
+- `--dump-uidcache` prints the file at the end of a run.
+- `--uidcache-url=` fetches one before the backend starts.
+- `web/make-uidcache.sh` makes it (one 6-minute run), and the page loads
+  it.
+
+With it, every pipeline compiles at boot (about 3.5 s; the backend has no
+background compiling, so on the GPU thread before the game runs):
+
+| whole run | without | with the UID file |
+|---|---|---|
+| worst second | 21–42% | **80%** |
+| p1 second | 77–79% | **82%** |
+| frames over 100 ms | 13 | 6 (loading: each covers more emulated time than wall) |
+| GPU-thread compile during them | 1,661 ms | 4 ms |
+
+The file covers the harness's path, not the whole game: a level the path
+never reaches still compiles its pipelines when first drawn. Persisting
+the file in the browser (OPFS), so each session adds what it met, is the
+follow-up. The file is generated, not committed (a record of the game's
+render states); the page runs without it, with the stalls.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

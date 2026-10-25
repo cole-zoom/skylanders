@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -28,6 +29,7 @@
 #include "rangeblob.h"
 
 #if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
 #include <emscripten/fetch.h>
 #endif
 
@@ -39,6 +41,11 @@ struct SourceStats
 {
   u64 requests = 0;
   u64 bytes = 0;
+  // Time spent in reads, in microseconds; the HTTP source's synchronous
+  // fetches are what can stall the thread that reads. Atomic because
+  // --frame-times reads it from the CPU thread while DiscIO's reader may
+  // be another.
+  std::atomic<u64> us{0};
   // Called with every read's raw disc offset and length, when set. The
   // harness uses it to name the file a read lands in, which is the only
   // cheap signal of what the game is doing at a given moment.
@@ -92,7 +99,10 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
     const char* headers[] = {"Range", range.c_str(), nullptr};
     attr.requestHeaders = headers;
 
+    const double t0 = emscripten_get_now();
     emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
+    stats->us.fetch_add(static_cast<u64>((emscripten_get_now() - t0) * 1000.0),
+                        std::memory_order_relaxed);
     std::vector<u8> out;
     // 206 Partial Content is the expected answer. 200 means the server ignored
     // the Range header and sent everything, which is a server bug rather than
