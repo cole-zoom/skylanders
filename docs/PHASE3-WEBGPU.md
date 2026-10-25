@@ -503,10 +503,15 @@ trusting it; kill the headless Chrome (`pkill -f "Chrome --headless"`)
 after killing a run, or it stays at 100% of a core.
 
 *What is left.* The margin is 1.5 points, inside the run-to-run variance
-of a different session, so the gate is met but not by much. Item 2 is
-unchanged and not yet run: `--webgpu-no-present` (frames drawn and
-submitted, nothing copied to the canvas, no yield) is in the tree as its
-first bisect step, and `powermetrics` needs a password. Item 3's shaves
+of a different session, so the gate is met but not by much.
+
+Item 2's first bisect step, run the same night (JIT on, gameplay window,
+frames 23,846 in all four, order no-present, present, present,
+no-present): `--webgpu-no-present` (frames drawn and submitted, nothing
+copied to the canvas, no yield) 102.9 / 103.0%, presenting 100.9 / 101.4%.
+**Presenting costs about 2 points** -- real, but a tenth of the gap to
+Null (121%). The rest is in drawing and submitting, which is where item
+3 points; `powermetrics` (needs a password) is still unrun. Item 3's shaves
 (vertices generated straight into the gathered-write buffer; repeated
 vertex-constant uploads skipped) and a SIMD conversion path in the JIT are
 the next points to buy headroom.
