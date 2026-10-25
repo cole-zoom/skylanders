@@ -55,6 +55,10 @@ struct Context
   // Measurement only: draws are not recorded (nothing reaches the GPU
   // process but passes, copies and the present).
   bool no_draws = false;
+  // Measurement only: nothing reaches the canvas -- no surface texture, no
+  // copy to it, no yield to the browser -- so Chrome has no animating
+  // canvas to composite. The frames are still drawn and submitted.
+  bool no_present = false;
 
   // The one layout every render pipeline shares (WGPUShader.h has the
   // numbering): group 0 the three uniform blocks, group 1 eight textures

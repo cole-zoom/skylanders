@@ -615,7 +615,8 @@ void Gfx::PresentBackbuffer()
 {
   EndPass();
   wgpu::SurfaceTexture current;
-  g_context.surface.GetCurrentTexture(&current);
+  if (!g_context.no_present)
+    g_context.surface.GetCurrentTexture(&current);
   if (current.texture)
   {
     EnsureEncoder();
@@ -629,7 +630,8 @@ void Gfx::PresentBackbuffer()
   Flush();
   // The frame reaches the canvas once this worker's task ends.
   const double t0 = emscripten_get_now();
-  YieldToBrowser();
+  if (!g_context.no_present)
+    YieldToBrowser();
   Stats& st = g_stats_wgpu;
   st.yield_ms += emscripten_get_now() - t0;
   if (++st.presents % 600 == 0)
