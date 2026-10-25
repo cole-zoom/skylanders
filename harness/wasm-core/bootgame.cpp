@@ -392,6 +392,35 @@ static double g_stick_x = 0.0, g_stick_y = 0.0;
 static bool g_pointer_set = false;
 static double g_pointer_x = 0.0, g_pointer_y = 0.0;
 
+// --live-input: the player's keyboard, mouse and gamepad, for the browser
+// shell in web/ (M5). The page writes this struct straight into wasm memory
+// -- the heap is a SharedArrayBuffer, so the CPU thread sees the stores --
+// and the input overrides read it whenever the emulated Wiimote polls. No
+// lock: each field is one aligned word, and a read that races a write sees
+// a button one poll late. The layout is web/input.js's; change both.
+struct LiveInput
+{
+  u32 buttons;             // bit i held = kLiveButtons[i]
+  float stick_x, stick_y;  // Nunchuk stick, -1..1, y up
+  float pointer_x, pointer_y;  // Wii Remote pointer, -1..1, y up
+  u32 pointer_on;          // 0: not overridden (the cursor reads the centre)
+};
+static volatile LiveInput g_live{};
+static bool g_live_on = false;
+static const char* const kLiveButtons[] = {"A",    "B",  "1",    "2",     "+", "-", "Home",
+                                           "Up",   "Down", "Left", "Right", "C", "Z"};
+extern "C" {
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE volatile LiveInput* harness_live_input() { return &g_live; }
+#endif
+// Emulated seconds since stepping began, refreshed with the stage marker,
+// so the page can show the speed (emulated seconds per wall second).
+volatile double g_harness_emulated_s = 0.0;
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE volatile double* harness_emulated_seconds() { return &g_harness_emulated_s; }
+#endif
+}
+
 // Names from WiimoteEmu.h, Nunchuk.h and ControllerEmu.h. A D-pad direction
 // and a face button live in different GROUPS, which is why both halves are
 // carried. Entries whose group begins with "Nunchuk " belong to the
@@ -418,6 +447,20 @@ static bool LookupButton(const std::string& name,
       *out = {e.group, e.control};
       return true;
     }
+  }
+  return false;
+}
+
+// Whether the page holds the control the Wiimote or Nunchuk is reading.
+static bool LiveHeld(std::string_view group, std::string_view control)
+{
+  const u32 buttons = g_live.buttons;
+  for (size_t i = 0; i < std::size(kLiveButtons); ++i)
+  {
+    std::pair<const char*, const char*> e;
+    if ((buttons >> i & 1) && LookupButton(kLiveButtons[i], &e) && group == e.first &&
+        control == e.second)
+      return true;
   }
   return false;
 }
@@ -938,6 +981,7 @@ int main(int argc, char** argv)
   bool want_events = false;
   bool want_input = false;
   std::string input_seq = "A";
+  float emulation_speed = 0.0f;  // --speed=F; 0 = unlimited
   bool want_skylander = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
@@ -1004,6 +1048,14 @@ int main(int argc, char** argv)
       if (argv[i][7] == '=')
         input_seq = argv[i] + 8;
     }
+    // --live-input: take buttons, stick and pointer from the page (web/)
+    // instead of a script. Replaces --input.
+    else if (std::strcmp(argv[i], "--live-input") == 0)
+      g_live_on = true;
+    // --speed=F: limit emulation to F times real time, as Dolphin does when
+    // played (1 = real time). Measuring runs leave it unlimited; see 1e.
+    else if (std::strncmp(argv[i], "--speed=", 8) == 0)
+      emulation_speed = std::strtof(argv[i] + 8, nullptr);
     // --skylander[=ID:VAR]: create a figure and place it on the portal.
     // Defaults to Whirlwind (0, 0x0000), one of the figures that shipped with
     // Spyro's Adventure, so the id/var pair is known-good for this disc.
@@ -1468,6 +1520,33 @@ int main(int argc, char** argv)
       }
     }
   }
+  else if (g_live_on)
+  {
+    if (InputConfig* cfg = Wiimote::GetConfig())
+    {
+      if (auto* controller = cfg->GetController(0))
+      {
+        controller->SetInputOverrideFunction(
+            [](std::string_view group, std::string_view control,
+               ControlState state) -> std::optional<ControlState> {
+              if (group == "IR")
+              {
+                if (!g_live.pointer_on)
+                  return std::nullopt;
+                if (control == "X")
+                  return g_live.pointer_x;
+                if (control == "Y")
+                  return g_live.pointer_y;
+                return std::nullopt;
+              }
+              if (group != "Buttons" && group != "D-Pad")
+                return std::nullopt;
+              return LiveHeld(group, control) ? 1.0 : 0.0;
+            });
+        std::printf("  input     live, from the page\n");
+      }
+    }
+  }
   check(true, "controller configs loaded");
 
   // ── the Nunchuk ──
@@ -1496,11 +1575,13 @@ int main(int argc, char** argv)
               if (group == "Stick")
               {
                 if (control == "X")
-                  return g_stick_x;
+                  return g_live_on ? g_live.stick_x : g_stick_x;
                 if (control == "Y")
-                  return g_stick_y;
+                  return g_live_on ? g_live.stick_y : g_stick_y;
                 return std::nullopt;
               }
+              if (group == "Buttons" && g_live_on)
+                return LiveHeld("Nunchuk Buttons", control) ? 1.0 : 0.0;
               if (group == "Buttons")
               {
                 const bool held = std::string_view(g_press_group) == "Nunchuk Buttons" &&
@@ -1589,8 +1670,9 @@ int main(int argc, char** argv)
   //     measuring: at 95% of real time it was already costing 184 ms of a
   //     2.2 s run in clock reads and sleeps, and past 100% it would hold
   //     the speed line at exactly 100% whatever the recompiler did. Zero
-  //     means unlimited (CoreTiming::IsSpeedUnlimited).
-  Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 0.0f);
+  //     means unlimited (CoreTiming::IsSpeedUnlimited). --speed=1 puts the
+  //     limit back, for playing (web/).
+  Config::SetCurrent(Config::MAIN_EMULATION_SPEED, emulation_speed);
 
   // 2. DSP HLE. HW::Init passes MAIN_DSP_HLE to DSPManager::Init and the LLE
   //    path spawns a dedicated DSP thread; HLE runs the DSP on the caller.
@@ -3149,6 +3231,8 @@ int main(int argc, char** argv)
       std::snprintf(buf, sizeof(buf), "stepping %lluM",
                     static_cast<unsigned long long>(i / 1000000));
       InitMark(buf);
+      g_harness_emulated_s =
+          static_cast<double>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) / 729e6;
       next_mark = i + (1u << 22);
     }
     if (tick_cap &&

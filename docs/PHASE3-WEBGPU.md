@@ -519,6 +519,43 @@ the next points to buy headroom.
 **M5 — the browser shell.** `web/`: the page, the canvas, input, the disc
 streaming that already works in the harness. Overlaps Phase 4.
 
+*Done* (2026-10-25). `web/build.sh && node web/serve.mjs /tmp/ssa.iso`,
+then http://127.0.0.1:8080/ in Chrome.
+
+- **The page** (`web/index.html`, `web/shell.js`) boots the same module
+  every measurement runs (`bootgame.cpp`, WebGPU, JIT, dual core) with
+  `--live-input --speed=1 --skylander`. It shows a boot status, a speed
+  readout and a fullscreen button. Before loading anything it checks for
+  WebGPU, JSPI and cross-origin isolation, so a missing one is reported in
+  words, not as an abort. Query: `speed=`, `figure=ID:VAR`, `log=1`.
+- **Input** (`web/input.js`): keyboard, mouse and standard-mapping
+  gamepads become one 24-byte struct the page writes straight into wasm
+  memory. `--live-input` points the Wiimote's and Nunchuk's input
+  overrides at it, the same hook the scripted `--input` uses, so no
+  Dolphin patch was needed. The layout is fixed in both files.
+- **Real time**: `--speed=1` turns Dolphin's throttle back on (the
+  Video Interface calls it every field); measuring runs keep it off.
+- **One origin** (`web/serve.mjs`): page and module with COOP/COEP, and the
+  disc at `/disc`, ranges only.
+- **Smoke test** (`web/smoke.mjs`): headless Chrome, keys sent through
+  Chrome's input pipeline. Tapping Space every 2 s takes the game from boot
+  through the intro and Flynn's dialogue to Shattered Island (about 4.5
+  min of real time); `MOVE_FROM=` then holds W and D, and Whirlwind
+  walks.
+
+*Measured with it.* The speed readout holds at about 100% and never above,
+so the limit works. It dips to 84–94% in the stretch before gameplay (about
+120–260 s in) and **to 87–91% while walking**: the M4 gate's window taps A
+in place, and moving through the level costs more. Real play is not yet at
+100% everywhere, so the M4 headroom work (item 3) still matters.
+
+*Not done here.* Audio (Null audio; Phase 4's AudioWorklet), the portal
+UI (the figure is fixed by `figure=`), saves, the pointer checked in a
+real menu (mapped, not tested), and the canvas at the game's own aspect
+(the backend's surface is a fixed 640x528, scaled by CSS). `web/` is plain
+JavaScript modules, not TypeScript as `ARCHITECTURE.md` planned. There is
+no build step to justify yet.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.
