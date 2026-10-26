@@ -652,6 +652,61 @@ unless stated, frames 23,846 in all but one:
   bug. A clean block could point at bytes the uniform buffer had since
   wrapped over; now its upload is re-sent after a wrap. M3 passes.
 
+### The recompiler, after headroom: code size, then accuracy
+
+Walking under WebGPU was 91%, and the walking profile put 83% of the CPU
+thread in compiled guest code, spread over ~14,000 blocks. All numbers
+below are the walking window (`--walk-from`, 300-400 s), frames 23,846 in
+every run.
+
+*What it is not.* Chrome does optimise the blocks: with the fast
+compiler only (`--liftoff-only`) the boot runs at 82% against 145%, but
+forcing the optimising compiler on everything (`--no-liftoff`) or
+optimising sooner (`--wasm-tiering-budget=100000`) leaves the walking
+window where it was (107.3% / 107.3% / 109.1% against 107.3%).
+`run-boot-browser.mjs` passes `JS_FLAGS` through for such A/Bs.
+
+*What it is: code size.* `--jit-dump=PC[,PC...]` prints a block's
+module and `harness/wasm-core/jit-asm.mjs` prints the ARM64 TurboFan
+makes of it. The hottest block (`0x8037ac20`, ~60 guest instructions of
+`lfs`/`fmuls`/`fadds`/`stfs`) was 5,874 machine instructions, 23 KB. TurboFan
+lays rarely taken paths inline, so every memory access carried ~45
+instructions of fallback (the hardware-register test, the hatch call,
+the bail, the budget charges) around ~14 that run. A probe that adds one
+more never-taken copy of that fallback to each access
+(`--jit-probe-pad`) costs a fifth of the speed: **106.1% -> 86.4 / 86.8%**.
+
+*What changed* (Null walking, each line on top of the one before):
+
+| | walking, Null (points) | the change |
+|---|---|---|
+| before | 106.8-107.0% | |
+| compact slow paths | +4 | each slow path is one call to a helper (`slowpaths.h`): the hatch, and an access the region table does not map; the helper charges the budget and leaves the exit PC in a fixed slot |
+| FPRF as Dolphin's JITs | +2.3 | the inline FP forms leave FPSCR[FPRF] alone unless `Config::MAIN_FPRF` (default off) |
+| FP at Dolphin's JIT accuracy | +2.4, then +3 | add/sub/mul/div and the paired multiply-adds without the operand tests and hatch fallbacks that only served FPSCR's exception bits; Force25Bit, the NI flush and the fmadd tie correction (`MAIN_ACCURATE_FMADDS`, default on) kept |
+| short float conversions | +0.7 | `lfs`/`stfs`/`psq_l` through promote/demote, the bitwise path only for NaNs and inexact stores; exact |
+| scalar fmadds, frsp, fctiwz inline | +3 | at Dolphin's JIT accuracy; interpreter traffic 476M -> 263M instructions over the run |
+| **all** | **122.8 / 123.3%** | |
+
+Under WebGPU, the number this started from, alternating runs: **old 90.9
+/ 91.0%, new 103.1 / 103.2%**. Screenshots at the end of both show the
+same scene and position.
+
+*Accuracy.* The exact switches (compact, short conversions) pass the
+differentials (`run-jitdiff.sh /tmp/jitdiff.js --compact
+--short-convert`, now also nightly), and mutants of each fail them. The
+chain differential now traps (`twi`) in one chain in eight, which is the
+first thing to reach the hatch's own exit; before, an over-charge there
+passed. The FP mode is not the interpreter's: FPSCR's exception bits and
+NaN payloads are what Dolphin's own JITs make of them by default, and
+`--jit-exact-fp --jit-fprf` restores the exact forms.
+
+*Left.* The interpreter still takes stores to the hardware registers,
+`cror`, `psq_st` to the pipe, `dcbz_l`, `ps_sum0`, `lwbrx`, `andi.`, `andis.`
+(263M instructions over the run, ~2-3% of the CPU thread). Per access the
+hot path is still ~14 instructions with a dependent table load, and
+guest registers live in memory.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

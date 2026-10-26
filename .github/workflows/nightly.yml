@@ -187,3 +187,9 @@ jobs:
         # that fails returns non-zero, and so does one that fails its own
         # coverage assertions, which is the point of having them.
         run: harness/wasm-core/run-jitdiff.sh
+
+      - name: the four differentials, as the game compiles
+        # The same suite with the slow paths as helper calls and the float
+        # conversions through promote/demote -- the dispatcher's defaults,
+        # both meant to be exact. The module is the one the step above built.
+        run: node --max-old-space-size=8192 --expose-gc /tmp/jitdiff.js --compact --short-convert

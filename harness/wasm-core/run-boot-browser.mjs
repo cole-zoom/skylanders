@@ -72,6 +72,9 @@ try {
                           // headless viewport is shorter, and a screenshot
                           // of what lies below it comes back white.
                           '--window-size=1024,768',
+                          // JS_FLAGS=... passes V8 flags through, e.g. to
+                          // pin wasm to one compiler tier for an A/B.
+                          ...(process.env.JS_FLAGS ? [`--js-flags=${process.env.JS_FLAGS}`] : []),
                           `--user-data-dir=${profile}`, 'http://127.0.0.1:8102/index.html'],
                  { stdio: ['ignore', 'ignore', 'pipe'] });
   chrome.stderr.setEncoding('utf8');

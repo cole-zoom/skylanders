@@ -181,6 +181,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE u32 ppc_interp_op(u32 /*state*/, u32 ins, u32 pc
   return st.pc != pc + 4 ? 1u : 0u;
 }
 
+#include "slowpaths.h"
+
 #if defined(__EMSCRIPTEN__)
 // The import object every block module is instantiated with: the heap, the
 // table, and the interpreter hatch, which is this module's own export.
@@ -190,6 +192,8 @@ EM_JS(void, JitImportsInit, (), {
       memory: wasmMemory,
       __indirect_function_table: wasmTable,
       ppc_interp_op: wasmExports['ppc_interp_op'],
+      ppc_hatch_exit: wasmExports['ppc_hatch_exit'],
+      ppc_mem_slow: wasmExports['ppc_mem_slow'],
     },
   };
 });
@@ -1086,6 +1090,12 @@ int main(int argc, char** argv)
   bool want_idle_skip = true;
   u32 jit_threshold = 16;
   bool want_jit_names = false;
+  bool want_probe_pad = false;
+  bool want_compact = true;
+  bool want_fast_fp = true;
+  bool want_short_convert = true;
+  bool want_fprf = false;  // or Config::MAIN_FPRF; see below
+  std::vector<u32> jit_dump_pcs;
   bool want_hatch = true;
   bool want_phys = true;
   bool want_gp = true;
@@ -1264,6 +1274,17 @@ int main(int argc, char** argv)
     // than to wasm-function[k] in a module identified by hash.
     else if (std::strcmp(argv[i], "--jit-names") == 0)
       want_jit_names = true;
+    // --jit-dump=PC[,PC...]: print the module holding the block at each PC
+    // (JITMOD <pc> <function> <bytes>, then base64 "F " lines), so the
+    // emitted code can be read and run through V8 outside the game
+    // (harness/wasm-core/jit-asm.mjs prints the machine code).
+    else if (std::strncmp(argv[i], "--jit-dump=", 11) == 0)
+      for (const char* q = argv[i] + 11; *q;)
+      {
+        char* e;
+        jit_dump_pcs.push_back(static_cast<u32>(std::strtoul(q, &e, 16)));
+        q = *e == ',' ? e + 1 : e;
+      }
     // --jit-no-hatch: an untranslated instruction ends its block and goes
     // through the dispatcher to the interpreter, as it used to.
     else if (std::strcmp(argv[i], "--jit-no-hatch") == 0)
@@ -1293,6 +1314,28 @@ int main(int argc, char** argv)
     // (and retire the block when first), as they used to.
     else if (std::strcmp(argv[i], "--jit-no-l1") == 0)
       want_l1 = false;
+    // --jit-fprf: the inline floating-point forms write FPSCR[FPRF], as the
+    // interpreter does. Off by default because Config::MAIN_FPRF is, which
+    // is what Dolphin's own JITs follow (StateLayout::fprf).
+    else if (std::strcmp(argv[i], "--jit-fprf") == 0)
+      want_fprf = true;
+    // --jit-exact-fp: floating-point arithmetic exact to the interpreter,
+    // FPSCR exception bits and all, instead of at Dolphin's JIT accuracy
+    // (StateLayout::fast_fp).
+    else if (std::strcmp(argv[i], "--jit-exact-fp") == 0)
+      want_fast_fp = false;
+    // --jit-no-compact: the slow paths inline in each block, as they were
+    // before StateLayout::hatch_exit_index.
+    else if (std::strcmp(argv[i], "--jit-no-compact") == 0)
+      want_compact = false;
+    // --jit-no-short-convert: float loads and stores convert bit by bit, as
+    // before StateLayout::short_convert. Both ways are exact.
+    else if (std::strcmp(argv[i], "--jit-no-short-convert") == 0)
+      want_short_convert = false;
+    // --jit-probe-pad: every RAM access carries a dead copy of its miss
+    // branch (StateLayout::probe_cold_pad), to price inline cold code.
+    else if (std::strcmp(argv[i], "--jit-probe-pad") == 0)
+      want_probe_pad = true;
     // --dual-core: Dolphin's dual-core mode. The GPU -- VideoCommon's
     // command processing, vertex loading and texture cache, which is 42%
     // of the emulation thread's time in gameplay with the Null backend --
@@ -2421,6 +2464,14 @@ int main(int argc, char** argv)
   jit_layout.ps_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, ps));
   jit_layout.interp_hatch = want_hatch;
   jit_layout.hatch_mmio = want_hatch;
+  // Function 0 is ppc_interp_op; 1 and 2 the compact helpers, imported
+  // after it whenever the hatch is.
+  if (want_hatch && want_compact)
+  {
+    jit_layout.hatch_exit_index = 1;
+    jit_layout.mem_slow_index = 2;
+    jit_layout.exit_value_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_jit_exit_value));
+  }
   jit_layout.pc_offset = static_cast<u32>(offsetof(PowerPC::PowerPCState, pc));
   g_hatch_interp = &system.GetInterpreter();
   g_hatch_ppc = &ppc;
@@ -2453,6 +2504,10 @@ int main(int argc, char** argv)
     jit_layout.gqr_values = &state.spr[SPR_GQR0];
   jit_layout.paired_madd = want_madd && want_hatch;
   jit_layout.cr_diff = want_crdiff;
+  jit_layout.probe_cold_pad = want_probe_pad;
+  jit_layout.fprf = want_fprf || Config::Get(Config::MAIN_FPRF);
+  jit_layout.fast_fp = want_fast_fp;
+  jit_layout.short_convert = want_short_convert;
   // The write-gather pipe, when the DBATs map it where every Wii game
   // has it; see StateLayout::gather_pipe_ea. The physical tier runs the
   // exception handlers, which issue no GX commands, and keeps the hatch.
@@ -2751,8 +2806,18 @@ int main(int argc, char** argv)
     if (want_link)
       mb.ImportTable();
     if (want_hatch)
+    {
       mb.ImportFunction("env", "ppc_interp_op", {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
                         {ppc2wasm::kI32});
+      // Imported whether or not they are used, so the indices are fixed.
+      mb.ImportFunction("env", "ppc_hatch_exit",
+                        {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
+                        {ppc2wasm::kI32});
+      mb.ImportFunction("env", "ppc_mem_slow",
+                        {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32,
+                         ppc2wasm::kI32},
+                        {ppc2wasm::kI32});
+    }
     mb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
 
     struct Pending
@@ -2900,6 +2965,13 @@ int main(int argc, char** argv)
 
     const double t_install0 = want_jit_stats ? JitNow() : 0.0;
     const auto bytes = mb.Build();
+    for (size_t k = 0; k < pending.size(); ++k)
+      if (std::find(jit_dump_pcs.begin(), jit_dump_pcs.end(), pending[k].pc) !=
+          jit_dump_pcs.end())
+      {
+        std::printf("JITMOD %08x f%zu %zu\n", pending[k].pc, k, bytes.size());
+        EmitBase64(bytes);
+      }
     const int base =
         JitInstallBatch(bytes.data(), static_cast<int>(bytes.size()),
                         static_cast<int>(pending.size()));

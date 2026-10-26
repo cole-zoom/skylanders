@@ -398,6 +398,60 @@ struct StateLayout
   // interpreted one at a time over 390 emulated seconds, 99% of
   // everything still interpreted.
   uint32_t l1_cache_base = 0;
+
+  // A measuring probe, not a feature: every RAM access carries a second,
+  // never-taken copy of its miss branch, to measure what cold code inline
+  // in the hot path costs (instruction cache, taken branches).
+  bool probe_cold_pad = false;
+
+  // Whether the inline floating-point forms write FPSCR[FPRF], the class
+  // of each result. Dolphin's own JITs follow Config::MAIN_FPRF, off by
+  // default, and leave FPRF alone when it is; this does the same. On, the
+  // inline forms match the interpreter bit for bit, which is what the
+  // differentials check. What goes through the hatch always writes it.
+  bool fprf = true;
+
+  // The arithmetic forms (EmitFpBinary) at the accuracy of Dolphin's own
+  // JITs: Force25Bit on a single multiply's multiplicand, the operation,
+  // the rounding to single, and nothing else -- no FPSCR exception bits
+  // (VXSNAN, VXISI, ZX, ...), no interpreter for NaN, infinite or
+  // subnormal operands, NaNs as the host makes them. That is what
+  // JitArm64::fp_arith does with Config::MAIN_ACCURATE_NANS off, its
+  // default. The NI flush stays: it changes results, not just flags.
+  bool fast_fp = false;
+
+  // lfs/stfs/psq_l's float conversions through promote and demote, with
+  // the bitwise path only for what those would get wrong (see
+  // EmitConvertToDoubleShort). Exact either way; off is the old code.
+  bool short_convert = false;
+
+  // ── compact slow paths ──
+  //
+  // TurboFan lays a block's rarely taken paths inline, between the hot
+  // instructions, so their size is paid in instruction cache and taken
+  // branches on every run of the block. A never-taken copy of the miss
+  // branch on each memory access measured the walking window 106% -> 87%.
+  //
+  // When these are set, the slow paths shrink to one call each. Both
+  // helpers do what the inline code did -- run the instruction through
+  // the interpreter or refuse it, and charge the budget for what the block
+  // ran -- and return 0 to carry on or 1 to leave the block, having
+  // written the value to leave with (a PC, with the low bit set for a
+  // bail) at exit_value_addr:
+  //
+  //   hatch_exit(state, ins, pc, insts_before) -> i32
+  //       the hatch: the interpreter runs `ins`; leave if it branched.
+  //   mem_slow(state, ea, ins, pc, insts_before) -> i32
+  //
+  // insts_before carries enable_linking in its top bit: the budget is
+  // charged only when blocks link, as the inline paths do.
+  //       an access whose address the region table does not map: the
+  //       hardware registers through the interpreter, anything else a bail.
+  //
+  // Function indices in the module, 0 for off.
+  uint32_t hatch_exit_index = 0;
+  uint32_t mem_slow_index = 0;
+  uint32_t exit_value_addr = 0;
 };
 
 namespace detail
@@ -580,9 +634,39 @@ inline void EmitIsMmio(Bytes& b, uint32_t ea_local)
 // Call the interpreter for `ins` at `pc` (StateLayout::interp_hatch) and,
 // if control did not simply advance, charge the budget and leave with the
 // PC the interpreter set. Leaves nothing on the stack.
+// Leave the block with the value a compact slow-path helper wrote, when the
+// helper's result (on the stack) is non-zero.
+inline void EmitSlowExit(Bytes& b, const StateLayout& l)
+{
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.exit_value_addr));
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, 0);
+  b.push_back(kReturn);
+  b.push_back(kEnd);
+}
+
 inline void EmitHatchCall(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc,
                           uint32_t insts_before)
 {
+  if (l.hatch_exit_index)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(ins));
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(pc));
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(insts_before | (l.enable_linking ? 0x80000000u : 0u)));
+    b.push_back(kCall);
+    PutU32(b, l.hatch_exit_index);
+    EmitSlowExit(b, l);
+    return;
+  }
   b.push_back(kLocalGet);
   PutU32(b, 0);
   b.push_back(kI32Const);
@@ -616,6 +700,17 @@ inline void EmitHatchCall(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t
   PutU32(b, l.pc_offset);
   b.push_back(kReturn);
   b.push_back(kEnd);
+}
+
+// Whether a store based on `ra` is worth the inline gather-pipe path. Under
+// the compact slow paths a store to the pipe that skips it still reaches
+// the pipe exactly, through the interpreter, so this decides only size: r1
+// is the stack pointer and r2 and r13 the EABI's small-data anchors, and
+// GX commands are never written through any of them. Every function
+// prologue's stores were paying for the path.
+inline bool MayStoreToGatherPipe(const StateLayout& l, uint32_t ra)
+{
+  return !l.hatch_exit_index || (ra != 1 && ra != 2 && ra != 13);
 }
 
 // A store that may take the gather-pipe fast path (StateLayout::
@@ -743,6 +838,7 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
   b.push_back(kI32Eqz);
   b.push_back(kIf);
   b.push_back(kVoid);
+  auto emit_miss = [&]() {
   if (l.l1_cache_base)
   {
     // The locked cache: (ea - 0xE0000000) < 0x40000. Its base goes where
@@ -767,6 +863,27 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
     b.push_back(kEnd);
   }
   emit_gather_pipe();
+  if (via_hatch && l.mem_slow_index)
+  {
+    // Compact: the helper takes the hardware registers to the
+    // interpreter and refuses anything else, as the code below does.
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(ins));
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(bail_pc));
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(insts_before | (l.enable_linking ? 0x80000000u : 0u)));
+    b.push_back(kCall);
+    PutU32(b, l.mem_slow_index);
+    EmitSlowExit(b, l);
+    b.push_back(kBr);
+    PutU32(b, skip_depth + 1);  // out of the miss branch and the caller's block
+    return;
+  }
   if (via_hatch)
   {
     // The hardware registers go to the interpreter; anything else outside
@@ -780,6 +897,8 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
     b.push_back(kEnd);
   }
   EmitBailBody(b, l, bail_pc, insts_before);
+  };
+  emit_miss();
   b.push_back(kEnd);
   // ea = base + (ea & 0x01FFFFFF)
   b.push_back(kLocalGet);
@@ -792,6 +911,20 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
   b.push_back(kI32Add);
   b.push_back(kLocalSet);
   PutU32(b, ea_local);
+  if (l.probe_cold_pad)
+  {
+    // A measuring probe: the miss branch again, behind a test that never
+    // holds (no host address is 1). Never runs; only makes the code bigger.
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32Eq);
+    b.push_back(kIf);
+    b.push_back(kVoid);
+    emit_miss();
+    b.push_back(kEnd);
+  }
 }
 
 // Compute the effective address of a d(rA) operand into ea_local.
@@ -1607,6 +1740,72 @@ inline void EmitBswap64(Bytes& b, uint32_t local)
 // double on the stack. Not f64.promote_f32 -- that would quiet a
 // signalling NaN, and the guest keeps it signalling. Uses i32 locals 5 and
 // 6 as scratch; they belong to the link epilogue and are dead here.
+inline void EmitConvertToDouble(Bytes& b, uint32_t local);
+inline void EmitConvertToSingle(Bytes& b, uint32_t local);
+
+// The same two conversions, shorter and still exact. f64.promote_f32 IS
+// ConvertToDouble for every float that is not a NaN (normals, zeros, and
+// subnormals, which it normalises exactly as the interpreter's loop does);
+// only a NaN, which promote would quiet, takes the bitwise path. Going
+// the other way, f32.demote_f64 is ConvertToSingle's truncation for every
+// double that is exactly a float and not a NaN, which is every value a
+// paired-single computation stores; anything else takes the bitwise path.
+inline void EmitConvertToDoubleShort(Bytes& b, uint32_t local)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI32Const);
+  PutI32(b, 0x7F800000);
+  b.push_back(kI32And);
+  b.push_back(kI32Const);
+  PutI32(b, 0x7F800000);
+  b.push_back(kI32Eq);
+  b.push_back(kIf);
+  b.push_back(kI64);
+  EmitConvertToDouble(b, local);
+  b.push_back(kElse);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kF32ReinterpretI32);
+  b.push_back(kF64PromoteF32);
+  b.push_back(kI64ReinterpretF64);
+  b.push_back(kEnd);
+}
+
+// Uses i32 local 5, as EmitConvertToSingle does.
+inline void EmitConvertToSingleShort(Bytes& b, uint32_t local)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kF64ReinterpretI64);
+  b.push_back(kF32DemoteF64);
+  b.push_back(kI32ReinterpretF32);
+  b.push_back(kLocalTee);
+  PutU32(b, 5);
+  b.push_back(kF32ReinterpretI32);
+  b.push_back(kF64PromoteF32);
+  b.push_back(kI64ReinterpretF64);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI64Ne);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kI64Const);
+  PutI64(b, 0x7FF0000000000000ll);
+  b.push_back(kI64And);
+  b.push_back(kI64Const);
+  PutI64(b, 0x7FF0000000000000ll);
+  b.push_back(kI64Eq);
+  b.push_back(kI32Or);
+  b.push_back(kIf);
+  b.push_back(kI32);
+  EmitConvertToSingle(b, local);
+  b.push_back(kElse);
+  b.push_back(kLocalGet);
+  PutU32(b, 5);
+  b.push_back(kEnd);
+}
+
 inline void EmitConvertToDouble(Bytes& b, uint32_t local)
 {
   // exp -> local 5, frac -> local 6
@@ -1955,7 +2154,8 @@ inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32
   // single store may take the gather-pipe path, converted exactly as for
   // RAM. Local 3 is free when there is no update.
   GatherPipeStore gp;
-  if (is_store && !update && !is_double && !as_integer && l.gather_pipe_ea)
+  if (is_store && !update && !is_double && !as_integer && l.gather_pipe_ea &&
+      MayStoreToGatherPipe(l, ra))
   {
     gp.size = 4;
     gp.ptr_local = 3;
@@ -1967,7 +2167,10 @@ inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32
       PutU32(bb, ps0);
       bb.push_back(kLocalSet);
       PutU32(bb, 9);
-      EmitConvertToSingle(bb, 9);
+      if (l.short_convert)
+        EmitConvertToSingleShort(bb, 9);
+      else
+        EmitConvertToSingle(bb, 9);
       bb.push_back(kLocalSet);
       PutU32(bb, 2);
       bb.push_back(kLocalGet);
@@ -2021,7 +2224,10 @@ inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32
       PutU32(b, ps0);
       b.push_back(kLocalSet);
       PutU32(b, 9);
-      EmitConvertToSingle(b, 9);
+      if (l.short_convert)
+        EmitConvertToSingleShort(b, 9);
+      else
+        EmitConvertToSingle(b, 9);
       b.push_back(kLocalSet);
       PutU32(b, 2);
       EmitBswap32(b, 2);
@@ -2060,7 +2266,10 @@ inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32
     EmitBswap32(b, 2);
     b.push_back(kLocalSet);
     PutU32(b, 2);
-    EmitConvertToDouble(b, 2);
+    if (l.short_convert)
+      EmitConvertToDoubleShort(b, 2);
+    else
+      EmitConvertToDouble(b, 2);
     b.push_back(kLocalSet);
     PutU32(b, 9);
     b.push_back(kLocalGet);
@@ -2284,7 +2493,10 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
       EmitBswap32(b, 2);
       b.push_back(kLocalSet);
       PutU32(b, 2);
-      EmitConvertToDouble(b, 2);
+      if (l.short_convert)
+        EmitConvertToDoubleShort(b, 2);
+      else
+        EmitConvertToDouble(b, 2);
       b.push_back(kLocalSet);
       PutU32(b, 9);
       b.push_back(kLocalGet);
@@ -2686,6 +2898,8 @@ inline void EmitForceSingleOrHatch(Bytes& b, const StateLayout& l, uint32_t ins,
   lget(src); i64c(static_cast<int64_t>(0x8000000000000000ull)); op(kI64And); lset(src);
   op(kEnd);
   lget(src); op(kF64ReinterpretI64); op(kF32DemoteF64); op(kI32ReinterpretF32); lset(dst);
+  if (l.fast_fp)
+    return;  // an infinite or NaN result is kept, as Dolphin's JITs keep it
   lget(dst); i32c(0x7F800000); op(kI32And); i32c(0x7F800000); op(kI32Eq);
   op(kIf); op(kVoid);
   EmitHatchCall(b, l, ins, pc, n);
@@ -2700,7 +2914,7 @@ inline void EmitForceSingleOrHatch(Bytes& b, const StateLayout& l, uint32_t ins,
 // float in local 2 into local 6, using 5: normal 0x4/0x8, zero 0x2/0x12,
 // denormal 0x14/0x18 (positive/negative). `select` takes its first
 // operand when the condition holds, so the negative code goes first.
-inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired)
+inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired, bool fprf = true)
 {
   auto op = [&](uint8_t o) { b.push_back(o); };
   auto u = [&](uint32_t v) { PutU32(b, v); };
@@ -2711,6 +2925,8 @@ inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired)
   op(kI64Store); u(3); u(pd);
   lget(0); lget(paired ? 3 : 2); op(kF32ReinterpretI32); op(kF64PromoteF32);
   op(kI64ReinterpretF64); op(kI64Store); u(3); u(pd + 8);
+  if (!fprf)
+    return;
   lget(2); i32c(31); op(kI32ShrU); lset(5);  // sign
   // zero code | denormal code, by the mantissa
   i32c(0x12); i32c(0x2); lget(5); op(kSelect);
@@ -2769,9 +2985,80 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
     i64c(0x7FF0000000000000ll); op(kI64And); i64c(0x7FF0000000000000ll); op(kI64Eq);
   };
   auto fpscr_load = [&]() { lget(0); op(kI32Load); u(2); u(l.fpscr_offset); };
+  // Under NI, flush the double in local 9 to a signed zero when its
+  // magnitude is below `limit` (the smallest normal single or double).
+  auto ni_flush = [&](int64_t limit) {
+    fpscr_load(); i32c(4); op(kI32And); i32c(0); op(kI32Ne);
+    lget(9); i64c(0x7FFFFFFFFFFFFFFFll); op(kI64And); i64c(limit); op(kI64LtU);
+    op(kI32And);
+    op(kIf); op(kVoid);
+    lget(9); i64c(static_cast<int64_t>(0x8000000000000000ull)); op(kI64And); lset(9);
+    op(kEnd);
+  };
 
   op(kBlock);
   op(kVoid);
+
+  if (l.fast_fp)
+  {
+    for (int h = 0; h < halves; ++h)
+    {
+      const uint32_t ha = pa + h * 8;
+      const uint32_t h2 = p2 + ((kind == 2 && c_half >= 0) ? c_half : h) * 8;
+      load64(ha); op(kF64ReinterpretI64);
+      load64(h2);
+      if (kind == 2 && single)
+      {
+        lset(10);
+        lget(10); i64c(static_cast<int64_t>(0xFFFFFFFFF8000000ull)); op(kI64And);
+        lget(10); i64c(0x0000000008000000ll); op(kI64And); op(kI64Add);
+      }
+      op(kF64ReinterpretI64);
+      op(kind == 0 ? kF64Add : kind == 1 ? kF64Sub : kind == 2 ? kF64Mul : kF64Div);
+      op(kI64ReinterpretF64);
+      lset(9);
+      if (single)
+      {
+        ni_flush(0x3810000000000000ll);
+        lget(9); op(kF64ReinterpretI64); op(kF32DemoteF64); op(kI32ReinterpretF32); lset(2 + h);
+      }
+      else
+      {
+        ni_flush(0x0010000000000000ll);
+      }
+    }
+    if (single)
+    {
+      EmitSingleWrites(b, pd, paired, l.fprf);
+    }
+    else
+    {
+      lget(0); lget(9); op(kI64Store); u(3); u(pd);
+      if (l.fprf)
+      {
+        lget(9); i64c(63); op(kI64ShrU); op(kI32WrapI64); lset(5);
+        i32c(0x12); i32c(0x2); lget(5); op(kSelect);
+        i32c(0x18); i32c(0x14); lget(5); op(kSelect);
+        lget(9); i64c(0x000FFFFFFFFFFFFFll); op(kI64And); op(kI64Eqz); op(kSelect);
+        i32c(0x8); i32c(0x4); lget(5); op(kSelect);
+        lget(9); i64c(0x7FF0000000000000ll); op(kI64And); op(kI64Eqz); op(kSelect);
+        lset(6);
+      }
+    }
+    if (l.fprf)
+    {
+      // FPRF for a NaN or infinity is not computed here: the code above
+      // classes only finite values, so with fprf on this is approximate.
+      lget(0);
+      fpscr_load();
+      i32c(static_cast<int32_t>(~(0x1Fu << 12)));
+      op(kI32And);
+      lget(6); i32c(12); op(kI32Shl); op(kI32Or);
+      op(kI32Store); u(2); u(l.fpscr_offset);
+    }
+    op(kEnd);
+    return;
+  }
 
   // ── the tests, before anything is written ──
   i32c(0);
@@ -2847,7 +3134,11 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
   // ── the writes ──
   if (single)
   {
-    EmitSingleWrites(b, pd, paired);
+    EmitSingleWrites(b, pd, paired, l.fprf);
+  }
+  else if (!l.fprf)
+  {
+    lget(0); lget(9); op(kI64Store); u(3); u(pd);
   }
   else
   {
@@ -2861,6 +3152,11 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
     lset(6);
   }
   // fpscr = (fpscr & ~FPRF [& ~(FI|FR) for a multiply]) | code << 12
+  if (!l.fprf)
+  {
+    op(kEnd);
+    return;
+  }
   lget(0);
   fpscr_load();
   i32c(static_cast<int32_t>(~((0x1Fu << 12) | ((kind == 2 && !paired) ? (0x3u << 17) : 0u))));
@@ -2900,8 +3196,11 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
 // 13 the result, 14 a'; i32 2 and 3 the single results, 5 the slow-path
 // flag, 6 FPRF's code.
 inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc, uint32_t n,
-                       bool sub, bool negate, int c_half)
+                       bool sub, bool negate, int c_half, bool scalar = false)
 {
+  // scalar: fmadds and its kin (opcode 59), one half -- ps0 of each
+  // operand -- and the result in both halves of D.
+  const int halves = scalar ? 1 : 2;
   const uint32_t fd = (ins >> 21) & 0x1F, fa = (ins >> 16) & 0x1F, fb = (ins >> 11) & 0x1F,
                  fc = (ins >> 6) & 0x1F;
   const uint32_t pd = l.ps_offset + fd * 16, pa = l.ps_offset + fa * 16,
@@ -2935,9 +3234,16 @@ inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc
   op(kVoid);
 
   // ── the tests, before anything is written ──
+  //
+  // Not with fast_fp: the operation below is then computed whatever the
+  // operands, as Dolphin's JITs do -- the tie correction (its default
+  // MAIN_ACCURATE_FMADDS) kept, the exception bits and the exact fma for a
+  // value that is not float-exact not.
+  if (!l.fast_fp)
+  {
   i32c(0);
   lset(5);
-  for (int h = 0; h < 2; ++h)
+  for (int h = 0; h < halves; ++h)
   {
     load64(pa + h * 8); is_special(); slow();
     load64(pb + h * 8); is_special(); slow();
@@ -2951,9 +3257,10 @@ inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc
   EmitHatchCall(b, l, ins, pc, n);
   op(kBr); u(1);
   op(kEnd);
+  }
 
   // ── the arithmetic, one half at a time ──
-  for (int h = 0; h < 2; ++h)
+  for (int h = 0; h < halves; ++h)
   {
     load64(pa + h * 8); lset(9);
     // Force25Bit: keep 25 mantissa bits, rounding up on the 26th. c is
@@ -3001,7 +3308,12 @@ inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc
   }
 
   // ── the writes ──
-  EmitSingleWrites(b, pd, true);
+  EmitSingleWrites(b, pd, !scalar, l.fprf);
+  if (!l.fprf)
+  {
+    op(kEnd);
+    return;
+  }
   // fpscr = (fpscr & ~FPRF) | code << 12; FI and FR are not touched.
   lget(0);
   lget(0); op(kI32Load); u(2); u(l.fpscr_offset);
@@ -3010,6 +3322,73 @@ inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc
   lget(6); i32c(12); op(kI32Shl); op(kI32Or);
   op(kI32Store); u(2); u(l.fpscr_offset);
   op(kEnd);
+}
+
+// frsp and fctiwz at Dolphin's JIT accuracy (StateLayout::fast_fp), for the
+// forms without Rc. frsp rounds to single (the NI flush kept, as
+// EmitForceSingleOrHatch keeps it) and fills both halves; no FI, FR or
+// exception bits. fctiwz is JitArm64::fctiwx: a saturating truncation --
+// NaN gives 0 there as here, where the interpreter gives 0x80000000 --
+// with 0xFFF80000 above it in ps0, and ps1 left alone.
+inline void EmitFrspFast(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc, uint32_t n)
+{
+  const uint32_t fd = (ins >> 21) & 0x1F, fb = (ins >> 11) & 0x1F;
+  b.push_back(kBlock);
+  b.push_back(kVoid);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI64Load);
+  PutU32(b, 3);
+  PutU32(b, l.ps_offset + fb * 16);
+  b.push_back(kLocalSet);
+  PutU32(b, 9);
+  EmitForceSingleOrHatch(b, l, ins, pc, n, 9, 2);
+  EmitSingleWrites(b, l.ps_offset + fd * 16, false, l.fprf);
+  if (l.fprf)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.fpscr_offset);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(~((0x1Fu << 12) | (0x3u << 17))));
+    b.push_back(kI32And);
+    b.push_back(kLocalGet);
+    PutU32(b, 6);
+    b.push_back(kI32Const);
+    PutI32(b, 12);
+    b.push_back(kI32Shl);
+    b.push_back(kI32Or);
+    b.push_back(kI32Store);
+    PutU32(b, 2);
+    PutU32(b, l.fpscr_offset);
+  }
+  b.push_back(kEnd);
+}
+
+inline void EmitFctiwzFast(Bytes& b, const StateLayout& l, uint32_t ins)
+{
+  const uint32_t fd = (ins >> 21) & 0x1F, fb = (ins >> 11) & 0x1F;
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI64Load);
+  PutU32(b, 3);
+  PutU32(b, l.ps_offset + fb * 16);
+  b.push_back(kF64ReinterpretI64);
+  b.push_back(kPrefixFC);
+  PutU32(b, 2);  // i32.trunc_sat_f64_s
+  b.push_back(kI64ExtendI32U);
+  b.push_back(kI64Const);
+  PutI64(b, static_cast<int64_t>(0xFFF8000000000000ull));
+  b.push_back(kI64Or);
+  b.push_back(kI64Store);
+  PutU32(b, 3);
+  PutU32(b, l.ps_offset + fd * 16);
 }
 
 // frsp, the common case inline: a value that is already exactly
@@ -3045,6 +3424,11 @@ inline void EmitFrsp(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc, 
   op(kEnd);
   lget(0); lget(9); op(kI64Store); u(3); u(pd);
   lget(0); lget(9); op(kI64Store); u(3); u(pd + 8);
+  if (!l.fprf)
+  {
+    op(kEnd);
+    return;
+  }
   lget(2); i32c(31); op(kI32ShrU); lset(5);
   i32c(0x12); i32c(0x2); lget(5); op(kSelect);
   i32c(0x18); i32c(0x14); lget(5); op(kSelect);
@@ -3212,7 +3596,7 @@ inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t
   // pointer, which an update form needs for the address written back --
   // and no GX command is issued with an update form.
   GatherPipeStore gp;
-  if (is_store && !update && l.gather_pipe_ea)
+  if (is_store && !update && l.gather_pipe_ea && MayStoreToGatherPipe(l, ra))
   {
     gp.size = size;
     gp.ptr_local = 3;
@@ -3722,6 +4106,21 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       else if (xo5 == 20) kind = 1;
       else if (xo5 == 25) kind = 2;
       else if (xo5 == 18) kind = 3;
+      if (kind < 0 && layout.fast_fp && layout.paired_madd && xo5 >= 28 && xo5 <= 31)
+      {
+        // fmsubs 28, fmadds 29, fnmsubs 30, fnmadds 31, at Dolphin's JIT
+        // accuracy only: the interpreter also writes FI and FR for these,
+        // which the paired forms do not, and the exact mode leaves them to it.
+        need_fp(this_pc, n);
+        used_i64 = used_i64 < 6 ? 6 : used_i64;
+        EmitPsMadd(body, layout, ins, this_pc, n, xo5 == 28 || xo5 == 30,
+                   xo5 == 30 || xo5 == 31, -1, true);
+        if (Rc(ins))
+          EmitUpdateCR1(body, layout);
+        touches_memory = true;
+        handled = true;
+        break;
+      }
       if (kind < 0)
         break;
       need_fp(this_pc, n);
@@ -3821,13 +4220,23 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           handled = true;
           break;
         }
+        if (!paired && xo == 15 && layout.fast_fp && !Rc(ins))
+        {
+          need_fp(this_pc, n);
+          EmitFctiwzFast(body, layout, ins);
+          touches_memory = true;
+          handled = true;
+          break;
+        }
         if (kind < 0 && !frsp)
           break;
         if (paired)
           need_pse(this_pc, n);
         else
           need_fp(this_pc, n);
-        if (frsp)
+        if (frsp && layout.fast_fp && !Rc(ins))
+          EmitFrspFast(body, layout, ins, this_pc, n);
+        else if (frsp)
           EmitFrsp(body, layout, ins, this_pc, n);
         else
           EmitFpBinary(body, layout, ins, this_pc, n, kind, paired, paired, c_half);
@@ -5547,42 +5956,9 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           need_pse(this_pc, n);
         else if ((op >= 48 && op <= 63) || op == 4)
           need_fp(this_pc, n);
-        body.push_back(kLocalGet);
-        PutU32(body, 0);
-        body.push_back(kI32Const);
-        PutI32(body, static_cast<int32_t>(ins));
-        body.push_back(kI32Const);
-        PutI32(body, static_cast<int32_t>(this_pc));
-        body.push_back(kCall);
-        PutU32(body, 0);
-        body.push_back(kIf);
-        body.push_back(kVoid);
-        if (layout.enable_linking)
-        {
-          // The instruction ran; charge it with the rest of the block.
-          body.push_back(kLocalGet);
-          PutU32(body, 0);
-          body.push_back(kLocalGet);
-          PutU32(body, 0);
-          body.push_back(kI32Load);
-          PutU32(body, 2);
-          PutU32(body, layout.downcount_offset);
-          body.push_back(kI32Const);
-          PutI32(body, static_cast<int32_t>(n + 1));
-          body.push_back(kI32Sub);
-          body.push_back(kI32Store);
-          PutU32(body, 2);
-          PutU32(body, layout.downcount_offset);
-        }
-        // Leave with the PC the interpreter set. Unmarked: nothing is
-        // left for the dispatcher to do.
-        body.push_back(kLocalGet);
-        PutU32(body, 0);
-        body.push_back(kI32Load);
-        PutU32(body, 2);
-        PutU32(body, layout.pc_offset);
-        body.push_back(kReturn);
-        body.push_back(kEnd);
+        // Charges the instruction with the rest of the block and leaves
+        // with the PC the interpreter set when it did not fall through.
+        EmitHatchCall(body, layout, ins, this_pc, n);
         touches_memory = true;
         handled = true;
         // An mtspr the interpreter ran may have written HID2, which the
@@ -5744,6 +6120,12 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     mb.ImportTable();
   if (layout.interp_hatch)
     mb.ImportFunction("env", "ppc_interp_op", {kI32, kI32, kI32}, {kI32});
+  if (layout.interp_hatch && layout.hatch_exit_index)
+  {
+    // Indices 1 and 2, as StateLayout::hatch_exit_index expects.
+    mb.ImportFunction("env", "ppc_hatch_exit", {kI32, kI32, kI32, kI32}, {kI32});
+    mb.ImportFunction("env", "ppc_mem_slow", {kI32, kI32, kI32, kI32, kI32}, {kI32});
+  }
   mb.SetFunction({kI32}, {kI32}, body, "f", used_locals, used_i64);
   r.module = mb.Build();
   return r;
