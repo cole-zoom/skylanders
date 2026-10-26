@@ -64,11 +64,16 @@ void VertexManager::UploadUniforms()
   auto& vs = system.GetVertexShaderManager();
   auto& gs = system.GetGeometryShaderManager();
   auto& ps = system.GetPixelShaderManager();
-  if (!m_uniforms_uploaded || ps.dirty)
+  // With uniform_dedup every block is offered every draw: SetGXUniforms
+  // drops the unchanged ones for a memcmp, and re-sends one whose upload
+  // the uniform buffer has wrapped past -- which the dirty flags alone
+  // never did, leaving a clean block pointing at overwritten bytes.
+  const bool all = g_context.uniform_dedup;
+  if (all || !m_uniforms_uploaded || ps.dirty)
     GetGfx().SetGXUniforms(0, &ps.constants, sizeof(ps.constants));
-  if (!m_uniforms_uploaded || vs.dirty)
+  if (all || !m_uniforms_uploaded || vs.dirty)
     GetGfx().SetGXUniforms(1, &vs.constants, sizeof(vs.constants));
-  if (!m_uniforms_uploaded || gs.dirty)
+  if (all || !m_uniforms_uploaded || gs.dirty)
     GetGfx().SetGXUniforms(2, &gs.constants, sizeof(gs.constants));
   m_uniforms_uploaded = true;
   vs.dirty = false;

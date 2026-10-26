@@ -710,6 +710,93 @@ static void NoteIdleWait(double ms, u32 backlog)
   }
 }
 
+// --frame-times: every frame's wall time against its emulated time, and
+// what a slow one waited on. The gameplay window's average said 101%; a
+// player in a visible Chrome saw the readout at ~80%, dips to ~28% and a
+// few seconds at 0% while Eon spoke. This is the measurement that sees
+// those. A frame is a change of the scanned-out XFB, as for `frames`.
+struct FrameTime
+{
+  double t_emu;       // emulated s at the frame's end
+  double wall_ms;     // wall time the frame took
+  double emu_ms;      // emulated time it covered
+  double compile_ms;  // GPU thread making shaders and pipelines meanwhile
+  double disc_ms;     // in synchronous disc reads meanwhile
+  double idle_ms;     // the CPU thread waiting for the GPU thread meanwhile
+};
+static std::vector<FrameTime> g_frame_times;
+
+static u64 CompileUs()
+{
+#if defined(HARNESS_WEBGPU)
+  return WebGPU::g_compile_us.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
+}
+
+// Speed per second of wall time -- what the page's readout shows -- and the
+// slow frames, over the frames from `from_s` emulated seconds on.
+static void ReportFrameTimes(const char* label, double from_s)
+{
+  std::vector<double> per_second, walls;
+  double wall = 0, emu = 0;
+  double hitch_ms = 0, hitch_compile = 0, hitch_disc = 0, hitch_idle = 0;
+  u64 hitches = 0;
+  std::vector<const FrameTime*> worst;
+  for (const FrameTime& f : g_frame_times)
+  {
+    if (f.t_emu < from_s)
+      continue;
+    walls.push_back(f.wall_ms);
+    wall += f.wall_ms;
+    emu += f.emu_ms;
+    if (wall >= 1000.0)
+    {
+      per_second.push_back(100.0 * emu / wall);
+      wall = emu = 0;
+    }
+    if (f.wall_ms > 100.0)
+    {
+      ++hitches;
+      hitch_ms += f.wall_ms;
+      hitch_compile += f.compile_ms;
+      hitch_disc += f.disc_ms;
+      hitch_idle += f.idle_ms;
+      worst.push_back(&f);
+    }
+  }
+  if (per_second.empty())
+    return;
+  std::sort(per_second.begin(), per_second.end());
+  std::sort(walls.begin(), walls.end());
+  const auto pct = [](const std::vector<double>& v, double p) {
+    return v[std::min(v.size() - 1, static_cast<size_t>(p * v.size()))];
+  };
+  size_t below90 = 0;
+  for (double v : per_second)
+    below90 += v < 90.0;
+  std::printf("  seconds   %s: %zu wall seconds; speed in each: median %.0f%%, p25 %.0f%%, "
+              "p10 %.0f%%, p1 %.0f%%, worst %.0f%%; %zu below 90%%\n",
+              label, per_second.size(), pct(per_second, 0.5), pct(per_second, 0.25),
+              pct(per_second, 0.10), pct(per_second, 0.01), per_second.front(), below90);
+  std::printf("  frametime %s: %zu frames; wall ms median %.1f, p90 %.1f, p99 %.1f, max %.0f\n",
+              label, walls.size(), pct(walls, 0.5), pct(walls, 0.9), pct(walls, 0.99),
+              walls.back());
+  std::printf("  hitches   %s: %llu frames over 100 ms, %.0f ms in all; during them the GPU "
+              "thread compiled for %.0f ms, disc reads took %.0f ms, the CPU thread waited on "
+              "the GPU thread %.0f ms\n",
+              label, static_cast<unsigned long long>(hitches), hitch_ms, hitch_compile,
+              hitch_disc, hitch_idle);
+  std::sort(worst.begin(), worst.end(),
+            [](const FrameTime* a, const FrameTime* b) { return a->wall_ms > b->wall_ms; });
+  for (size_t i = 0; i < std::min<size_t>(worst.size(), 25); ++i)
+    std::printf("  hitch     t=%.2f s: %.0f ms for %.0f ms emulated; compile %.0f, disc %.0f, "
+                "idle-wait %.0f ms\n",
+                worst[i]->t_emu, worst[i]->wall_ms, worst[i]->emu_ms, worst[i]->compile_ms,
+                worst[i]->disc_ms, worst[i]->idle_ms);
+}
+
 extern "C" void harness_texture_hash(int site, u32 len, u32 samples, u32 rows)
 {
   if (!g_texhash_on || site < 0 || site >= kTexHashSites)
@@ -982,6 +1069,10 @@ int main(int argc, char** argv)
   bool want_input = false;
   std::string input_seq = "A";
   float emulation_speed = 0.0f;  // --speed=F; 0 = unlimited
+  bool want_frame_times = false;
+  u64 walk_from = 0;
+  bool want_dump_uidcache = false;
+  std::string uidcache_url;
   bool want_skylander = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
@@ -1011,6 +1102,7 @@ int main(int argc, char** argv)
   bool want_webgpu_no_upload = false;
   bool want_webgpu_no_draws = false;
   bool want_webgpu_no_present = false;
+  bool want_webgpu_uniform_dedup = true;
   bool want_osd = true;
   std::string fifo_path;
   u64 record_fifo_at = 0;  // --record-fifo=TICKS
@@ -1048,6 +1140,30 @@ int main(int argc, char** argv)
       if (argv[i][7] == '=')
         input_seq = argv[i] + 8;
     }
+    // --frame-times: per-frame wall time, the speed in each wall second,
+    // and what the slow frames waited on (see FrameTime). Turns on
+    // --idle-stats, which it reads.
+    else if (std::strcmp(argv[i], "--frame-times") == 0)
+      want_frame_times = g_idle_stats = true;
+    // --walk-from=TICKS: with --input, from this emulated time on also hold
+    // the Nunchuk stick, a quarter turn every 2 s (up, right, down, left):
+    // walking while the sequence keeps pressing, closer to play than
+    // tapping A in place.
+    else if (std::strncmp(argv[i], "--walk-from=", 12) == 0)
+      walk_from = std::strtoull(argv[i] + 12, nullptr, 0);
+    // --dump-uidcache: at the end, print the shader cache's pipeline UID
+    // file (Dolphin writes one per game, Cache/<game id>.uidcache, a record
+    // of every pipeline the run made) as base64, for web/make-uidcache.sh.
+    else if (std::strcmp(argv[i], "--dump-uidcache") == 0)
+      want_dump_uidcache = true;
+    // --uidcache-url=URL: fetch a UID file before the video backend starts
+    // and put it in Cache/ under the URL's file name, which must be
+    // <game id>.uidcache. Dolphin's shader cache then compiles every
+    // pipeline in it at startup (on the GPU thread, before the game runs:
+    // the backend has no background compiling), instead of the first time
+    // the game draws with each -- the hitches --frame-times found.
+    else if (std::strncmp(argv[i], "--uidcache-url=", 15) == 0)
+      uidcache_url = argv[i] + 15;
     // --live-input: take buttons, stick and pointer from the page (web/)
     // instead of a script. Replaces --input.
     else if (std::strcmp(argv[i], "--live-input") == 0)
@@ -1219,6 +1335,10 @@ int main(int argc, char** argv)
     // and on the CPU thread through the caches (docs/PHASE3-WEBGPU.md M4).
     else if (std::strcmp(argv[i], "--webgpu-no-upload") == 0)
       want_webgpu_no_upload = true;
+    // --webgpu-no-uniform-dedup: upload every dirty uniform block, changed
+    // or not, as before (Gfx::SetGXUniforms), for A/B.
+    else if (std::strcmp(argv[i], "--webgpu-no-uniform-dedup") == 0)
+      want_webgpu_uniform_dedup = false;
     // --webgpu-no-draws: the backend records no draws (frames stay blank).
     // What the draws cost, and what Chrome's GPU-side work costs the CPU
     // thread.
@@ -1707,6 +1827,35 @@ int main(int argc, char** argv)
   // VI fell exactly one half-line behind, and 64 MILLION instructions later a
   // vertical-retrace interrupt fired on one target and not the other.
 
+  // ── the pipeline UID file ──
+  // Dolphin's shader cache records every pipeline it makes in
+  // Cache/<game id>.uidcache -- but only if Cache/ exists, which nothing
+  // in the harness made, so no run kept one.
+  File::CreateFullPath(File::GetUserPath(D_CACHE_IDX));
+#if defined(__EMSCRIPTEN__)
+  if (!uidcache_url.empty())
+  {
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+    emscripten_fetch_t* fetch = emscripten_fetch(&attr, uidcache_url.c_str());
+    const std::string name = uidcache_url.substr(uidcache_url.find_last_of('/') + 1);
+    const std::string path = File::GetUserPath(D_CACHE_IDX) + name;
+    bool ok = false;
+    if (fetch && fetch->status == 200)
+    {
+      File::CreateFullPath(path);
+      ok = File::WriteStringToFile(path, std::string(fetch->data, fetch->numBytes));
+    }
+    std::printf("  uidcache  %s: %s (%llu bytes)\n", uidcache_url.c_str(),
+                ok ? "loaded" : "NOT loaded",
+                fetch ? static_cast<unsigned long long>(fetch->numBytes) : 0ull);
+    if (fetch)
+      emscripten_fetch_close(fetch);
+  }
+#endif
+
   // ── the disc ──
   auto stats = std::make_shared<Harness::SourceStats>();
   Harness::ByteSource source;
@@ -1916,6 +2065,7 @@ int main(int argc, char** argv)
     WebGPU::g_context.no_upload = want_webgpu_no_upload;
     WebGPU::g_context.no_draws = want_webgpu_no_draws;
     WebGPU::g_context.no_present = want_webgpu_no_present;
+    WebGPU::g_context.uniform_dedup = want_webgpu_uniform_dedup;
     g_backend_info.DisplayName = g_video_backend->GetDisplayName();
     g_video_backend->InitBackendInfo(wsi);
     g_Config.VerifyValidity();
@@ -3210,6 +3360,10 @@ int main(int argc, char** argv)
   const TexHashSnapshot run_texhash0 = TexHashNow();
   u64 frames = 0;
   u32 last_xfb = 0;
+  // --frame-times: the previous frame's end.
+  double ft_wall0 = 0, ft_idle0 = 0;
+  s64 ft_ticks0 = 0;
+  u64 ft_compile0 = 0, ft_disc0 = 0;
   g_gx_armed = (gx_from == 0);
 
   for (u64 i = 0; i < steps; ++i)
@@ -3264,6 +3418,13 @@ int main(int argc, char** argv)
       {
         g_press_group = "";
         g_press_control = "";
+      }
+      if (walk_from && t >= walk_from)
+      {
+        static constexpr double kDir[4][2] = {{0, 0.95}, {0.95, 0}, {0, -0.95}, {-0.95, 0}};
+        const auto& d = kDir[((t - walk_from) / 1458000000ull) % 4];
+        g_stick_x = d[0];
+        g_stick_y = d[1];
       }
     }
     if (slow_checks)
@@ -3379,6 +3540,24 @@ int main(int argc, char** argv)
       {
         last_xfb = xfb;
         ++frames;
+#if defined(__EMSCRIPTEN__)
+        if (want_frame_times)
+        {
+          const double now = JitNow();
+          const s64 ticks = system.GetCoreTiming().GetTicks();
+          const u64 cus = CompileUs();
+          const u64 dus = stats->us.load(std::memory_order_relaxed);
+          if (ft_wall0 > 0)
+            g_frame_times.push_back({(ticks - ticks_at_step_start) / 729e6, now - ft_wall0,
+                                     (ticks - ft_ticks0) / 729e3, (cus - ft_compile0) / 1000.0,
+                                     (dus - ft_disc0) / 1000.0, g_idle_ms - ft_idle0});
+          ft_wall0 = now;
+          ft_ticks0 = ticks;
+          ft_compile0 = cus;
+          ft_disc0 = dus;
+          ft_idle0 = g_idle_ms;
+        }
+#endif
       }
     }
     if (xfb_every &&
@@ -3503,6 +3682,39 @@ int main(int argc, char** argv)
         std::printf("  wiimote   active extension %d (1 = Nunchuk)\n",
                     static_cast<int>(static_cast<WiimoteEmu::Wiimote*>(controller)
                                          ->GetActiveExtensionNumber()));
+    if (want_dump_uidcache)
+    {
+      // The shader cache appends through a stdio handle it never closes
+      // here (the run ends in _exit); flush it before reading the file.
+      std::fflush(nullptr);
+      for (const auto& entry : File::ScanDirectoryTree(File::GetUserPath(D_CACHE_IDX), false).children)
+      {
+        if (!entry.virtualName.ends_with(".uidcache"))
+          continue;
+        std::string data;
+        File::ReadFileToString(entry.physicalName, data);
+        std::printf("UIDCACHE %s %zu\n", entry.virtualName.c_str(), data.size());
+        EmitBase64(std::vector<u8>(data.begin(), data.end()));
+        std::printf("UIDCACHE END\n");
+      }
+    }
+    if (want_frame_times)
+    {
+#if defined(HARNESS_WEBGPU)
+      {
+        static const char* const kPhase[] = {"glslang", "tint", "module", "pipeline"};
+        std::printf("  compile   whole run:");
+        for (int p = 0; p < WebGPU::kCompilePhases; ++p)
+          std::printf(" %s %llu in %.0f ms;", kPhase[p],
+                      static_cast<unsigned long long>(WebGPU::g_phase_n[p].load()),
+                      WebGPU::g_phase_us[p].load() / 1000.0);
+        std::printf("\n");
+      }
+#endif
+      ReportFrameTimes("whole run", 0.0);
+      if (speed_from)
+        ReportFrameTimes("window", speed_from / 729e6);
+    }
     if (window_open)
     {
       const double wms = JitNow() - window_t0;

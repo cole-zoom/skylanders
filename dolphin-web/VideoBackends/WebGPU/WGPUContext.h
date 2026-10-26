@@ -13,9 +13,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdio>
+#include <optional>
 #include <string>
 
+#include <emscripten.h>
 #include <fmt/format.h>
 
 #include <webgpu/webgpu_cpp.h>
@@ -59,6 +62,8 @@ struct Context
   // copy to it, no yield to the browser -- so Chrome has no animating
   // canvas to composite. The frames are still drawn and submitted.
   bool no_present = false;
+  // Skip GX uniform uploads equal to the slot's last (Gfx::SetGXUniforms).
+  bool uniform_dedup = true;
 
   // The one layout every render pipeline shares (WGPUShader.h has the
   // numbering): group 0 the three uniform blocks, group 1 eight textures
@@ -110,10 +115,46 @@ struct Stats
   u64 bind_group_sets = 0;
   u64 texture_group_clears = 0;
   u64 draws = 0;
+  u64 uniform_skips = 0;  // GX uniform uploads skipped: same bytes as the last
   double yield_ms = 0;
    // time in the per-present yield
 };
 extern Stats g_stats_wgpu;
+
+// Time the GPU thread spends making shaders (glslang, Tint, the browser's
+// compile) and pipelines, in microseconds. Atomic because the harness's
+// --frame-times reads them from the CPU thread to say what a slow frame
+// was waiting on.
+inline std::atomic<u64> g_compile_us{0};
+inline std::atomic<u64> g_compiles{0};
+// The same time by phase: glslang (GLSL to SPIR-V), Tint (SPIR-V to WGSL),
+// CreateShaderModule and CreateRenderPipeline -- the last two including
+// CaptureValidation's wait for the browser's answer.
+enum CompilePhase { kGlslang, kTint, kModule, kPipeline, kCompilePhases };
+inline std::atomic<u64> g_phase_us[kCompilePhases];
+inline std::atomic<u64> g_phase_n[kCompilePhases];
+
+// Adds the time from construction to destruction to g_compile_us, and to
+// a phase's counter when given one.
+struct CompileTimer
+{
+  int phase = -1;
+  double t0 = emscripten_get_now();
+  CompileTimer() = default;
+  explicit CompileTimer(int phase_) : phase(phase_) {}
+  ~CompileTimer()
+  {
+    const u64 us = static_cast<u64>((emscripten_get_now() - t0) * 1000.0);
+    if (phase >= 0)
+    {
+      g_phase_us[phase].fetch_add(us, std::memory_order_relaxed);
+      g_phase_n[phase].fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    g_compile_us.fetch_add(us, std::memory_order_relaxed);
+    g_compiles.fetch_add(1, std::memory_order_relaxed);
+  }
+};
 
 // Let the browser have this worker for one turn of its event loop. A
 // canvas owned by a worker shows a frame only once the worker's task ends,

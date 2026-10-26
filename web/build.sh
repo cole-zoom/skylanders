@@ -4,6 +4,9 @@
 #
 #   web/build.sh && node web/serve.mjs /tmp/ssa.iso
 #
+# web/make-uidcache.sh once as well (six minutes), or the game stalls the
+# first time it draws with each pipeline.
+#
 # The module is harness/wasm-core/bootgame.cpp, the same program every
 # measurement runs; the page turns on what playing needs (--live-input,
 # --speed=1). Needs the prebuilt libraries in dolphin-web/build-wasm and

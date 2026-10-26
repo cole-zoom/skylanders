@@ -11,7 +11,9 @@ const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const status = $('status');
 const logEl = $('log');
-const lines = [];
+// The boot's first lines are kept whole (they say what loaded and what
+// failed), then a rolling tail.
+const head = [], lines = [];
 
 const say = (text, failed = false) => {
   status.textContent = text;
@@ -19,9 +21,10 @@ const say = (text, failed = false) => {
   status.classList.toggle('failed', failed);
 };
 const log = text => {
-  lines.push(text);
+  if (head.length < 200) head.push(text);
+  else lines.push(text);
   if (lines.length > 400) lines.splice(0, lines.length - 400);
-  if (!logEl.hidden) logEl.textContent = lines.join('\n');
+  if (!logEl.hidden) logEl.textContent = [...head, '…', ...lines].join('\n');
 };
 logEl.hidden = params.get('log') !== '1';
 
@@ -41,7 +44,11 @@ const figure = params.get('figure');
 // The run never ends on its own; the step count is only a cap.
 const args = [new URL('disc', location.href).href, '1000000000000000000',
               '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
-              `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander'];
+              `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander',
+              // The game's pipelines, compiled at boot rather than the first
+              // time each is drawn (web/make-uidcache.sh). Absent, the game
+              // still runs, with a stall at each new pipeline.
+              `--uidcache-url=${new URL('dist/SSPE52.uidcache', location.href).href}`];
 
 let stagePtr = 0, secondsPtr = 0;
 const readStage = () => {

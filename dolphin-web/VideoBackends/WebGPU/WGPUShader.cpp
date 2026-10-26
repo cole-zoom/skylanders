@@ -165,6 +165,7 @@ std::unique_ptr<Shader> Shader::Compile(ShaderStage stage, std::string_view sour
 {
   if (stage == ShaderStage::Geometry)
     return nullptr;
+  const CompileTimer timer;
   std::string full(stage == ShaderStage::Compute ? kComputeHeader : kHeader);
   full.append(RewriteForWebGPU(std::string(source)));
   // Tint aborts, rather than failing, on a SPIR-V instruction it does not
@@ -178,6 +179,7 @@ std::unique_ptr<Shader> Shader::Compile(ShaderStage stage, std::string_view sour
   }
 
   std::optional<SPIRV::CodeVector> spv;
+  std::optional<CompileTimer> phase(kGlslang);
   switch (stage)
   {
   case ShaderStage::Vertex:
@@ -192,9 +194,11 @@ std::unique_ptr<Shader> Shader::Compile(ShaderStage stage, std::string_view sour
   default:
     break;
   }
+  phase.reset();
   if (!spv)
     return nullptr;
 
+  phase.emplace(kTint);
   static bool tint_initialized = false;
   if (!tint_initialized)
   {
@@ -225,6 +229,7 @@ std::unique_ptr<Shader> Shader::Compile(ShaderStage stage, std::string_view sour
     return nullptr;
   }
   std::string wgsl = std::move(out->wgsl);
+  phase.emplace(kModule);
 
   wgpu::ShaderSourceWGSL wsrc{};
   wsrc.code = {wgsl.data(), wgsl.size()};
@@ -238,6 +243,7 @@ std::unique_ptr<Shader> Shader::Compile(ShaderStage stage, std::string_view sour
     WGPU_LOG("WebGPU: the browser rejected {}: {}", name, error);
     return nullptr;
   }
+  phase.reset();
   std::vector<Binding> bindings = ParseBindings(wgsl);
   return std::make_unique<Shader>(stage, std::move(module), std::move(bindings), std::move(wgsl));
 }
