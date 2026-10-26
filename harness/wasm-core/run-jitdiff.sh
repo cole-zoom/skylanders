@@ -19,6 +19,13 @@
 # to reaching memory limit" -- which reads as a harness crash rather than an
 # out-of-memory, and lands mid-run so the sections after it never report.
 # Each section now reuses its slots, so the instances are collectable.
+#
+#   harness/wasm-core/run-jitdiff.sh [out.js] [--compact] [--short-convert]
+#
+# The flags compile as the dispatcher does by default: the slow paths as
+# helper calls (StateLayout::hatch_exit_index) and the float conversions
+# through promote/demote (StateLayout::short_convert). Both are meant to be
+# exact, so the same expectations hold either way.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -29,4 +36,4 @@ harness/wasm-core/link.sh harness/wasm-core/jitdiff.cpp "$OUT"
 # but with seventy-odd templates and FP state the suite installs some 20,000
 # modules and the worker's default heap filled before the collector caught
 # up -- it died in the block differential with "reaching memory limit".
-exec node --max-old-space-size=8192 --expose-gc "$OUT"
+exec node --max-old-space-size=8192 --expose-gc "$OUT" "${@:2}"

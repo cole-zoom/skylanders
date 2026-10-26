@@ -89,12 +89,16 @@ extern "C" EMSCRIPTEN_KEEPALIVE u32 ppc_interp_op(u32 /*state*/, u32 ins, u32 pc
   return st.pc != pc + 4 ? 1u : 0u;
 }
 
+#include "slowpaths.h"
+
 EM_JS(void, JitImportsInit, (), {
   Module.__jitImports = {
     env: {
       memory: wasmMemory,
       __indirect_function_table: wasmTable,
       ppc_interp_op: wasmExports['ppc_interp_op'],
+      ppc_hatch_exit: wasmExports['ppc_hatch_exit'],
+      ppc_mem_slow: wasmExports['ppc_mem_slow'],
     },
   };
 });
@@ -209,10 +213,22 @@ struct Case
   int expect_bail_at = -1;
 };
 
-int main()
+int main(int argc, char** argv)
 {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::printf("target: wasm32  recompiled blocks vs the interpreter\n\n");
+  // --compact: the slow paths as helper calls (StateLayout::hatch_exit_index).
+  // --short-convert: float conversions through promote/demote. Both are
+  // meant to be exact, so every expectation below holds with them on.
+  bool want_compact = false, want_short_convert = false;
+  for (int i = 1; i < argc; ++i)
+  {
+    if (std::strcmp(argv[i], "--compact") == 0)
+      want_compact = true;
+    else if (std::strcmp(argv[i], "--short-convert") == 0)
+      want_short_convert = true;
+  }
+  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s\n\n",
+              want_compact ? "  [compact]" : "", want_short_convert ? "  [short-convert]" : "");
 
   auto& system = Core::System::GetInstance();
   Config::Init();
@@ -318,6 +334,13 @@ int main()
   // Compares as the dispatcher has them unless --jit-no-crdiff: the
   // operands' difference, not s_crTable (EmitCompareToCR).
   layout.cr_diff = true;
+  if (want_compact)
+  {
+    layout.hatch_exit_index = 1;
+    layout.mem_slow_index = 2;
+    layout.exit_value_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_jit_exit_value));
+  }
+  layout.short_convert = want_short_convert;
   // The GQRs above, specialised on as the dispatcher does; the guard the
   // emitted code carries is exercised by the mtspr-to-GQR case below.
   layout.gqr_values = &state.spr[SPR_GQR0];
@@ -1932,7 +1955,7 @@ int main()
     };
 
     int fails = 0, chains_run = 0, chains_linked = 0, longest = 0;
-    int exit_bail = 0, exit_msr = 0;
+    int exit_bail = 0, exit_msr = 0, exit_trap = 0;
     u64 total_tail_calls = 0;
     // Misses against an OCCUPIED slot belonging to someone else, and misses
     // against an empty one. Both are counted because they prove different
@@ -2020,6 +2043,15 @@ int main()
         prog[i * K + K - 1] = term;
       }
 
+      // One trap in one chain in eight: twi 31,r0,0 always traps. The
+      // compiler has no translation for it, so the hatch runs it, the
+      // interpreter takes the program exception, and the block leaves
+      // through the hatch's exit -- the one exit that charges the budget
+      // for the hatched instruction itself, which nothing else generated
+      // here reaches.
+      if ((rnd() % 8) == 0)
+        prog[rnd() % static_cast<u32>(prog.size())] = 0x0FE0'0000;
+
       // One guard refusal per trial, in one chain in four: rewrite the base
       // of a single memory instruction to r23, which points at MMIO.
       if ((rnd() % 4) == 0)
@@ -2103,6 +2135,11 @@ int main()
         // -- a divergence that is entirely the harness's.
         for (size_t k = 0; k < prog.size(); ++k)
           memory.Write_U32(prog[k], kChainBase + static_cast<u32>(k) * 4);
+        // addi r30,r30,1 at the program-exception vector, where a trap
+        // (above) sends the PC. The replay steps the interpreter as many
+        // times as the chain charged; one step too many then shows in r30
+        // instead of re-raising the exception on an empty word unseen.
+        memory.Write_U32(0x3BDE'0001, 0x8000'0700);
       };
 
       reset();
@@ -2151,6 +2188,16 @@ int main()
       cmb.ImportTable();
       cmb.ImportFunction("env", "ppc_interp_op", {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
                          {ppc2wasm::kI32});
+      if (layout.hatch_exit_index)
+      {
+        cmb.ImportFunction("env", "ppc_hatch_exit",
+                           {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
+                           {ppc2wasm::kI32});
+        cmb.ImportFunction("env", "ppc_mem_slow",
+                           {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32,
+                            ppc2wasm::kI32},
+                           {ppc2wasm::kI32});
+      }
       cmb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
       // Function index i is block i plus the imports before it, so a hole
       // naming block i's start PC resolves to i + ImportCount. Targets
@@ -2270,6 +2317,7 @@ int main()
       ++chains_run;
       exit_bail += bailed ? 1 : 0;
       exit_msr += msr_changed ? 1 : 0;
+      exit_trap += (jit_pc & 0x0FFFFFFFu) == 0x700 ? 1 : 0;
       total_tail_calls += tail_calls;
       if (tail_calls > 0)
         ++chains_linked;
@@ -2367,6 +2415,7 @@ int main()
     check(miss_decoy > 0, "a chain rejected an occupied slot holding another pc");
     check(exit_bail > 0, "a chain bailed partway through");
     check(exit_msr > 0, "a chain exited on an mtmsr");
+    check(exit_trap > 0, "a chain left through the hatch on a trap");
     // Direct calls are a second linking mechanism and need their own
     // floor. A chain whose holes all went unfilled behaves exactly like
     // one compiled without them, and every comparison here would stay
@@ -2384,6 +2433,7 @@ int main()
     // All four ways out of a chain, counted separately. A test can be green
     // and still have left one of them unvisited, and the only way to know
     // which is to count them rather than the passes.
+    std::printf("    exits: trap %d\n", exit_trap);
     std::printf("    exits: budget %u  miss %u (empty %llu, decoy %llu)  bail %d  msr %d\n",
                 chain_stats[2], chain_stats[3], static_cast<unsigned long long>(miss_empty),
                 static_cast<unsigned long long>(miss_decoy), exit_bail, exit_msr);
