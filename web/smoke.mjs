@@ -11,6 +11,10 @@
 // MOVE_FROM=N: from N s on, walk instead -- hold W, then D, 2 s each -- so
 // the stick is tested too. Needs web/build.sh to have run and the disc at
 // /tmp/ssa.iso.
+//
+// HEADED=1: a visible window, as a player has it. At the end it prints the
+// readout's distribution over the walk (or over the run without
+// MOVE_FROM): one sample per readout update, the number a player sees.
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -32,16 +36,21 @@ const profile = mkdtempSync(join(tmpdir(), 'shell-'));
 let chrome;
 try {
   await sleep(500);
-  chrome = spawn(CHROME, ['--headless', '--no-sandbox', `--remote-debugging-port=${DEBUG}`,
+  // A visible Chrome with a fresh profile opens its sign-in page first.
+  const headless = process.env.HEADED ? ['--no-first-run', '--no-default-browser-check']
+                                      : ['--headless'];
+  chrome = spawn(CHROME, [...headless, '--no-sandbox', `--remote-debugging-port=${DEBUG}`,
                           '--enable-unsafe-webgpu', '--window-size=1100,900',
                           `--user-data-dir=${profile}`,
                           `http://127.0.0.1:${PORT}/?${query}`], { stdio: 'ignore' });
+  const ours = t => t.type === 'page' && t.url.includes(`:${PORT}/`);
   let targets;
-  for (let i = 0; i < 60 && !targets; i++) {
+  for (let i = 0; i < 60 && !targets?.some(ours); i++) {
     try { targets = await (await fetch(`http://127.0.0.1:${DEBUG}/json`)).json(); }
-    catch { await sleep(250); }
+    catch {}
+    await sleep(250);
   }
-  const page = targets.find(t => t.type === 'page');
+  const page = targets.find(ours);
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise(r => (ws.onopen = r));
   let id = 0;
@@ -62,6 +71,18 @@ try {
     { type, code, key: KEYS[code][0], windowsVirtualKeyCode: KEYS[code][1] });
   const moveFrom = Number(process.env.MOVE_FROM ?? Infinity);
   let walks = 0;
+  // Every readout the page shows, as it shows it.
+  const watch = from => evaluate(`(() => {
+    if (!document.getElementById('speed')) return false;
+    window.__readouts = [];
+    new MutationObserver(() => {
+      const v = parseFloat(document.getElementById('speed').textContent);
+      if (!isNaN(v) && performance.now() / 1000 >= ${from}) window.__readouts.push(v);
+    }).observe(document.getElementById('speed'), { childList: true, characterData: true, subtree: true });
+    return true;
+  })()`);
+  const tPage = (await evaluate('performance.now() / 1000')) ?? 0;
+  while (!(await watch(tPage + (Number.isFinite(moveFrom) ? moveFrom : 0)))) await sleep(100);
 
   const t0 = Date.now();
   let nextReport = 0, nextShot = Number(process.env.SHOT_FROM ?? 30), shot = 0;
@@ -91,6 +112,14 @@ try {
     await sleep(200);
     await key('keyUp');
     await sleep(1800);
+  }
+  const r = (await evaluate('window.__readouts')) ?? [];
+  if (r.length) {
+    const v = [...r].sort((a, b) => a - b);
+    const at = p => v[Math.min(v.length - 1, Math.floor(p * v.length))];
+    console.log(`readout over ${v.length} s${Number.isFinite(moveFrom) ? ' of walking' : ''}: ` +
+                `median ${at(0.5)}%, p25 ${at(0.25)}%, p10 ${at(0.1)}%, worst ${v[0]}%; ` +
+                `${v.filter(x => x < 90).length} below 90%`);
   }
   const log = await evaluate(`document.getElementById('log').textContent`);
   writeFileSync(join(out, 'log.txt'), log ?? '');

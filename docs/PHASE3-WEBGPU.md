@@ -707,6 +707,42 @@ NaN payloads are what Dolphin's own JITs make of them by default, and
 hot path is still ~14 instructions with a dependent table load, and
 guest registers live in memory.
 
+### A visible tab against the harness
+
+The player's ~80% readout was far below anything the harness measured.
+The candidates: presenting to a real screen (headless skips it), the
+real-time limit (`--speed=1`, which the page always runs with and the
+harness never did), and the page itself (live input through Chrome's
+input pipeline instead of `--input`). `HEADED=1` now runs both
+`run-boot-browser.mjs` and `web/smoke.mjs` in a visible window, and the
+smoke test prints the distribution of the page's own readout.
+
+The walking window under WebGPU, alternating, two runs each (frames
+23,846 in all):
+
+| | unlimited | `--speed=1` |
+|---|---|---|
+| headless | 102.5 / 102.2% | 99.9 / 99.8% |
+| visible window | 101.8 / 101.6% | 99.7 / 99.8% |
+| per wall second, all eight | median 100-102%, worst 92-93% | |
+
+The real page in a visible window, keys sent through Chrome, walking on
+Shattered Island for 130 s: **readout median 99%, p10 97%, worst 92%,
+no second below 90%.**
+
+- **A visible window costs about half a point, and nothing once the
+  speed is limited.** Presenting is not the gap.
+- **The limit costs nothing beyond the clamp.** Dolphin forgives a lag
+  only once it passes `MAIN_MAX_FALLBACK` (100 ms); dips shorter than that
+  are made up, and the throttled runs' seconds look like the unlimited
+  ones clamped at 100.
+- **The ~80% was the build.** It was the M5 build, before the UID cache
+  (#97) and the recompiler work (#98); that build measured 91% walking
+  (worst second 82%) in this same window. `web/dist` was still that
+  build until rebuilt. What is left unexplained is the player's machine
+  and session (their Chrome profile, other tabs, a hot laptop) and scenes
+  past this path, which only a replay of the current build can show.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.
