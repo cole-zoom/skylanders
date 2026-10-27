@@ -49,9 +49,18 @@ export function attachInput(canvas, heap, address) {
   const mouse = new Set();     // buttons from the mouse
   let pointer = null;          // [x, y] once the mouse or right stick has moved it
   let last = performance.now();
+  // Thrust (toward the screen, then back) is held for at least this long
+  // however briefly the key is tapped, so a tap is always a whole jab.
+  const THRUST_MS = 200;
+  let thrustUntil = 0;
 
   const block = e => { if (e.code in KEYS || e.code in STICK_KEYS) e.preventDefault(); };
-  addEventListener('keydown', e => { block(e); if (!e.repeat) held.add(e.code); });
+  addEventListener('keydown', e => {
+    block(e);
+    if (e.repeat) return;
+    held.add(e.code);
+    if (KEYS[e.code] === 'Thrust') thrustUntil = performance.now() + THRUST_MS;
+  });
   addEventListener('keyup', e => { block(e); held.delete(e.code); });
   // A key released while the window is not focused never sends keyup.
   addEventListener('blur', () => { held.clear(); mouse.clear(); });
@@ -84,6 +93,7 @@ export function attachInput(canvas, heap, address) {
       if (code in STICK_KEYS) { sx += STICK_KEYS[code][0]; sy += STICK_KEYS[code][1]; }
     }
     for (const b of mouse) buttons |= BIT[b];
+    if (now < thrustUntil) buttons |= BIT.Thrust;
     for (const pad of navigator.getGamepads?.() ?? []) {
       if (!pad || pad.mapping !== 'standard') continue;
       pad.buttons.forEach((b, i) => { if (b.pressed && PAD_BUTTONS[i]) buttons |= BIT[PAD_BUTTONS[i]]; });
