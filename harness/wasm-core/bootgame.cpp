@@ -1282,6 +1282,7 @@ int main(int argc, char** argv)
   std::string uidcache_url;
   bool want_skylander = false;
   bool want_audio = false;
+  bool keep_nand = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
   u64 trace_from = 0;
@@ -1385,6 +1386,11 @@ int main(int argc, char** argv)
     // --audio: play the game's sound through the page (see AudioRing).
     else if (std::strcmp(argv[i], "--audio") == 0)
       want_audio = true;
+    // --keep-nand: the Wii's NAND in <user>/Wii/, where the page restores
+    // the game's saves before main() (web/saves.js), instead of Dolphin's
+    // temporary session root, which is moved aside at every boot.
+    else if (std::strcmp(argv[i], "--keep-nand") == 0)
+      keep_nand = true;
     // --speed=F: limit emulation to F times real time, as Dolphin does when
     // played (1 = real time). Measuring runs leave it unlimited; see 1e.
     else if (std::strncmp(argv[i], "--speed=", 8) == 0)
@@ -1742,7 +1748,7 @@ int main(int argc, char** argv)
   const std::string user_dir = "/tmp/dolphin-boot-user/";
   File::CreateFullPath(user_dir);
   UICommon::SetUserDirectory(user_dir);
-  Core::InitializeWiiRoot(true);
+  Core::InitializeWiiRoot(!keep_nand);
   Config::AddLayer(ConfigLoaders::GenerateBaseConfigLoader());
   SConfig::Init();
 
@@ -2096,7 +2102,16 @@ int main(int argc, char** argv)
   // in the harness made, so no run kept one.
   File::CreateFullPath(File::GetUserPath(D_CACHE_IDX));
 #if defined(__EMSCRIPTEN__)
-  if (!uidcache_url.empty())
+  // A file already there was restored by the page (web/saves.js): the
+  // pipelines this browser has met, the fetched file's plus every one made
+  // since. It is kept rather than replaced.
+  if (!uidcache_url.empty() &&
+      File::Exists(File::GetUserPath(D_CACHE_IDX) +
+                   uidcache_url.substr(uidcache_url.find_last_of('/') + 1)))
+  {
+    std::printf("  uidcache  kept the one from earlier sessions\n");
+  }
+  else if (!uidcache_url.empty())
   {
     emscripten_fetch_attr_t attr;
     emscripten_fetch_attr_init(&attr);
