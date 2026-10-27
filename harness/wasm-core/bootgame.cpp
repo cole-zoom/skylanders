@@ -1440,6 +1440,8 @@ int main(int argc, char** argv)
   std::string uidcache_url;
   bool want_skylander = false;
   bool want_audio = false;
+  std::string load_state_url;
+  double replug_at_s = 0;  // --replug=S
   bool keep_nand = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
@@ -1544,6 +1546,17 @@ int main(int argc, char** argv)
     // --audio: play the game's sound through the page (see AudioRing).
     else if (std::strcmp(argv[i], "--audio") == 0)
       want_audio = true;
+    // --load-state=URL: load a save state (web/states.js's, gunzipped)
+    // before stepping, so a player's scene can be measured with every
+    // switch here. The measured times start from the state's.
+    else if (std::strncmp(argv[i], "--load-state=", 13) == 0)
+      load_state_url = argv[i] + 13;
+    // --replug=S: S emulated seconds into stepping, take the --skylander
+    // figure off the portal and put it back a second later. A loaded state
+    // waits for the figure it was saved with ("Please return the
+    // Skylander"); a figure placed afresh is taken instead, as in the page.
+    else if (std::strncmp(argv[i], "--replug=", 9) == 0)
+      replug_at_s = std::strtod(argv[i] + 9, nullptr);
     // --keep-nand: the Wii's NAND in <user>/Wii/, where the page restores
     // the game's saves before main() (web/saves.js), instead of Dolphin's
     // temporary session root, which is moved aside at every boot.
@@ -3811,6 +3824,32 @@ int main(int argc, char** argv)
   // how fast instructions run; with idle loops skipped, instructions and
   // time come apart, and what the player feels is emulated seconds per
   // wall second. The Wii's clock is 729 MHz, so that is ticks / 729e6.
+#if defined(__EMSCRIPTEN__)
+  if (!load_state_url.empty())
+  {
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+    emscripten_fetch_t* fetch = emscripten_fetch(&attr, load_state_url.c_str());
+    if (fetch && fetch->status == 200 && fetch->numBytes > 0)
+    {
+      // ServiceStates frees the buffer it loads from.
+      void* buffer = std::malloc(fetch->numBytes);
+      std::memcpy(buffer, fetch->data, fetch->numBytes);
+      g_states.op = 2;
+      g_states.ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(buffer));
+      g_states.size = static_cast<u32>(fetch->numBytes);
+      g_states.request.fetch_add(1);
+      ServiceStates(system);
+    }
+    check(g_states.result == 1, "save state loaded (--load-state)");
+    std::printf("  state     %s at %.1f emulated s\n", load_state_url.c_str(),
+                system.GetCoreTiming().GetTicks() / 729e6);
+    if (fetch)
+      emscripten_fetch_close(fetch);
+  }
+#endif
   const s64 ticks_at_step_start = system.GetCoreTiming().GetTicks();
   // Checks that need to run every step only when a flag asks for them.
   // Each is cheap alone; together, every step, they were a measurable part
@@ -3872,6 +3911,28 @@ int main(int argc, char** argv)
     if (tick_cap &&
         static_cast<u64>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) >= tick_cap)
       break;
+    if (replug_at_s > 0 && (i & 0xFFFF) == 0)
+    {
+      const double t = (system.GetCoreTiming().GetTicks() - ticks_at_step_start) / 729e6;
+      static int replug_phase = 0;
+      if (replug_phase == 0 && t >= replug_at_s)
+      {
+        for (u8 slot = 0; slot < MAX_SKYLANDERS; ++slot)
+          if (g_portal.slots[slot].present)
+          {
+            system.GetSkylanderPortal().RemoveSkylander(slot);
+            g_portal.slots[slot] = {};
+          }
+        replug_phase = 1;
+        std::printf("  replug    figure off at %.1f s\n", t);
+      }
+      else if (replug_phase == 1 && t >= replug_at_s + 1.0)
+      {
+        PlaceFigure(system, sky_id, sky_var);
+        replug_phase = 2;
+        std::printf("  replug    figure on at %.1f s\n", t);
+      }
+    }
 
     // Events are logged over the same window as the trace. --events turns
     // logging on from the first step, which --from cannot express: a window
