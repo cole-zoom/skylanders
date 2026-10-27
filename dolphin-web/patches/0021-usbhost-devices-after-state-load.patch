@@ -1,0 +1,55 @@
+diff --git a/Source/Core/Core/IOS/USB/Host.cpp b/Source/Core/Core/IOS/USB/Host.cpp
+index a3372fd..863d6eb 100644
+--- a/Source/Core/Core/IOS/USB/Host.cpp
++++ b/Source/Core/Core/IOS/USB/Host.cpp
+@@ -52,8 +52,23 @@ std::optional<IPCReply> USBHost::Open(const OpenRequest& request)
+ void USBHost::DoState(PointerWrap& p)
+ {
+   Device::DoState(p);
+-  if (IsOpened() && p.IsReadMode())
++  // This used to be under IsOpened(), which is never true for a USB host:
++  // USBHost::Open does not call Device::Open, so m_is_active stays false and
++  // the re-scan below never ran. Loading a state in the session that saved it
++  // got away with that (the host still had its devices); a state loaded into a
++  // session in which the game had not opened this host yet left it with no
++  // devices while the restored IDs still named them, and every transfer failed
++  // with ENOENT (the Skylanders portal went silent).
++  if (p.IsReadMode())
+   {
++    // Not opened in this session: become a scanner client as Open does.
++    if (!m_has_initialised)
++    {
++      GetSystem().GetUSBScanner().AddClient(this);
++      GetSystem().GetUSBScanner().WaitForFirstScan();
++      m_has_initialised = true;
++    }
++
+     // After a state has loaded, there may be insertion hooks for devices that were
+     // already plugged in, and which need to be triggered.
+     std::lock_guard lk(m_devices_mutex);
+diff --git a/Source/Core/Core/IOS/USB/USB_HID/HIDv4.cpp b/Source/Core/Core/IOS/USB/USB_HID/HIDv4.cpp
+index eb9c50a..0c7e75b 100644
+--- a/Source/Core/Core/IOS/USB/USB_HID/HIDv4.cpp
++++ b/Source/Core/Core/IOS/USB/USB_HID/HIDv4.cpp
+@@ -172,11 +172,17 @@ void USB_HIDv4::OnDeviceChange(ChangeEvent event, std::shared_ptr<USB::Device> d
+     if (event == ChangeEvent::Inserted)
+     {
+       const auto id = device->GetId();
+-      s32 new_id = 0;
+-      while (!m_ios_ids.emplace(new_id, id).second)
+-        ++new_id;
++      // After a state load (USBHost::DoState) every device is announced again
++      // as inserted, with the ID maps already restored. A device they know
++      // keeps its IOS ID; a new one would tell the game its device went away.
++      if (!m_device_ids.contains(id))
++      {
++        s32 new_id = 0;
++        while (!m_ios_ids.emplace(new_id, id).second)
++          ++new_id;
+ 
+-      m_device_ids[id] = new_id;
++        m_device_ids[id] = new_id;
++      }
+     }
+     else if (event == ChangeEvent::Removed)
+     {
