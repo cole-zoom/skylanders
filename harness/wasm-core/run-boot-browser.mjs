@@ -62,7 +62,13 @@ try {
   // (Runtime.consoleAPICalled on the page target) never sees, and that the
   // page's DOM never receives. Markers written with emscripten_console_log
   // therefore arrive here and nowhere else.
-  chrome = spawn(CHROME, ['--headless', '--no-sandbox', '--remote-debugging-port=9341',
+  // HEADED=1: a visible window instead, as a player runs it -- the page is
+  // then composited and presented to the screen, which headless skips. A
+  // visible Chrome with a fresh profile opens its sign-in page first, and
+  // the runner would attach to that, hence the first-run switches.
+  const headless = process.env.HEADED ? ['--no-first-run', '--no-default-browser-check']
+                                      : ['--headless'];
+  chrome = spawn(CHROME, [...headless, '--no-sandbox', '--remote-debugging-port=9341',
                           '--enable-logging=stderr', '--v=0',
                           // WebGPU in headless Chrome (the WebGPU backend,
                           // docs/PHASE3-WEBGPU.md); without it a WEBGPU=1
@@ -86,11 +92,16 @@ try {
     }
   });
   let targets;
+  // Wait for OUR page: a visible Chrome lists other pages too.
+  const ours = t => t.type === 'page' && t.url.includes(':8102/');
   for (let i = 0; i < 60; i++) {
-    try { targets = await (await fetch('http://127.0.0.1:9341/json')).json(); break; }
-    catch { await sleep(250); }
+    try {
+      targets = await (await fetch('http://127.0.0.1:9341/json')).json();
+      if (targets.some(ours)) break;
+    } catch {}
+    await sleep(250);
   }
-  const target = targets?.find(t => t.type === 'page');
+  const target = targets?.find(ours);
   if (!target) throw new Error('no page target');
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise(r => ws.onopen = r);
