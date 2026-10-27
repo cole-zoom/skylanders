@@ -122,5 +122,7 @@ export async function attachStates(module, root) {
       return li;
     }));
   };
+  // For tests that put a state in the store behind the panel's back.
+  root.refresh = show;
   show();
 }
