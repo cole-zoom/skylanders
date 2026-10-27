@@ -1934,6 +1934,14 @@ int main(int argc, char** argv)
   //     means unlimited (CoreTiming::IsSpeedUnlimited). --speed=1 puts the
   //     limit back, for playing (web/).
   Config::SetCurrent(Config::MAIN_EMULATION_SPEED, emulation_speed);
+  // The page's input is gated by the browser already: keys only reach a
+  // focused tab. Dolphin's own gate asks the host whether the render window
+  // has focus, which host_stubs.cpp answers "no", and a closed gate reads
+  // every MAPPED input as 0 -- the shake and the thrust, which are mapped
+  // (LiveMotion), while the buttons are overrides and pass. So for live
+  // input, Dolphin's "background input" setting: the gate stays open.
+  if (g_live_on)
+    Config::SetCurrent(Config::MAIN_INPUT_BACKGROUND_INPUT, true);
 
   // 2. DSP HLE. HW::Init passes MAIN_DSP_HLE to DSPManager::Init and the LLE
   //    path spawns a dedicated DSP thread; HLE runs the DSP on the caller.
