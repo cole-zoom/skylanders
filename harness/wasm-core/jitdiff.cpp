@@ -219,16 +219,21 @@ int main(int argc, char** argv)
   // --compact: the slow paths as helper calls (StateLayout::hatch_exit_index).
   // --short-convert: float conversions through promote/demote. Both are
   // meant to be exact, so every expectation below holds with them on.
-  bool want_compact = false, want_short_convert = false;
+  // --simd: paired singles as vectors (StateLayout::simd_ps); here, with
+  // the arithmetic exact, that is the quantized loads and stores.
+  bool want_compact = false, want_short_convert = false, want_simd = false;
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--compact") == 0)
       want_compact = true;
     else if (std::strcmp(argv[i], "--short-convert") == 0)
       want_short_convert = true;
+    else if (std::strcmp(argv[i], "--simd") == 0)
+      want_simd = true;
   }
-  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s\n\n",
-              want_compact ? "  [compact]" : "", want_short_convert ? "  [short-convert]" : "");
+  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s\n\n",
+              want_compact ? "  [compact]" : "", want_short_convert ? "  [short-convert]" : "",
+              want_simd ? "  [simd]" : "");
 
   auto& system = Core::System::GetInstance();
   Config::Init();
@@ -341,6 +346,7 @@ int main(int argc, char** argv)
     layout.exit_value_addr = static_cast<u32>(reinterpret_cast<uintptr_t>(&g_jit_exit_value));
   }
   layout.short_convert = want_short_convert;
+  layout.simd_ps = want_simd;
   // The GQRs above, specialised on as the dispatcher does; the guard the
   // emitted code carries is exercised by the mtspr-to-GQR case below.
   layout.gqr_values = &state.spr[SPR_GQR0];
@@ -963,6 +969,209 @@ int main(int argc, char** argv)
     }
     check(ok, "psq_l after mtspr GQR1 takes the guard and gets the new format");
     state.spr[SPR_GQR0 + 1] = saved;
+  }
+
+  // ── paired arithmetic as vectors ──
+  //
+  // At Dolphin's JIT accuracy (fast_fp, without fprf) the paired forms
+  // are not the interpreter's, so the oracle is the scalar form of the
+  // same thing: each instruction compiled twice, one half at a time and
+  // as vectors (StateLayout::simd_ps), run from the same state, and every
+  // register compared bit for bit. A quarter of the trials build a
+  // multiply-add whose sum lands on a float rounding tie, the one branch
+  // random operands almost never reach; FPSCR[NI] is set in half.
+  {
+    std::printf("\n  paired arithmetic as vectors, against the scalar forms\n");
+    struct P { u32 xo5; const char* name; };
+    static const P forms[] = {
+        {21, "ps_add"},  {20, "ps_sub"},  {25, "ps_mul"},   {18, "ps_div"},
+        {12, "ps_muls0"}, {13, "ps_muls1"}, {14, "ps_madds0"}, {15, "ps_madds1"},
+        {28, "ps_msub"}, {29, "ps_madd"}, {30, "ps_nmsub"}, {31, "ps_nmadd"},
+    };
+    constexpr u32 kForms = sizeof(forms) / sizeof(forms[0]);
+    ppc2wasm::StateLayout scalar_layout = layout;
+    scalar_layout.fast_fp = true;
+    scalar_layout.fprf = false;
+    scalar_layout.simd_ps = false;
+    ppc2wasm::StateLayout vector_layout = scalar_layout;
+    vector_layout.simd_ps = true;
+    u32 seed = 0x5EED'1234;
+    auto rnd = [&seed]() {
+      seed ^= seed << 13;
+      seed ^= seed >> 17;
+      seed ^= seed << 5;
+      return seed;
+    };
+    const u32 saved_fpscr = state.fpscr.Hex;
+    u32 runs[kForms] = {}, bad[kForms] = {}, ties = 0;
+    int slot_s = -1, slot_v = -1;
+    constexpr u32 kTrials = 6000;
+    for (u32 t = 0; t < kTrials; ++t)
+    {
+      const u32 f = rnd() % kForms;
+      const u32 fd = rnd() % 32, fa = rnd() % 32, fb = rnd() % 32, fc = rnd() % 32;
+      const u32 ins = (4u << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (fc << 6) |
+                      (forms[f].xo5 << 1);
+      seed_ps(rnd);
+      if (forms[f].xo5 >= 14 && (rnd() % 4) == 0)
+      {
+        // a * c lands exactly on a tie (1 + 2^-24, scaled), and b is zero
+        // or far below it, so the sum rounds onto the tie with an error.
+        const int k = static_cast<int>(rnd() % 40) - 20;
+        const double one = std::ldexp((rnd() & 1) ? -1.0 : 1.0, k);
+        const double cv = 1.0 + std::ldexp(1.0, -24);
+        const u32 pick = rnd() % 3;
+        const double bv = pick == 0 ? 0.0 : std::ldexp(pick == 1 ? 1.0 : -1.0, k - 60);
+        state.ps[fa].SetBoth(std::bit_cast<u64>(one), std::bit_cast<u64>(one));
+        state.ps[fc].SetBoth(std::bit_cast<u64>(cv), std::bit_cast<u64>(cv));
+        if (fb != fa && fb != fc)
+          state.ps[fb].SetBoth(std::bit_cast<u64>(bv), std::bit_cast<u64>(-bv));
+        ++ties;
+      }
+      state.fpscr.Hex = (rnd() & 1) ? 4u : 0u;
+      PowerPC::PairedSingle start[32];
+      for (int i = 0; i < 32; ++i)
+        start[i] = state.ps[i];
+      const u32 start_fpscr = state.fpscr.Hex;
+      auto rs = ppc2wasm::CompileBlock(&ins, BASE, 1, scalar_layout);
+      auto rv = ppc2wasm::CompileBlock(&ins, BASE, 1, vector_layout);
+      if (rs.instructions != 1 || rv.instructions != 1)
+        continue;
+      slot_s = InstallModuleAt(rs.module.data(), static_cast<int>(rs.module.size()), slot_s);
+      slot_v = InstallModuleAt(rv.module.data(), static_cast<int>(rv.module.size()), slot_v);
+      if (slot_s < 0 || slot_v < 0)
+      {
+        ++bad[f];
+        break;
+      }
+      state.pc = state.npc = BASE;
+      state.downcount = 1000;
+      RunBlock(slot_s, state, ppc);
+      PowerPC::PairedSingle want[32];
+      for (int i = 0; i < 32; ++i)
+        want[i] = state.ps[i];
+      const u32 want_fpscr = state.fpscr.Hex;
+      for (int i = 0; i < 32; ++i)
+        state.ps[i] = start[i];
+      state.fpscr.Hex = start_fpscr;
+      state.pc = state.npc = BASE;
+      state.downcount = 1000;
+      RunBlock(slot_v, state, ppc);
+      bool same = state.fpscr.Hex == want_fpscr;
+      for (int i = 0; i < 32; ++i)
+        same = same && state.ps[i].ps0 == want[i].ps0 && state.ps[i].ps1 == want[i].ps1;
+      ++runs[f];
+      if (!same)
+      {
+        if (bad[f]++ < 3)
+          std::printf("      %s %08x: f%u %016llx:%016llx, scalar %016llx:%016llx\n",
+                      forms[f].name, ins, fd, (unsigned long long)state.ps[fd].ps0,
+                      (unsigned long long)state.ps[fd].ps1, (unsigned long long)want[fd].ps0,
+                      (unsigned long long)want[fd].ps1);
+      }
+    }
+    char line[96];
+    for (u32 f = 0; f < kForms; ++f)
+    {
+      std::snprintf(line, sizeof(line), "%s: %u runs, the same bits", forms[f].name, runs[f]);
+      check(runs[f] > 0 && bad[f] == 0, line);
+    }
+    std::printf("      %u trials built on a rounding tie\n", ties);
+
+    // Blocks: twelve instructions drawn from the paired arithmetic, the
+    // forms that write a paired register without the vectors (merges,
+    // moves, scalar arithmetic) and the quantized loads and stores through
+    // r3, so the vector and scalar forms meet in one block. Registers,
+    // FPSCR and the memory window are compared.
+    constexpr u32 kK = 12, kBlocks = 3000;
+    constexpr u32 kWin = BASE + 0x4000, kWinBytes = 256;
+    u32 block_runs = 0, block_bad = 0;
+    std::vector<u8> win0(kWinBytes), want_win(kWinBytes);
+    for (u32 t = 0; t < kBlocks; ++t)
+    {
+      u32 prog[kK];
+      for (u32 i = 0; i < kK; ++i)
+      {
+        const u32 fd = rnd() % 12, fa = rnd() % 12, fb = rnd() % 12, fc = rnd() % 12;
+        const u32 kind = rnd() % 8;
+        if (kind < 4)
+          prog[i] = (4u << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (fc << 6) |
+                    (forms[rnd() % kForms].xo5 << 1);
+        else if (kind == 4)
+        {
+          static const u32 xo[] = {528, 560, 592, 624, 72, 40};  // merges, ps_mr, ps_neg
+          prog[i] = (4u << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (xo[rnd() % 6] << 1);
+        }
+        else if (kind == 5)
+        {
+          static const u32 xo5[] = {21, 25, 29};  // fadds, fmuls, fmadds
+          prog[i] = (59u << 26) | (fd << 21) | (fa << 16) | (fb << 11) | (fc << 6) |
+                    (xo5[rnd() % 3] << 1);
+        }
+        else
+        {
+          // psq_l (56) or psq_st (60), d(r3), W random, GQR0..4.
+          const u32 opc = (kind == 6) ? 56u : 60u;
+          const u32 d = (rnd() % 24) * 8;
+          prog[i] = (opc << 26) | (fd << 21) | (3u << 16) | ((rnd() & 1) << 15) |
+                    ((rnd() % 5) << 12) | d;
+        }
+      }
+      seed_ps(rnd);
+      state.fpscr.Hex = (rnd() & 1) ? 4u : 0u;
+      state.gpr[3] = kWin;
+      for (u32 i = 0; i < kWinBytes; i += 4)
+        memory.Write_U32(rnd(), kWin + i);
+      PowerPC::PairedSingle start[32];
+      for (int i = 0; i < 32; ++i)
+        start[i] = state.ps[i];
+      const u32 start_fpscr = state.fpscr.Hex;
+      memory.CopyFromEmu(win0.data(), kWin, kWinBytes);
+      auto rs = ppc2wasm::CompileBlock(prog, BASE, kK, scalar_layout);
+      auto rv = ppc2wasm::CompileBlock(prog, BASE, kK, vector_layout);
+      if (rs.instructions != kK || rv.instructions != kK)
+        continue;
+      slot_s = InstallModuleAt(rs.module.data(), static_cast<int>(rs.module.size()), slot_s);
+      slot_v = InstallModuleAt(rv.module.data(), static_cast<int>(rv.module.size()), slot_v);
+      if (slot_s < 0 || slot_v < 0)
+      {
+        ++block_bad;
+        break;
+      }
+      state.pc = state.npc = BASE;
+      state.downcount = 1000;
+      const u32 ret_s = RunBlock(slot_s, state, ppc);
+      PowerPC::PairedSingle want[32];
+      for (int i = 0; i < 32; ++i)
+        want[i] = state.ps[i];
+      const u32 want_fpscr = state.fpscr.Hex;
+      memory.CopyFromEmu(want_win.data(), kWin, kWinBytes);
+      for (int i = 0; i < 32; ++i)
+        state.ps[i] = start[i];
+      state.fpscr.Hex = start_fpscr;
+      memory.CopyToEmu(kWin, win0.data(), kWinBytes);
+      state.gpr[3] = kWin;
+      state.pc = state.npc = BASE;
+      state.downcount = 1000;
+      const u32 ret_v = RunBlock(slot_v, state, ppc);
+      bool same = ret_s == ret_v && state.fpscr.Hex == want_fpscr;
+      for (int i = 0; i < 32; ++i)
+        same = same && state.ps[i].ps0 == want[i].ps0 && state.ps[i].ps1 == want[i].ps1;
+      std::vector<u8> got_win(kWinBytes);
+      memory.CopyFromEmu(got_win.data(), kWin, kWinBytes);
+      same = same && got_win == want_win;
+      ++block_runs;
+      if (!same && block_bad++ < 3)
+      {
+        std::printf("      block %u differs:", t);
+        for (u32 i = 0; i < kK; ++i)
+          std::printf(" %08x", prog[i]);
+        std::printf("\n");
+      }
+    }
+    state.fpscr.Hex = saved_fpscr;
+    std::snprintf(line, sizeof(line), "blocks: %u runs, the same bits", block_runs);
+    check(block_runs > kBlocks / 2 && block_bad == 0, line);
   }
 
   // ── randomised differential ──
@@ -2161,7 +2370,8 @@ int main(int argc, char** argv)
 
       std::vector<int> index(nblocks, -1);
       std::vector<ppc2wasm::Bytes> bodies(nblocks);
-      std::vector<u32> block_locals(nblocks, 0), block_locals_i64(nblocks, 0);
+      std::vector<u32> block_locals(nblocks, 0), block_locals_i64(nblocks, 0),
+          block_locals_v128(nblocks, 0);
       std::vector<std::vector<ppc2wasm::DirectFixup>> block_fixups(nblocks);
       bool all_compiled = true;
       for (u32 i = 0; i < nblocks && all_compiled; ++i)
@@ -2174,6 +2384,7 @@ int main(int argc, char** argv)
           bodies[i] = std::move(rb.body);
           block_locals[i] = rb.locals;
           block_locals_i64[i] = rb.locals_i64;
+          block_locals_v128[i] = rb.locals_v128;
           block_fixups[i] = std::move(rb.fixups);
         }
       }
@@ -2214,7 +2425,8 @@ int main(int argc, char** argv)
       for (u32 i = 0; i < nblocks; ++i)
       {
         trial_direct += ppc2wasm::PatchDirectCalls(bodies[i], block_fixups[i], index_of);
-        cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i], block_locals_i64[i]);
+        cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i], block_locals_i64[i],
+                        block_locals_v128[i]);
       }
       const auto chain_module = cmb.Build();
       const int base = InstallBatchAt(chain_module.data(), static_cast<int>(chain_module.size()),

@@ -1459,6 +1459,7 @@ int main(int argc, char** argv)
   bool want_compact = true;
   bool want_fast_fp = true;
   bool want_short_convert = true;
+  bool want_simd = true;
   bool want_fprf = false;  // or Config::MAIN_FPRF; see below
   std::vector<u32> jit_dump_pcs;
   bool want_hatch = true;
@@ -1716,6 +1717,10 @@ int main(int argc, char** argv)
     // before StateLayout::short_convert. Both ways are exact.
     else if (std::strcmp(argv[i], "--jit-no-short-convert") == 0)
       want_short_convert = false;
+    // --jit-no-simd: paired singles one half at a time through i64
+    // locals, as before StateLayout::simd_ps. Both ways give the same bits.
+    else if (std::strcmp(argv[i], "--jit-no-simd") == 0)
+      want_simd = false;
     // --jit-probe-pad: every RAM access carries a dead copy of its miss
     // branch (StateLayout::probe_cold_pad), to price inline cold code.
     else if (std::strcmp(argv[i], "--jit-probe-pad") == 0)
@@ -2913,6 +2918,7 @@ int main(int argc, char** argv)
   jit_layout.fprf = want_fprf || Config::Get(Config::MAIN_FPRF);
   jit_layout.fast_fp = want_fast_fp;
   jit_layout.short_convert = want_short_convert;
+  jit_layout.simd_ps = want_simd;
   // The write-gather pipe, when the DBATs map it where every Wii game
   // has it; see StateLayout::gather_pipe_ea. The physical tier runs the
   // exception handlers, which issue no GX commands, and keeps the hatch.
@@ -3246,6 +3252,7 @@ int main(int argc, char** argv)
       ppc2wasm::Bytes body;
       u32 locals;
       u32 locals_i64;
+      u32 locals_v128;
       std::vector<ppc2wasm::DirectFixup> fixups;
     };
     std::vector<Pending> pending;
@@ -3309,7 +3316,8 @@ int main(int argc, char** argv)
         // known until the whole region has been discovered -- the target
         // may be a block this walk has not reached yet.
         pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc,
-                           std::move(r.body), r.locals, r.locals_i64, std::move(r.fixups)});
+                           std::move(r.body), r.locals, r.locals_i64, r.locals_v128,
+                           std::move(r.fixups)});
         for (u32 i = 0; i < r.nsucc; ++i)
           push(r.succ[i]);
         // The next address in memory after this block, which is past the
@@ -3370,7 +3378,7 @@ int main(int argc, char** argv)
       jit_direct_patched += ppc2wasm::PatchDirectCalls(pending[k].body, pending[k].fixups,
                                                        index_of);
       mb.AddFunction(pending[k].body, "f" + std::to_string(k), pending[k].locals,
-                     pending[k].locals_i64);
+                     pending[k].locals_i64, pending[k].locals_v128);
       if (want_jit_names)
       {
         char nm[16];

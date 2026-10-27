@@ -84,6 +84,7 @@ enum : uint8_t
   kI32 = 0x7F,
   kI64 = 0x7E,
   kF64 = 0x7C,
+  kV128 = 0x7B,
   kFuncType = 0x60,
 
   kBlock = 0x02,
@@ -198,6 +199,68 @@ enum : uint8_t
   kI64GtS = 0x55,
 };
 
+// ── 128-bit SIMD ──
+//
+// The prefix byte, then the operation as a LEB128 u32 (PutU32), so the
+// values above 0x7F take two bytes. Loads and stores take a memarg like
+// the scalar ones; the lane forms add a lane index byte after it.
+constexpr uint8_t kPrefixFD = 0xFD;
+enum : uint32_t
+{
+  kV128Load = 0x00,
+  kV128Load64Splat = 0x0A,
+  kV128Store = 0x0B,
+  kV128Const = 0x0C,
+  kI8x16Shuffle = 0x0D,
+  kI64x2Splat = 0x12,
+  kF64x2Splat = 0x14,
+  kI64x2ExtractLane = 0x1D,
+  kF64x2ExtractLane = 0x21,
+  kF64x2ReplaceLane = 0x22,
+  kI32x4Eq = 0x37,
+  kF64x2Eq = 0x47,
+  kF64x2Ne = 0x48,
+  kF64x2Gt = 0x4A,
+  kV128Not = 0x4D,
+  kV128And = 0x4E,
+  kV128AndNot = 0x4F,
+  kV128Or = 0x50,
+  kV128Xor = 0x51,
+  kV128Bitselect = 0x52,
+  kV128AnyTrue = 0x53,
+  kV128Store8Lane = 0x58,
+  kV128Store16Lane = 0x59,
+  kV128Store32Lane = 0x5A,
+  kV128Store64Lane = 0x5B,
+  kV128Load32Zero = 0x5C,
+  kV128Load64Zero = 0x5D,
+  kF32x4DemoteF64x2Zero = 0x5E,
+  kF64x2PromoteLowF32x4 = 0x5F,
+  kI8x16NarrowI16x8S = 0x65,
+  kI8x16NarrowI16x8U = 0x66,
+  kI16x8NarrowI32x4S = 0x85,
+  kI16x8NarrowI32x4U = 0x86,
+  kI16x8ExtendLowI8x16S = 0x87,
+  kI16x8ExtendLowI8x16U = 0x89,
+  kI32x4ExtendLowI16x8S = 0xA7,
+  kI32x4ExtendLowI16x8U = 0xA9,
+  kI64x2ShrU = 0xCD,
+  kI64x2Add = 0xCE,
+  kI64x2Sub = 0xD1,
+  kI64x2Eq = 0xD6,
+  kI64x2LtS = 0xD8,
+  kI64x2GtS = 0xD9,
+  kF32x4Mul = 0xE6,
+  kF32x4Min = 0xE8,
+  kF32x4Max = 0xE9,
+  kF64x2Add = 0xF0,
+  kF64x2Sub = 0xF1,
+  kF64x2Mul = 0xF2,
+  kF64x2Div = 0xF3,
+  kI32x4TruncSatF32x4S = 0xF8,
+  kF32x4ConvertI32x4S = 0xFA,
+};
+
 // Signed LEB128 for i64.const.
 inline void PutI64(Bytes& out, int64_t v)
 {
@@ -269,12 +332,12 @@ public:
   // stack cannot be indexed twice without recomputing.
   void SetFunction(const std::vector<uint8_t>& params, const std::vector<uint8_t>& results,
                    const Bytes& body, const std::string& export_name, uint32_t i32_locals = 0,
-                   uint32_t i64_locals = 0)
+                   uint32_t i64_locals = 0, uint32_t v128_locals = 0)
   {
     m_params = params;
     m_results = results;
     m_funcs.clear();
-    AddFunction(body, export_name, i32_locals, i64_locals);
+    AddFunction(body, export_name, i32_locals, i64_locals, v128_locals);
   }
 
   // Add one more function to the module, returning its index.
@@ -287,11 +350,13 @@ public:
   // module needs.
   // i64_locals follow the i32 locals: with one parameter and N i32 locals,
   // the first i64 local is index N + 1. Floating-point blocks use them for
-  // 64-bit register values and byte swaps.
+  // 64-bit register values and byte swaps. v128_locals follow those, for
+  // paired singles held as vectors.
   uint32_t AddFunction(const Bytes& body, const std::string& export_name,
-                       uint32_t i32_locals = 0, uint32_t i64_locals = 0)
+                       uint32_t i32_locals = 0, uint32_t i64_locals = 0,
+                       uint32_t v128_locals = 0)
   {
-    m_funcs.push_back({body, export_name, i32_locals, i64_locals});
+    m_funcs.push_back({body, export_name, i32_locals, i64_locals, v128_locals});
     return static_cast<uint32_t>(m_funcs.size() - 1);
   }
 
@@ -404,7 +469,8 @@ public:
       for (const Func& f : m_funcs)
       {
         Bytes body;
-        const uint32_t groups = (f.locals ? 1u : 0u) + (f.locals_i64 ? 1u : 0u);
+        const uint32_t groups =
+            (f.locals ? 1u : 0u) + (f.locals_i64 ? 1u : 0u) + (f.locals_v128 ? 1u : 0u);
         PutU32(body, groups);
         if (f.locals)
         {
@@ -415,6 +481,11 @@ public:
         {
           PutU32(body, f.locals_i64);
           body.push_back(kI64);
+        }
+        if (f.locals_v128)
+        {
+          PutU32(body, f.locals_v128);
+          body.push_back(kV128);
         }
         PutBytes(body, f.body);
         body.push_back(kEnd);
@@ -464,6 +535,7 @@ private:
     std::string export_name;
     uint32_t locals = 0;
     uint32_t locals_i64 = 0;
+    uint32_t locals_v128 = 0;
     std::string debug_name;
   };
 

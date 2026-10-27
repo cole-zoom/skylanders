@@ -743,6 +743,61 @@ no second below 90%.**
   and session (their Chrome profile, other tabs, a hot laptop) and scenes
   past this path, which only a replay of the current build can show.
 
+### Busy scenes: paired singles as vectors
+
+A player's busy scenes (the first level's vortex, chests, fights) ran
+60-70% on their laptop. On their save states in the harness
+(`--load-state`), the CPU thread was busy 99%, 87% of it in compiled
+guest code, and the hottest blocks were the game's skinning loops:
+`psq_l` / `ps_madds0` / `psq_st`, ~5,800 machine instructions for ~100
+guest instructions. Counting that code, the cost was not loads and stores
+of guest registers (~300 of them) but each paired single done one half
+at a time through i64 locals: ~550 moves between integer and float
+registers, the conversions twice, the byte swaps twice.
+
+A paired single is two doubles side by side in guest state, the layout
+of an `f64x2`. With `StateLayout::simd_ps` (on; `--jit-no-simd` for A/B):
+
+- `psq_l` loads both halves with one vector load, swaps bytes with one
+  shuffle and converts with `f64x2.promote_low_f32x4`, one store. A float
+  pair holding an infinity or a NaN takes the bit-by-bit path. Integer
+  types extend, convert and scale as vectors.
+- `psq_st` does `ConvertToSingleFTZ` on both lanes with integer vector
+  operations (exact for every input, no branch), or clamps, truncates and
+  narrows the integer types.
+- At Dolphin's JIT accuracy (`fast_fp`, without `fprf`), the paired
+  arithmetic (`ps_add`/`sub`/`mul`/`div`, `ps_muls0/1`, `ps_madds0/1`,
+  `ps_madd`/`msub`/`nmadd`/`nmsub`) computes both halves with one vector
+  operation each: Force25Bit, the rounding-tie correction (in an `if`
+  taken only when a lane has a tie), the NI flush.
+- `lfs` and the scalar single forms write both halves with one store.
+
+The same bits either way. The differentials run with `--simd`. A new
+section in `jitdiff.cpp` compares the vector arithmetic with the scalar
+form at JIT accuracy: 6,000 single instructions (a fifth of the
+multiply-adds built on a rounding tie, NI set in half) and 3,000
+twelve-instruction blocks that mix the vector forms with merges, moves,
+scalar arithmetic and quantized loads and stores, comparing registers,
+FPSCR and memory. Mutants caught: the FTZ bound, a sign-extension, the
+tie direction, the NI threshold and the negate mask.
+
+Alternating runs, WebGPU, dual core:
+
+| | before | vectors |
+|---|---|---|
+| vortex state, standing (27 emulated s) | 93.2 / 92.8% | **96.0 / 96.1%** |
+| town gate state | 82.3 / 82.4% | **85.5 / 85.0%** |
+| walking window (300-400 s) | 103.4 / 103.8% | **105.8 / 105.9%** |
+
+Frames were the same in each pair (vortex 1,619 in the window; walking
+23,846-23,847 over the run).
+
+*Tried and not kept:* keeping each paired register in a v128 local
+between instructions (write-through, so nothing flushed at an exit):
+95.7 / 95.5% against 97.1 / 96.4% without, alternating. The values live
+across the cold paths' calls, and the spills cost more than the loads
+they save.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.
