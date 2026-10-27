@@ -14,7 +14,7 @@
 //   +16 f32  pointer y (-1..1, up)
 //   +20 u32  pointer on
 export const BUTTONS = ['A', 'B', '1', '2', '+', '-', 'Home',
-                        'Up', 'Down', 'Left', 'Right', 'C', 'Z'];
+                        'Up', 'Down', 'Left', 'Right', 'C', 'Z', 'Shake'];
 const BIT = Object.fromEntries(BUTTONS.map((b, i) => [b, 1 << i]));
 
 // KeyboardEvent.code -> a Wii button, or a stick direction.
@@ -26,13 +26,14 @@ export const KEYS = {
   ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
   Enter: '+', Backspace: '-', KeyH: 'Home',
   Digit1: '1', Digit2: '2',
+  KeyR: 'Shake',
 };
 const STICK_KEYS = { KeyW: [0, 1], KeyS: [0, -1], KeyA: [-1, 0], KeyD: [1, 0] };
 
 // The standard gamepad mapping's button indices.
 const PAD_BUTTONS = { 0: 'A', 1: 'B', 2: 'C', 3: 'Z', 4: '1', 5: '2', 6: 'Z', 7: 'B',
                       8: '-', 9: '+', 12: 'Up', 13: 'Down', 14: 'Left', 15: 'Right',
-                      16: 'Home' };
+                      10: 'Shake', 11: 'Shake', 16: 'Home' };
 const DEADZONE = 0.15;
 // Right stick moves the pointer at this many screen-widths a second.
 const POINTER_SPEED = 1.2;

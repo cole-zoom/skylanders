@@ -91,7 +91,18 @@ try {
     if (t >= nextReport) {
       const s = await evaluate(`JSON.stringify({
         status: document.getElementById('status').hidden ? '' : document.getElementById('status').textContent,
-        speed: document.getElementById('speed').textContent })`);
+        speed: document.getElementById('speed').textContent,
+        sound: document.getElementById('sound').textContent,
+        // The sound ring (bootgame.cpp's AudioRing): frames written, read,
+        // the worklet's short quanta, and the loudest sample in it now.
+        audio: (() => {
+          if (!Module._harness_audio) return null;
+          const a = Module._harness_audio(), b = Module.HEAPU8.buffer;
+          const ix = new Uint32Array(b, a, 4), d = new Int16Array(b, a + 16, 2 * ix[2]);
+          let peak = 0;
+          for (const v of d) peak = Math.max(peak, Math.abs(v));
+          return { written: ix[0], read: ix[1], underruns: ix[3], peak };
+        })() })`);
       console.log(`t=${t.toFixed(0)}s ${s}`);
       nextReport += 10;
     }

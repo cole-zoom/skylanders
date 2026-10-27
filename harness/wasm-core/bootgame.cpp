@@ -50,6 +50,8 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "AudioCommon/AudioCommon.h"
+#include "AudioCommon/Mixer.h"
+#include "AudioCommon/SoundStream.h"
 #include "Common/Logging/LogManager.h"
 #include "Common/WindowSystemInfo.h"
 #include "VideoCommon/AsyncRequests.h"
@@ -412,7 +414,8 @@ struct LiveInput
 static volatile LiveInput g_live{};
 static bool g_live_on = false;
 static const char* const kLiveButtons[] = {"A",    "B",  "1",    "2",     "+", "-", "Home",
-                                           "Up",   "Down", "Left", "Right", "C", "Z"};
+                                           "Up",   "Down", "Left", "Right", "C", "Z", "Shake"};
+static constexpr int kLiveShakeBit = 13;
 extern "C" {
 #if defined(__EMSCRIPTEN__)
 EMSCRIPTEN_KEEPALIVE volatile LiveInput* harness_live_input() { return &g_live; }
@@ -468,6 +471,82 @@ static bool LiveHeld(std::string_view group, std::string_view control)
   }
   return false;
 }
+// The Wii Remote's shake, held while the page's Shake bit is. Dolphin's
+// Shake group takes no input override: it reads its three controls'
+// mapping expressions. So each axis is mapped to the variable $shake and
+// the bit sets the variable. Checked on every poll, because
+// Wiimote::LoadConfig (the boot's title change) puts the default mappings
+// back after the override is installed.
+static void LiveShake(WiimoteEmu::Wiimote* wiimote)
+{
+  auto* shake = wiimote->GetWiimoteGroup(WiimoteEmu::WiimoteGroup::Shake);
+  for (auto& c : shake->controls)
+  {
+    if (c->control_ref->GetExpression() != "$shake")
+    {
+      c->control_ref->SetExpression("$shake");
+      wiimote->UpdateSingleControlReference(g_controller_interface, c->control_ref.get());
+    }
+  }
+  const auto& vars = wiimote->GetExpressionVariables();
+  if (const auto it = vars.find("shake"); it != vars.end() && it->second)
+    *it->second = (g_live.buttons >> kLiveShakeBit & 1) ? 1.0 : 0.0;
+}
+
+// --audio: the game's sound, for the page (web/audio.js). Dolphin's Null
+// sound stream sets the mixer's output rate to 0, which drops every sample
+// the DSP pushes; with --audio the rate goes back to 48 kHz and a thread of
+// our own does what a native backend's callback would: it pulls stereo
+// from the mixer into a ring in wasm memory, which the page's AudioWorklet
+// reads. The page owns `read`, this side `write`; both count frames and
+// only ever grow, so `write - read` is the fill.
+struct AudioRing
+{
+  std::atomic<u32> write;
+  std::atomic<u32> read;
+  u32 frames;     // capacity
+  u32 underruns;  // the worklet's count of quanta it found short
+  s16 data[2 * 8192];
+};
+static AudioRing g_audio{{0}, {0}, 8192, 0, {}};
+extern "C" {
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE AudioRing* harness_audio() { return &g_audio; }
+#endif
+}
+
+// Keeps the ring about 43 ms full (2,048 frames) in 256-frame pulls.
+// Nothing waits on this thread and it waits on nothing but its own sleep:
+// a creator blocking on a new thread is the deadlock docs/PLAN.md records.
+// When the game runs slow the mixer runs dry and pads with its last
+// sample, so the ring stays fed by wall time and a slow stretch is heard as
+// a stretch of held sound, not as the page falling behind.
+static void StartAudioPump(Mixer* mixer)
+{
+  mixer->SetSampleRate(48000);
+  std::thread([mixer] {
+    constexpr u32 kTarget = 2048, kChunk = 256;
+    s16 chunk[2 * kChunk];
+    while (true)
+    {
+      u32 w = g_audio.write.load(std::memory_order_relaxed);
+      while (w - g_audio.read.load(std::memory_order_acquire) < kTarget)
+      {
+        mixer->Mix(chunk, kChunk);
+        for (u32 i = 0; i < kChunk; ++i)
+        {
+          const u32 at = (w + i) % g_audio.frames;
+          g_audio.data[2 * at] = chunk[2 * i];
+          g_audio.data[2 * at + 1] = chunk[2 * i + 1];
+        }
+        w += kChunk;
+        g_audio.write.store(w, std::memory_order_release);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }).detach();
+}
+
 // The step the CPU loop is on, so an event can be tied to an instruction
 // count. Ticks and steps are NOT the same clock: CoreTiming advances by
 // slice_length - downcount, and the apploader runs before stepping begins, so
@@ -1078,6 +1157,7 @@ int main(int argc, char** argv)
   bool want_dump_uidcache = false;
   std::string uidcache_url;
   bool want_skylander = false;
+  bool want_audio = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
   u64 trace_from = 0;
@@ -1178,6 +1258,9 @@ int main(int argc, char** argv)
     // instead of a script. Replaces --input.
     else if (std::strcmp(argv[i], "--live-input") == 0)
       g_live_on = true;
+    // --audio: play the game's sound through the page (see AudioRing).
+    else if (std::strcmp(argv[i], "--audio") == 0)
+      want_audio = true;
     // --speed=F: limit emulation to F times real time, as Dolphin does when
     // played (1 = real time). Measuring runs leave it unlimited; see 1e.
     else if (std::strncmp(argv[i], "--speed=", 8) == 0)
@@ -1689,9 +1772,10 @@ int main(int argc, char** argv)
     {
       if (auto* controller = cfg->GetController(0))
       {
+        auto* wiimote = static_cast<WiimoteEmu::Wiimote*>(controller);
         controller->SetInputOverrideFunction(
-            [](std::string_view group, std::string_view control,
-               ControlState state) -> std::optional<ControlState> {
+            [wiimote](std::string_view group, std::string_view control,
+                      ControlState state) -> std::optional<ControlState> {
               if (group == "IR")
               {
                 if (!g_live.pointer_on)
@@ -1704,6 +1788,10 @@ int main(int argc, char** argv)
               }
               if (group != "Buttons" && group != "D-Pad")
                 return std::nullopt;
+              // Once per poll. The motion is read just before the buttons,
+              // so a shake starts a poll (5 ms) late.
+              if (group == "Buttons" && control == "A")
+                LiveShake(wiimote);
               return LiveHeld(group, control) ? 1.0 : 0.0;
             });
         std::printf("  input     live, from the page\n");
@@ -2242,6 +2330,11 @@ int main(int argc, char** argv)
   check(system.GetDSP().GetDSPEmulator()->Initialize(system.IsWii(), false),
         "DSP emulator initialised");
   AudioCommon::PostInitSoundStream(system);
+  if (want_audio)
+  {
+    StartAudioPump(system.GetSoundStream()->GetMixer());
+    std::printf("  audio     48 kHz to the page\n");
+  }
 
   // Known starting execution state, as Core.cpp:620 does.
   system.GetCPU().Break();
