@@ -37,6 +37,8 @@
 #include <emscripten.h>
 #endif
 
+#include <fmt/format.h>
+
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
@@ -555,6 +557,118 @@ static void StartAudioPump(Mixer* mixer)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   }).detach();
+}
+
+// The Portal of Power, from the page (web/portal.js). The page fills op,
+// id, var and slot, then bumps `request`; the CPU loop carries it out at its
+// next stage marker (~10 ms) and sets `done` to match. One request at a
+// time: the page waits for `done` before writing the next. `slots` mirrors
+// what is on the portal and `version` changes whenever it does.
+struct PortalBox
+{
+  std::atomic<u32> request;
+  std::atomic<u32> done;
+  u32 op;  // 1: place figure (id, var); 2: remove the figure in `slot`
+  u32 id, var, slot;
+  s32 result;  // place: the slot it went to; remove: 1; either: -1 failed
+  std::atomic<u32> version;
+  struct
+  {
+    u32 present, id, var;
+  } slots[MAX_SKYLANDERS];
+};
+static PortalBox g_portal{};
+// One file per figure kind, <id>-<var>.sky, kept when the figure comes off
+// the portal: putting it back brings its level, gold and upgrades with it,
+// as with a real toy.
+static std::string g_figures_dir;
+
+// Every figure Dolphin knows, as JSON: [[id, var, name, game, element,
+// type], ...], built once. The enums go as Dolphin's numbers; web/portal.js
+// names them.
+static std::string FigureListJson()
+{
+  std::string out = "[";
+  for (const auto& [ids, data] : IOS::HLE::USB::list_skylanders)
+  {
+    if (out.size() > 1)
+      out += ',';
+    std::string name;
+    for (const char* c = data.name; *c; ++c)
+    {
+      if (*c == '"' || *c == '\\')
+        name += '\\';
+      name += *c;
+    }
+    out += fmt::format("[{},{},\"{}\",{},{},{}]", ids.first, ids.second, name,
+                       static_cast<int>(data.game), static_cast<int>(data.element),
+                       static_cast<int>(data.type));
+  }
+  return out + "]";
+}
+
+extern "C" {
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE PortalBox* harness_portal() { return &g_portal; }
+EMSCRIPTEN_KEEPALIVE const char* harness_figure_list()
+{
+  static const std::string list = FigureListJson();
+  return list.c_str();
+}
+#endif
+}
+
+// Puts a figure on the portal, creating its file the first time. Returns
+// the slot, or -1.
+static int PlaceFigure(Core::System& system, u16 id, u16 var)
+{
+  const std::string path = fmt::format("{}{}-{:04x}.sky", g_figures_dir, id, var);
+  if (!File::Exists(path))
+  {
+    IOS::HLE::USB::SkylanderFigure figure(path);
+    if (!figure.Create(id, var))
+      return -1;
+    figure.Close();
+  }
+  File::IOFile file(path, "r+b");
+  if (!file.IsOpen())
+    return -1;
+  const u8 slot = system.GetSkylanderPortal().LoadSkylander(
+      std::make_unique<IOS::HLE::USB::SkylanderFigure>(std::move(file)));
+  if (slot >= MAX_SKYLANDERS)
+    return -1;
+  g_portal.slots[slot] = {1, id, var};
+  g_portal.version.fetch_add(1, std::memory_order_release);
+  return slot;
+}
+
+static void ServicePortal(Core::System& system)
+{
+  const u32 request = g_portal.request.load(std::memory_order_acquire);
+  if (request == g_portal.done.load(std::memory_order_relaxed))
+    return;
+  if (g_portal.op == 1)
+  {
+    g_portal.result = PlaceFigure(system, static_cast<u16>(g_portal.id),
+                                  static_cast<u16>(g_portal.var));
+  }
+  else if (g_portal.op == 2 && g_portal.slot < MAX_SKYLANDERS &&
+           g_portal.slots[g_portal.slot].present)
+  {
+    // RemoveSkylander saves and closes the figure's file. Only a slot this
+    // code filled is removed: an empty one has no figure to close.
+    system.GetSkylanderPortal().RemoveSkylander(static_cast<u8>(g_portal.slot));
+    g_portal.slots[g_portal.slot] = {};
+    g_portal.version.fetch_add(1, std::memory_order_release);
+    g_portal.result = 1;
+  }
+  else
+  {
+    g_portal.result = -1;
+  }
+  std::printf("  portal    op %u id %u var 0x%04x slot %u -> %d\n", g_portal.op, g_portal.id,
+              g_portal.var, g_portal.slot, g_portal.result);
+  g_portal.done.store(request, std::memory_order_release);
 }
 
 // The step the CPU loop is on, so an event can be tied to an instruction
@@ -2155,19 +2269,13 @@ int main(int argc, char** argv)
   // LoadSkylander() places it in a portal slot. MEMFS is a real filesystem as
   // far as this code is concerned, so the browser creates figures the same way
   // native does -- no special case.
+  g_figures_dir = user_dir + "figures/";
+  File::CreateFullPath(g_figures_dir);
   if (want_skylander)
   {
-    const std::string sky_path = user_dir + "figure.sky";
-    {
-      IOS::HLE::USB::SkylanderFigure figure(sky_path);
-      check(figure.Create(sky_id, sky_var), "Skylander figure data created");
-      figure.Close();
-    }
-    File::IOFile sky_file(sky_path, "r+b");
-    const u8 slot = system.GetSkylanderPortal().LoadSkylander(
-        std::make_unique<IOS::HLE::USB::SkylanderFigure>(std::move(sky_file)));
-    check(slot != 0xFF, "Skylander placed on the portal");
-    std::printf("  skylander id=%u var=0x%04x -> portal slot %u\n", sky_id, sky_var, slot);
+    const int slot = PlaceFigure(system, sky_id, sky_var);
+    check(slot >= 0, "Skylander placed on the portal");
+    std::printf("  skylander id=%u var=0x%04x -> portal slot %d\n", sky_id, sky_var, slot);
   }
 
   // ── video ──
@@ -3570,6 +3678,8 @@ int main(int argc, char** argv)
       InitMark(buf);
       g_harness_emulated_s =
           static_cast<double>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) / 729e6;
+      if (g_live_on)
+        ServicePortal(system);
       next_mark = i + (1u << 22);
     }
     if (tick_cap &&

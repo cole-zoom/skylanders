@@ -12,6 +12,10 @@
 // the stick is tested too. Needs web/build.sh to have run and the disc at
 // /tmp/ssa.iso.
 //
+// SWAP_AT=N SWAP_TO=name: at N s, take every figure off the portal and put
+// on the first one the portal panel finds for `name`, through the panel's
+// own buttons.
+//
 // HEADED=1: a visible window, as a player has it. At the end it prints the
 // readout's distribution over the walk (or over the run without
 // MOVE_FROM): one sample per readout update, the number a player sees.
@@ -65,11 +69,13 @@ try {
     ws.send(JSON.stringify({ id: me, method, params }));
   });
   const evaluate = async expr =>
-    (await send('Runtime.evaluate', { expression: expr, returnByValue: true }))?.result?.value;
+    (await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }))
+      ?.result?.value;
   const KEYS = { Space: [' ', 32], KeyW: ['w', 87], KeyD: ['d', 68] };
   const key = (type, code = 'Space') => send('Input.dispatchKeyEvent',
     { type, code, key: KEYS[code][0], windowsVirtualKeyCode: KEYS[code][1] });
   const moveFrom = Number(process.env.MOVE_FROM ?? Infinity);
+  let swapAt = Number(process.env.SWAP_AT ?? Infinity);
   let walks = 0;
   // Every readout the page shows, as it shows it.
   const watch = from => evaluate(`(() => {
@@ -105,6 +111,23 @@ try {
         })() })`);
       console.log(`t=${t.toFixed(0)}s ${s}`);
       nextReport += 10;
+    }
+    if (t >= swapAt) {
+      swapAt = Infinity;
+      const r = await evaluate(`(async () => {
+        const p = document.getElementById('portal');
+        const slots = () => [...p.querySelectorAll('.slots li')].map(li => li.textContent).join(' | ');
+        const before = slots();
+        for (const b of p.querySelectorAll('.slots button')) b.click();
+        await new Promise(r => setTimeout(r, 1500));
+        const s = p.querySelector('input');
+        s.value = ${JSON.stringify(process.env.SWAP_TO ?? '')};
+        s.dispatchEvent(new Event('input'));
+        p.querySelector('.figures button')?.click();
+        await new Promise(r => setTimeout(r, 1500));
+        return before + ' -> ' + slots();
+      })()`);
+      console.log(`t=${t.toFixed(0)}s portal: ${r}`);
     }
     if (t >= nextShot) {
       const r = await send('Page.captureScreenshot', { format: 'png' });
