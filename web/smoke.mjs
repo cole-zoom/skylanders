@@ -16,6 +16,9 @@
 // on the first one the portal panel finds for `name`, through the panel's
 // own buttons.
 //
+// STATES=120:save1,300:load1: at those seconds, press the save-state
+// panel's Save or Load button for that slot, and report how it went.
+//
 // COPY_OUT=<path>: at the end, copy this file out of the emulator's
 // filesystem into out-dir (e.g. Cache/SSPE52.uidcache, relative to the
 // emulator's user directory).
@@ -86,6 +89,10 @@ try {
     { type, code, key: KEYS[code][0], windowsVirtualKeyCode: KEYS[code][1] });
   const moveFrom = Number(process.env.MOVE_FROM ?? Infinity);
   let swapAt = Number(process.env.SWAP_AT ?? Infinity);
+  const stateActions = (process.env.STATES ?? '').split(',').filter(Boolean).map(a => {
+    const [at, what] = a.split(':');
+    return { at: Number(at), op: what.replace(/\d+$/, ''), slot: Number(what.match(/\d+$/)[0]) };
+  });
   let walks = 0;
   // Every readout the page shows, as it shows it.
   const watch = from => evaluate(`(() => {
@@ -122,6 +129,20 @@ try {
         })() })`);
       console.log(`t=${t.toFixed(0)}s ${s}`);
       nextReport += 10;
+    }
+    if (stateActions.length && t >= stateActions[0].at) {
+      const { op, slot } = stateActions.shift();
+      const r = await evaluate(`(async () => {
+        const root = document.getElementById('states');
+        const li = root.querySelectorAll('li')[${slot - 1}];
+        const b = [...li.querySelectorAll('button')].find(b => b.textContent === ${JSON.stringify(op === 'save' ? 'Save' : 'Load')});
+        b.click();
+        const st = root.querySelector('.state-status');
+        for (let i = 0; i < 600 && (!st.textContent || st.textContent.endsWith('…')); i++)
+          await new Promise(r => setTimeout(r, 100));
+        return st.textContent;
+      })()`);
+      console.log(`t=${t.toFixed(0)}s state ${op} ${slot}: ${r}`);
     }
     if (t >= swapAt) {
       swapAt = Infinity;

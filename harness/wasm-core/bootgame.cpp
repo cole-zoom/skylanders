@@ -50,7 +50,10 @@
 #include "Core/ConfigManager.h"
 #include "Common/Thread.h"
 #include "Core/Core.h"
+#include "Common/ChunkFile.h"
 #include "Core/CoreTiming.h"
+#include "Core/GeckoCode.h"
+#include "Core/Movie.h"
 #include "AudioCommon/AudioCommon.h"
 #include "AudioCommon/Mixer.h"
 #include "AudioCommon/SoundStream.h"
@@ -669,6 +672,161 @@ static void ServicePortal(Core::System& system)
   std::printf("  portal    op %u id %u var 0x%04x slot %u -> %d\n", g_portal.op, g_portal.id,
               g_portal.var, g_portal.slot, g_portal.result);
   g_portal.done.store(request, std::memory_order_release);
+}
+
+// Save states, from the page (web/states.js): the whole machine to a
+// buffer and back. Dolphin's State::SaveAs / LoadAs expect its own run
+// loop (RunOnCPUThread, a compressing thread, a 100 MB undo copy), so the
+// harness runs the same sequence itself, on the CPU thread at a stage
+// marker, and leaves compression and storage to the page. Same mailbox
+// shape as PortalBox.
+struct StateBox
+{
+  std::atomic<u32> request;
+  std::atomic<u32> done;
+  u32 op;  // 1 save; 2 load the `size` bytes at `ptr`; 3 allocate `size`; 4 free `ptr`
+  u32 ptr, size;
+  s32 result;  // save: the state's size, at `ptr`; allocate: the address; else 1; -1 failed
+  char message[160];
+};
+static StateBox g_states{};
+// Set by main once the recompiler exists: forget every compiled block,
+// because a loaded state can hold different code at the same addresses.
+static std::function<void()> g_after_state_load;
+
+// The header: what has to match before anything is overwritten. Dolphin's
+// STATE_VERSION is State.cpp's and not exported; kDolphinStateVersion
+// copies it and has to follow it when Dolphin is updated.
+constexpr u32 kStateMagic = 0x534B5953;  // "SYKS"
+constexpr u32 kStateFormat = 1;
+constexpr u32 kDolphinStateVersion = 192;
+
+static bool DoStateHeader(Core::System& system, PointerWrap& p, std::string* why)
+{
+  u32 magic = kStateMagic, format = kStateFormat, version = kDolphinStateVersion;
+  u32 mem1 = system.GetMemory().GetRamSizeReal(), mem2 = system.GetMemory().GetExRamSizeReal();
+  p.Do(magic);
+  p.Do(format);
+  p.Do(version);
+  p.Do(mem1);
+  p.Do(mem2);
+  if (!p.IsReadMode())
+    return true;
+  if (magic != kStateMagic)
+    *why = "not a save state from this page";
+  else if (format != kStateFormat || version != kDolphinStateVersion)
+    *why = fmt::format("made by another version (format {}, Dolphin {}; this build {}, {})",
+                       format, version, kStateFormat, kDolphinStateVersion);
+  else if (mem1 != system.GetMemory().GetRamSizeReal() ||
+           mem2 != system.GetMemory().GetExRamSizeReal())
+    *why = "made with different memory sizes";
+  else
+    return true;
+  return false;
+}
+
+// State.cpp's DoState, which is static: the same calls in the same order.
+static void DoMachineState(Core::System& system, PointerWrap& p)
+{
+  system.GetMovie().DoState(p);
+  p.DoMarker("Movie");
+  // In dual core this runs on the GPU thread, as a blocking AsyncRequests
+  // event, and the CPU thread waits for it.
+  g_video_backend->DoState(p);
+  p.DoMarker("video_backend");
+  system.GetCoreTiming().DoState(p);
+  p.DoMarker("CoreTiming");
+  HW::DoState(system, p);
+  p.DoMarker("HW");
+  system.GetPowerPC().DoState(p);
+  p.DoMarker("PowerPC");
+  Wiimote::DoState(p);
+  p.DoMarker("Wiimote");
+  Gecko::DoState(p);
+  p.DoMarker("Gecko");
+}
+
+static void ServiceStates(Core::System& system)
+{
+  const u32 request = g_states.request.load(std::memory_order_acquire);
+  if (request == g_states.done.load(std::memory_order_relaxed))
+    return;
+  std::string why;
+  g_states.result = -1;
+  if (g_states.op == 1)
+  {
+    u8* end = nullptr;
+    PointerWrap measure(&end, 0, PointerWrap::Mode::Measure);
+    DoStateHeader(system, measure, &why);
+    DoMachineState(system, measure);
+    const size_t size = measure.GetOffsetFromPreviousPosition(nullptr);
+    u8* buffer = static_cast<u8*>(std::malloc(size));
+    if (!buffer)
+    {
+      why = fmt::format("no memory for {} MB", size >> 20);
+    }
+    else
+    {
+      u8* at = buffer;
+      PointerWrap write(&at, size, PointerWrap::Mode::Write);
+      DoStateHeader(system, write, &why);
+      DoMachineState(system, write);
+      if (write.IsWriteMode())
+      {
+        g_states.ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(buffer));
+        g_states.size = static_cast<u32>(size);
+        g_states.result = static_cast<s32>(size);
+      }
+      else
+      {
+        std::free(buffer);
+        why = "the state did not fit the size it measured";
+      }
+    }
+  }
+  else if (g_states.op == 2)
+  {
+    u8* const buffer = reinterpret_cast<u8*>(static_cast<uintptr_t>(g_states.ptr));
+    u8* at = buffer;
+    PointerWrap header(&at, g_states.size, PointerWrap::Mode::Read);
+    if (DoStateHeader(system, header, &why))
+    {
+      at = buffer;
+      PointerWrap read(&at, g_states.size, PointerWrap::Mode::Read);
+      DoStateHeader(system, read, &why);
+      DoMachineState(system, read);
+      if (read.IsReadMode())
+        g_states.result = 1;
+      else
+        why = "the state stopped matching partway through; reload the page";
+      if (g_after_state_load)
+        g_after_state_load();
+    }
+    std::free(buffer);
+  }
+  else if (g_states.op == 3)
+  {
+    void* buffer = std::malloc(g_states.size);
+    if (buffer)
+      g_states.result = static_cast<s32>(reinterpret_cast<uintptr_t>(buffer));
+    else
+      why = fmt::format("no memory for {} MB", g_states.size >> 20);
+  }
+  else if (g_states.op == 4)
+  {
+    std::free(reinterpret_cast<void*>(static_cast<uintptr_t>(g_states.ptr)));
+    g_states.result = 1;
+  }
+  std::snprintf(g_states.message, sizeof(g_states.message), "%s", why.c_str());
+  std::printf("  state     op %u size %u -> %d %s\n", g_states.op, g_states.size,
+              g_states.result, why.c_str());
+  g_states.done.store(request, std::memory_order_release);
+}
+
+extern "C" {
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE StateBox* harness_states() { return &g_states; }
+#endif
 }
 
 // The step the CPU loop is on, so an event can be tied to an instruction
@@ -2972,6 +3130,17 @@ int main(int argc, char** argv)
       static_cast<u32>(reinterpret_cast<uintptr_t>(region_table_phys.data()));
   Tier tier_virt{jit_cache, link_table, jit_layout, false};
   Tier tier_phys{jit_cache_phys, link_table_phys, jit_layout_phys, true};
+  // A loaded save state (ServiceStates) can hold other code at the same
+  // addresses. Every way into compiled code is a lookup in a cache or a
+  // link table -- direct calls only join blocks of one module -- so
+  // forgetting those is forgetting every translation; the old modules stay
+  // installed, unreachable.
+  g_after_state_load = [&] {
+    jit_cache.clear();
+    jit_cache_phys.clear();
+    std::fill(link_table.begin(), link_table.end(), 0u);
+    std::fill(link_table_phys.begin(), link_table_phys.end(), 0u);
+  };
   u64 jit_phys_dispatches = 0;
 
   auto compile_region = [&](Tier& tier, u32 seed) {
@@ -3694,7 +3863,10 @@ int main(int argc, char** argv)
       g_harness_emulated_s =
           static_cast<double>(system.GetCoreTiming().GetTicks() - ticks_at_step_start) / 729e6;
       if (g_live_on)
+      {
         ServicePortal(system);
+        ServiceStates(system);
+      }
       next_mark = i + (1u << 22);
     }
     if (tick_cap &&
