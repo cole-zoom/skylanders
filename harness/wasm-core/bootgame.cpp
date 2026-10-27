@@ -414,8 +414,10 @@ struct LiveInput
 static volatile LiveInput g_live{};
 static bool g_live_on = false;
 static const char* const kLiveButtons[] = {"A",    "B",  "1",    "2",     "+", "-", "Home",
-                                           "Up",   "Down", "Left", "Right", "C", "Z", "Shake"};
+                                           "Up",   "Down", "Left", "Right", "C", "Z", "Shake",
+                                           "Thrust"};
 static constexpr int kLiveShakeBit = 13;
+static constexpr int kLiveThrustBit = 14;
 extern "C" {
 #if defined(__EMSCRIPTEN__)
 EMSCRIPTEN_KEEPALIVE volatile LiveInput* harness_live_input() { return &g_live; }
@@ -471,26 +473,34 @@ static bool LiveHeld(std::string_view group, std::string_view control)
   }
   return false;
 }
-// The Wii Remote's shake, held while the page's Shake bit is. Dolphin's
-// Shake group takes no input override: it reads its three controls'
-// mapping expressions. So each axis is mapped to the variable $shake and
-// the bit sets the variable. Checked on every poll, because
+// The Wii Remote's motions, held while the page's bits are: Shake (all
+// three axes) and Thrust (the Swing group's Forward: the remote pushed
+// away from the player, as the game's "Move!" prompts ask for). Dolphin's
+// motion groups take no input override: they read their controls' mapping
+// expressions. So those controls are mapped to the variables $shake and
+// $thrust and the bits set the variables. Checked on every poll, because
 // Wiimote::LoadConfig (the boot's title change) puts the default mappings
 // back after the override is installed.
-static void LiveShake(WiimoteEmu::Wiimote* wiimote)
+static void LiveMotion(WiimoteEmu::Wiimote* wiimote)
 {
-  auto* shake = wiimote->GetWiimoteGroup(WiimoteEmu::WiimoteGroup::Shake);
-  for (auto& c : shake->controls)
-  {
-    if (c->control_ref->GetExpression() != "$shake")
+  const auto map = [wiimote](ControllerEmu::Control& c, const char* expression) {
+    if (c.control_ref->GetExpression() != expression)
     {
-      c->control_ref->SetExpression("$shake");
-      wiimote->UpdateSingleControlReference(g_controller_interface, c->control_ref.get());
+      c.control_ref->SetExpression(expression);
+      wiimote->UpdateSingleControlReference(g_controller_interface, c.control_ref.get());
     }
-  }
+  };
+  for (auto& c : wiimote->GetWiimoteGroup(WiimoteEmu::WiimoteGroup::Shake)->controls)
+    map(*c, "$shake");
+  // Force's inputs: Up, Down, Left, Right, Forward, Backward.
+  map(*wiimote->GetWiimoteGroup(WiimoteEmu::WiimoteGroup::Swing)->controls[4], "$thrust");
   const auto& vars = wiimote->GetExpressionVariables();
-  if (const auto it = vars.find("shake"); it != vars.end() && it->second)
-    *it->second = (g_live.buttons >> kLiveShakeBit & 1) ? 1.0 : 0.0;
+  const auto set = [&vars](const char* name, int bit) {
+    if (const auto it = vars.find(name); it != vars.end() && it->second)
+      *it->second = (g_live.buttons >> bit & 1) ? 1.0 : 0.0;
+  };
+  set("shake", kLiveShakeBit);
+  set("thrust", kLiveThrustBit);
 }
 
 // --audio: the game's sound, for the page (web/audio.js). Dolphin's Null
@@ -1789,9 +1799,9 @@ int main(int argc, char** argv)
               if (group != "Buttons" && group != "D-Pad")
                 return std::nullopt;
               // Once per poll. The motion is read just before the buttons,
-              // so a shake starts a poll (5 ms) late.
+              // so a motion starts a poll (5 ms) late.
               if (group == "Buttons" && control == "A")
-                LiveShake(wiimote);
+                LiveMotion(wiimote);
               return LiveHeld(group, control) ? 1.0 : 0.0;
             });
         std::printf("  input     live, from the page\n");
