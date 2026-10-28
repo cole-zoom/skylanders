@@ -3,11 +3,12 @@
 //
 // Query parameters, all optional:
 //   speed=F       emulation speed limit, 1 = real time (default), 0 = unlimited
-//   figure=ID:VAR the Skylander on the portal (default Whirlwind, 0:0)
+//   figure=ID:VAR the Skylander on the portal at boot (default Whirlwind, 0:0)
 //   log=1         show the emulator's output under the canvas
 //   audio=0       no sound
 import { attachAudio } from './audio.js';
 import { attachInput } from './input.js';
+import { attachPortal } from './portal.js';
 
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -105,6 +106,8 @@ window.Module = {
     stagePtr = Module._harness_stage();
     secondsPtr = Module._harness_emulated_seconds();
     attachInput($('canvas'), Module.HEAPU8.buffer, Module._harness_live_input());
+    $('portal').hidden = false;
+    attachPortal(Module, $('portal'));
     if (audio)
       attachAudio(Module.HEAPU8.buffer, Module._harness_audio(), $('sound'))
         .catch(e => log(`! sound failed: ${e.message}`));

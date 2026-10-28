@@ -25,6 +25,20 @@
         padding: 1px 5px; color: var(--fg); }
   button { font: inherit; color: var(--fg); background: #1b2030; border: 1px solid #333a46;
            border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+  #portal { width: min(100%, 900px); }
+  #portal h2 { font-size: 14px; margin: 0 0 6px; color: var(--dim); font-weight: 600; }
+  #portal ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  #portal .slots { margin-bottom: 10px; }
+  #portal .slots li { background: #1b2030; border: 1px solid #333a46; border-radius: 6px;
+                      padding: 4px 4px 4px 10px; }
+  #portal .slots button { padding: 2px 8px; margin-left: 6px; }
+  #portal .empty { color: var(--dim); padding: 4px 0; }
+  #portal .find { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  #portal input, #portal select { font: inherit; color: var(--fg); background: #1b2030;
+                                  border: 1px solid #333a46; border-radius: 6px; padding: 4px 8px; }
+  #portal input { flex: 1 1 180px; }
+  #portal .figures { max-height: 160px; overflow: auto; }
+  #portal .figures button { padding: 3px 10px; }
   #log { width: min(100%, 900px); max-height: 30vh; overflow: auto; margin: 0;
          font: 11px ui-monospace, monospace; color: var(--dim); }
 </style>
@@ -50,6 +64,7 @@
   <button id="sound">Sound</button>
   <button id="fullscreen">Fullscreen</button>
 </div>
+<section id="portal" hidden></section>
 <pre id="log" hidden></pre>
 <script type="module" src="shell.js"></script>
 </html>
