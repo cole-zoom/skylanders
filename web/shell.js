@@ -5,6 +5,8 @@
 //   speed=F       emulation speed limit, 1 = real time (default), 0 = unlimited
 //   figure=ID:VAR the Skylander on the portal (default Whirlwind, 0:0)
 //   log=1         show the emulator's output under the canvas
+//   audio=0       no sound
+import { attachAudio } from './audio.js';
 import { attachInput } from './input.js';
 
 const $ = id => document.getElementById(id);
@@ -40,10 +42,12 @@ if (missing.length) {
 }
 
 const speed = params.get('speed') ?? '1';
+const audio = params.get('audio') !== '0';
 const figure = params.get('figure');
 // The run never ends on its own; the step count is only a cap.
 const args = [new URL('disc', location.href).href, '1000000000000000000',
               '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
+              ...(audio ? ['--audio'] : []),
               `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander',
               // The game's pipelines, compiled at boot rather than the first
               // time each is drawn (web/make-uidcache.sh). Absent, the game
@@ -59,7 +63,18 @@ const readStage = () => {
 };
 
 // The speed readout: emulated seconds per wall second, over the last second.
+// Every reading is also sent to the server (web/serve.mjs writes them to a
+// file), so a play session leaves a record of where it was slow.
 let lastEmulated = 0, lastWall = 0;
+let readouts = [];
+const sendReadouts = () => {
+  if (!readouts.length) return;
+  fetch('readout', { method: 'POST', body: readouts.join('\n') + '\n', keepalive: true })
+    .catch(() => {});
+  readouts = [];
+};
+setInterval(sendReadouts, 10000);
+addEventListener('pagehide', sendReadouts);
 const hud = () => {
   const stage = readStage();
   if (!stage.startsWith('stepping')) {
@@ -71,6 +86,8 @@ const hud = () => {
     if (lastWall) {
       const pct = (100 * (emulated - lastEmulated)) / (wall - lastWall);
       $('speed').textContent = `${pct.toFixed(0)}%`;
+      readouts.push(`${new Date().toISOString()} emulated ${emulated.toFixed(1)} s ` +
+                    `readout ${pct.toFixed(0)}%`);
     }
     lastEmulated = emulated;
     lastWall = wall;
@@ -88,6 +105,11 @@ window.Module = {
     stagePtr = Module._harness_stage();
     secondsPtr = Module._harness_emulated_seconds();
     attachInput($('canvas'), Module.HEAPU8.buffer, Module._harness_live_input());
+    if (audio)
+      attachAudio(Module.HEAPU8.buffer, Module._harness_audio(), $('sound'))
+        .catch(e => log(`! sound failed: ${e.message}`));
+    else
+      $('sound').hidden = true;
     setInterval(hud, 1000);
   },
 };
