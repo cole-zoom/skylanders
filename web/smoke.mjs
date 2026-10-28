@@ -16,6 +16,13 @@
 // on the first one the portal panel finds for `name`, through the panel's
 // own buttons.
 //
+// COPY_OUT=<path>: at the end, copy this file out of the emulator's
+// filesystem into out-dir (e.g. Cache/SSPE52.uidcache, relative to the
+// emulator's user directory).
+//
+// KEEP_PROFILE=<dir>: use (and keep) this Chrome profile, so the saves one
+// run leaves in the browser are there for the next.
+//
 // HEADED=1: a visible window, as a player has it. At the end it prints the
 // readout's distribution over the walk (or over the run without
 // MOVE_FROM): one sample per readout update, the number a player sees.
@@ -34,9 +41,12 @@ const PORT = 8090, DEBUG = 9351;
 mkdirSync(out, { recursive: true });
 
 const here = dirname(fileURLToPath(import.meta.url));
+// The page's readout goes to this run's own log, not a player's.
 const server = spawn(process.execPath, [join(here, 'serve.mjs'), '/tmp/ssa.iso', String(PORT)],
-                     { stdio: 'ignore' });
-const profile = mkdtempSync(join(tmpdir(), 'shell-'));
+                     { stdio: 'ignore',
+                       env: { ...process.env, READOUT_LOG: join(out, 'readout.log') } });
+const profile = process.env.KEEP_PROFILE ?? mkdtempSync(join(tmpdir(), 'shell-'));
+mkdirSync(profile, { recursive: true });
 let chrome;
 try {
   await sleep(500);
@@ -99,6 +109,7 @@ try {
         status: document.getElementById('status').hidden ? '' : document.getElementById('status').textContent,
         speed: document.getElementById('speed').textContent,
         sound: document.getElementById('sound').textContent,
+        saves: document.getElementById('saves-status').textContent,
         // The sound ring (bootgame.cpp's AudioRing): frames written, read,
         // the worklet's short quanta, and the loudest sample in it now.
         audio: (() => {
@@ -155,6 +166,14 @@ try {
                 `median ${at(0.5)}%, p25 ${at(0.25)}%, p10 ${at(0.1)}%, worst ${v[0]}%; ` +
                 `${v.filter(x => x < 90).length} below 90%`);
   }
+  if (process.env.COPY_OUT) {
+    const b64 = await evaluate(`(() => {
+      const d = Module.FS.readFile('/tmp/dolphin-boot-user/' + ${JSON.stringify(process.env.COPY_OUT)});
+      let s = ''; for (let i = 0; i < d.length; i += 0x8000) s += String.fromCharCode(...d.subarray(i, i + 0x8000));
+      return btoa(s); })()`);
+    if (b64) writeFileSync(join(out, process.env.COPY_OUT.split('/').pop()), Buffer.from(b64, 'base64'));
+    console.log(`${process.env.COPY_OUT}: ${b64 ? 'copied' : 'not found'}`);
+  }
   const log = await evaluate(`document.getElementById('log').textContent`);
   writeFileSync(join(out, 'log.txt'), log ?? '');
   console.log(`screenshots and log.txt in ${out}`);
@@ -162,5 +181,6 @@ try {
 } finally {
   for (const p of [chrome, server]) { try { p?.kill(); } catch {} }
   await sleep(300);
-  try { rmSync(profile, { recursive: true, force: true }); } catch {}
+  if (!process.env.KEEP_PROFILE)
+    try { rmSync(profile, { recursive: true, force: true }); } catch {}
 }

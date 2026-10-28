@@ -9,6 +9,7 @@
 import { attachAudio } from './audio.js';
 import { attachInput } from './input.js';
 import { attachPortal } from './portal.js';
+import { keepSaves, loadSaves, restoreSaves } from './saves.js';
 
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -49,6 +50,8 @@ const figure = params.get('figure');
 const args = [new URL('disc', location.href).href, '1000000000000000000',
               '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
               ...(audio ? ['--audio'] : []),
+              // The NAND where web/saves.js restores the game's saves.
+              '--keep-nand',
               `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander',
               // The game's pipelines, compiled at boot rather than the first
               // time each is drawn (web/make-uidcache.sh). Absent, the game
@@ -95,8 +98,14 @@ const hud = () => {
   }
 };
 
+// The saves kept in this browser, read before the module starts so they
+// can be put back before main() runs. Without IndexedDB the game still
+// runs, from a fresh NAND each time.
+const saves = await loadSaves().catch(e => (log(`! saves unavailable: ${e.message}`), null));
+
 window.Module = {
   canvas: $('canvas'),
+  preRun: [() => { if (saves) restoreSaves(Module.FS, saves.files); }],
   arguments: args,
   print: log,
   printErr: text => log('! ' + text),
@@ -108,6 +117,11 @@ window.Module = {
     attachInput($('canvas'), Module.HEAPU8.buffer, Module._harness_live_input());
     $('portal').hidden = false;
     attachPortal(Module, $('portal'));
+    if (saves) {
+      $('saves').hidden = false;
+      keepSaves(Module.FS, saves, { status: $('saves-status'), exportButton: $('saves-export'),
+                                    importButton: $('saves-import'), resetButton: $('saves-reset') });
+    }
     if (audio)
       attachAudio(Module.HEAPU8.buffer, Module._harness_audio(), $('sound'))
         .catch(e => log(`! sound failed: ${e.message}`));
