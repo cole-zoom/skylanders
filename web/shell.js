@@ -10,6 +10,7 @@ import { attachAudio } from './audio.js';
 import { attachInput } from './input.js';
 import { attachPortal } from './portal.js';
 import { keepSaves, loadSaves, restoreSaves } from './saves.js';
+import { attachStates } from './states.js';
 
 const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -87,8 +88,9 @@ const hud = () => {
     say('');
     const emulated = new Float64Array(Module.HEAPU8.buffer, secondsPtr, 1)[0];
     const wall = performance.now() / 1000;
-    if (lastWall) {
-      const pct = (100 * (emulated - lastEmulated)) / (wall - lastWall);
+    // A loaded save state moves the emulated clock; that second is skipped.
+    const pct = (100 * (emulated - lastEmulated)) / (wall - lastWall);
+    if (lastWall && pct >= 0 && pct < 1000) {
       $('speed').textContent = `${pct.toFixed(0)}%`;
       readouts.push(`${new Date().toISOString()} emulated ${emulated.toFixed(1)} s ` +
                     `readout ${pct.toFixed(0)}%`);
@@ -118,6 +120,8 @@ window.Module = {
     $('portal').hidden = false;
     attachPortal(Module, $('portal'));
     if (saves) {
+      $('states').hidden = false;
+      attachStates(Module, $('states')).catch(e => log(`! save states unavailable: ${e.message}`));
       $('saves').hidden = false;
       keepSaves(Module.FS, saves, { status: $('saves-status'), exportButton: $('saves-export'),
                                     importButton: $('saves-import'), resetButton: $('saves-reset') });

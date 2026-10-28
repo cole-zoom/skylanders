@@ -16,6 +16,14 @@
 // on the first one the portal panel finds for `name`, through the panel's
 // own buttons.
 //
+// STATE_URL=<path under web/>: once the page is running, put that save
+// state file (.sav.gz) in slot 4 and load it. PRESS=12:KeyT,14:KeyT:500:
+// at those seconds, press those keys (for ms, default 200); with either,
+// the Space tapping stops, so the scene is left to the keys given.
+//
+// STATES=120:save1,300:load1: at those seconds, press the save-state
+// panel's Save or Load button for that slot, and report how it went.
+//
 // COPY_OUT=<path>: at the end, copy this file out of the emulator's
 // filesystem into out-dir (e.g. Cache/SSPE52.uidcache, relative to the
 // emulator's user directory).
@@ -81,11 +89,22 @@ try {
   const evaluate = async expr =>
     (await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }))
       ?.result?.value;
-  const KEYS = { Space: [' ', 32], KeyW: ['w', 87], KeyD: ['d', 68] };
+  const KEYS = { Space: [' ', 32], KeyW: ['w', 87], KeyD: ['d', 68], KeyR: ['r', 82],
+                 KeyT: ['t', 84], KeyA: ['a', 65], KeyS: ['s', 83] };
+  let stateUrl = process.env.STATE_URL;
+  const presses = (process.env.PRESS ?? '').split(',').filter(Boolean).map(p => {
+    const [at, code, ms] = p.split(':');
+    return { at: Number(at), code, ms: Number(ms ?? 200) };
+  });
+  const scripted = Boolean(stateUrl || presses.length);
   const key = (type, code = 'Space') => send('Input.dispatchKeyEvent',
     { type, code, key: KEYS[code][0], windowsVirtualKeyCode: KEYS[code][1] });
   const moveFrom = Number(process.env.MOVE_FROM ?? Infinity);
   let swapAt = Number(process.env.SWAP_AT ?? Infinity);
+  const stateActions = (process.env.STATES ?? '').split(',').filter(Boolean).map(a => {
+    const [at, what] = a.split(':');
+    return { at: Number(at), op: what.replace(/\d+$/, ''), slot: Number(what.match(/\d+$/)[0]) };
+  });
   let walks = 0;
   // Every readout the page shows, as it shows it.
   const watch = from => evaluate(`(() => {
@@ -123,6 +142,50 @@ try {
       console.log(`t=${t.toFixed(0)}s ${s}`);
       nextReport += 10;
     }
+    if (stateUrl && await evaluate(`!!document.querySelector('#states li')`)) {
+      const url = stateUrl;
+      stateUrl = undefined;
+      const r = await evaluate(`(async () => {
+        const blob = await (await fetch(${JSON.stringify(url)})).blob();
+        const db = await new Promise((ok, no) => {
+          const q = indexedDB.open('skylanders-states', 1);
+          q.onupgradeneeded = () => q.result.createObjectStore('states');
+          q.onsuccess = () => ok(q.result); q.onerror = () => no(q.error); });
+        await new Promise((ok, no) => { const tx = db.transaction('states', 'readwrite');
+          tx.objectStore('states').put({ when: Date.now(), blob }, 4);
+          tx.oncomplete = ok; tx.onerror = () => no(tx.error); });
+        const root = document.getElementById('states');
+        const st = root.querySelector('.state-status');
+        await root.refresh();
+        [...root.querySelectorAll('li')[3].querySelectorAll('button')]
+          .find(b => b.textContent === 'Load').click();
+        for (let i = 0; i < 600 && (!st.textContent || st.textContent.endsWith('…')); i++)
+          await new Promise(r => setTimeout(r, 100));
+        return st.textContent;
+      })()`);
+      console.log(`t=${t.toFixed(0)}s state from ${url}: ${r}`);
+    }
+    while (presses.length && t >= presses[0].at) {
+      const { code, ms } = presses.shift();
+      await key('keyDown', code);
+      await sleep(ms);
+      await key('keyUp', code);
+      console.log(`t=${t.toFixed(0)}s pressed ${code} for ${ms} ms`);
+    }
+    if (stateActions.length && t >= stateActions[0].at) {
+      const { op, slot } = stateActions.shift();
+      const r = await evaluate(`(async () => {
+        const root = document.getElementById('states');
+        const li = root.querySelectorAll('li')[${slot - 1}];
+        const b = [...li.querySelectorAll('button')].find(b => b.textContent === ${JSON.stringify(op === 'save' ? 'Save' : 'Load')});
+        b.click();
+        const st = root.querySelector('.state-status');
+        for (let i = 0; i < 600 && (!st.textContent || st.textContent.endsWith('…')); i++)
+          await new Promise(r => setTimeout(r, 100));
+        return st.textContent;
+      })()`);
+      console.log(`t=${t.toFixed(0)}s state ${op} ${slot}: ${r}`);
+    }
     if (t >= swapAt) {
       swapAt = Infinity;
       const r = await evaluate(`(async () => {
@@ -145,6 +208,10 @@ try {
       if (r?.data) writeFileSync(join(out, `shot-${String(++shot).padStart(2, '0')}.png`),
                                  Buffer.from(r.data, 'base64'));
       nextShot += Number(process.env.SHOT_EVERY ?? 30);
+    }
+    if (scripted) {
+      await sleep(250);
+      continue;
     }
     if (t >= moveFrom) {
       const code = walks++ % 2 ? 'KeyD' : 'KeyW';
