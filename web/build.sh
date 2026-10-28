@@ -4,7 +4,7 @@
 #
 #   web/build.sh && node web/serve.mjs /tmp/ssa.iso
 #
-# web/make-uidcache.sh once as well (six minutes), or the game stalls the
+# web/make-uidcache.sh once as well (about 8 minutes), or the game stalls the
 # first time it draws with each pipeline.
 #
 # The module is harness/wasm-core/bootgame.cpp, the same program every
