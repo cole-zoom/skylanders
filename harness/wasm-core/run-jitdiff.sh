@@ -20,12 +20,13 @@
 # out-of-memory, and lands mid-run so the sections after it never report.
 # Each section now reuses its slots, so the instances are collectable.
 #
-#   harness/wasm-core/run-jitdiff.sh [out.js] [--compact] [--short-convert]
+#   harness/wasm-core/run-jitdiff.sh [out.js] [--compact] [--short-convert] [--simd]
 #
 # The flags compile as the dispatcher does by default: the slow paths as
-# helper calls (StateLayout::hatch_exit_index) and the float conversions
-# through promote/demote (StateLayout::short_convert). Both are meant to be
-# exact, so the same expectations hold either way.
+# helper calls (StateLayout::hatch_exit_index), the float conversions
+# through promote/demote (StateLayout::short_convert) and the paired
+# singles as vectors (StateLayout::simd_ps). All are meant to be exact, so
+# the same expectations hold either way.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

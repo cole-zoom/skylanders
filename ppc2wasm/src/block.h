@@ -58,6 +58,10 @@ struct BlockResult
   // blocks with floating-point or multi-word forms, and then the i32 count
   // is always 8 so that these are locals 9 and 10.
   uint32_t locals_i64 = 0;
+  // v128 locals, declared after the i64 ones. Non-zero only with
+  // StateLayout::simd_ps, and then the i64 count is always 6, so that
+  // these start at kV128Local.
+  uint32_t locals_v128 = 0;
   uint32_t instructions;  // PowerPC instructions translated
   uint32_t end_pc;        // where the interpreter should resume
   const char* stopped_on; // why the block ended, for diagnostics
@@ -424,6 +428,16 @@ struct StateLayout
   // the bitwise path only for what those would get wrong (see
   // EmitConvertToDoubleShort). Exact either way; off is the old code.
   bool short_convert = false;
+
+  // ── paired singles as vectors ──
+  //
+  // A paired single is two doubles side by side in guest state, ps0 then
+  // ps1, which is the layout of an f64x2. When set, the quantized loads
+  // and stores move both halves with one vector access, and (with
+  // fast_fp and without fprf) the paired arithmetic computes both halves
+  // with one vector operation each, instead of one half at a time through
+  // i64 locals. Results are the same bits either way.
+  bool simd_ps = false;
 
   // ── compact slow paths ──
   //
@@ -1678,6 +1692,69 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
   PutU32(b, 4);
 }
 
+// ── paired singles as vectors (StateLayout::simd_ps) ──
+//
+// The v128 locals start at 15: a block that uses them declares all eight
+// i32 locals and all six i64 ones, as the paired multiply-adds do.
+constexpr uint32_t kV128Local = 15;
+constexpr uint32_t kV128Locals = 6;
+
+inline void Simd(Bytes& b, uint32_t o)
+{
+  b.push_back(kPrefixFD);
+  PutU32(b, o);
+}
+
+// A vector load or store, with its memarg; the lane forms add the lane.
+inline void SimdMem(Bytes& b, uint32_t o, uint32_t align, uint32_t offset)
+{
+  Simd(b, o);
+  PutU32(b, align);
+  PutU32(b, offset);
+}
+
+inline void SimdLane(Bytes& b, uint32_t o, uint32_t align, uint32_t offset, uint8_t lane)
+{
+  SimdMem(b, o, align, offset);
+  b.push_back(lane);
+}
+
+// v128.const with two 64-bit lanes, low lane first.
+inline void V128Const(Bytes& b, uint64_t lo, uint64_t hi)
+{
+  Simd(b, kV128Const);
+  for (int i = 0; i < 8; ++i)
+    b.push_back(static_cast<uint8_t>(lo >> (8 * i)));
+  for (int i = 0; i < 8; ++i)
+    b.push_back(static_cast<uint8_t>(hi >> (8 * i)));
+}
+
+inline void V128Splat64(Bytes& b, uint64_t v) { V128Const(b, v, v); }
+
+inline void V128Splat32(Bytes& b, uint32_t v)
+{
+  const uint64_t w = v | (static_cast<uint64_t>(v) << 32);
+  V128Const(b, w, w);
+}
+
+// The vector in `local` with its bytes rearranged: lane i of the result is
+// byte lanes[i] of it. Both shuffle operands are the same vector, so every
+// index is below 16.
+inline void EmitShuffle(Bytes& b, uint32_t local, const uint8_t (&lanes)[16])
+{
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  b.push_back(kLocalGet);
+  PutU32(b, local);
+  Simd(b, kI8x16Shuffle);
+  for (uint8_t x : lanes)
+    b.push_back(x);
+}
+
+// Guest byte order to host within each 32-bit (or 16-bit) lane.
+constexpr uint8_t kSwap32[16] = {3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12};
+constexpr uint8_t kSwap16[16] = {1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14};
+
 // Byte-swap the i32 in `local`, leaving the result on the stack. See the
 // note in EmitMemOp for the rotate trick.
 inline void EmitBswap32(Bytes& b, uint32_t local)
@@ -2272,20 +2349,34 @@ inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32
       EmitConvertToDouble(b, 2);
     b.push_back(kLocalSet);
     PutU32(b, 9);
-    b.push_back(kLocalGet);
-    PutU32(b, 0);
-    b.push_back(kLocalGet);
-    PutU32(b, 9);
-    b.push_back(kI64Store);
-    PutU32(b, 3);
-    PutU32(b, ps0);
-    b.push_back(kLocalGet);
-    PutU32(b, 0);
-    b.push_back(kLocalGet);
-    PutU32(b, 9);
-    b.push_back(kI64Store);
-    PutU32(b, 3);
-    PutU32(b, ps0 + 8);
+    if (l.simd_ps)
+    {
+      // One store for both halves, so a vector load of the register
+      // later reads what one store wrote.
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kLocalGet);
+      PutU32(b, 9);
+      Simd(b, kI64x2Splat);
+      SimdMem(b, kV128Store, 3, ps0);
+    }
+    else
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kLocalGet);
+      PutU32(b, 9);
+      b.push_back(kI64Store);
+      PutU32(b, 3);
+      PutU32(b, ps0);
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kLocalGet);
+      PutU32(b, 9);
+      b.push_back(kI64Store);
+      PutU32(b, 3);
+      PutU32(b, ps0 + 8);
+    }
   }
 
   if (update)
@@ -2403,6 +2494,160 @@ inline void EmitLsqeAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
   b.push_back(kEnd);
 }
 
+// The NI flush of a paired result in v128 local `r`, as ni_flush does per
+// half in EmitFpBinary: under FPSCR[NI], a lane whose magnitude is below
+// the smallest normal single becomes a signed zero.
+inline void EmitNiFlushSimd(Bytes& b, const StateLayout& l, uint32_t r)
+{
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  lget(0); op(kI32Load); u(2); u(l.fpscr_offset);
+  op(kI32Const); PutI32(b, 4); op(kI32And);
+  op(kIf); op(kVoid);
+  lget(r); V128Splat64(b, 0x8000000000000000ull); Simd(b, kV128And);
+  lget(r);
+  lget(r); V128Splat64(b, 0x7FFFFFFFFFFFFFFFull); Simd(b, kV128And);
+  V128Splat64(b, 0x3810000000000000ull); Simd(b, kI64x2LtS);
+  Simd(b, kV128Bitselect);
+  op(kLocalSet); u(r);
+  op(kEnd);
+}
+
+// The quantized load's data, both halves, from the host address in local
+// 1 into ps0 with one vector store. A float pair with an infinity or a NaN
+// in it runs `scalar` instead, which converts it bit by bit.
+template <typename F>
+inline void EmitPsqLoadSimd(Bytes& b, uint32_t ps0, bool is_float, int size, bool is_signed,
+                            uint32_t factor_bits, bool scaled, bool w, F scalar)
+{
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
+  const uint32_t v0 = kV128Local;
+  // The bytes. An integer pair narrower than a word is read as a word,
+  // up to three bytes past the data; that is still host memory, and only
+  // the bytes asked for reach the register.
+  lget(1);
+  SimdMem(b, (is_float && !w) ? kV128Load64Zero : kV128Load32Zero, 0, 0);
+  lset(v0);
+  if (is_float)
+  {
+    EmitShuffle(b, v0, kSwap32);
+    lset(v0);
+    lget(v0); V128Splat32(b, 0x7F800000); Simd(b, kV128And);
+    V128Splat32(b, 0x7F800000); Simd(b, kI32x4Eq);
+    Simd(b, kV128AnyTrue);
+    op(kIf); op(kVoid);
+    scalar();
+    op(kElse);
+    lget(0);
+    lget(v0);
+  }
+  else
+  {
+    lget(0);
+    if (size == 2)
+    {
+      EmitShuffle(b, v0, kSwap16);
+      Simd(b, is_signed ? kI32x4ExtendLowI16x8S : kI32x4ExtendLowI16x8U);
+    }
+    else
+    {
+      lget(v0);
+      Simd(b, is_signed ? kI16x8ExtendLowI8x16S : kI16x8ExtendLowI8x16U);
+      Simd(b, is_signed ? kI32x4ExtendLowI16x8S : kI32x4ExtendLowI16x8U);
+    }
+    Simd(b, kF32x4ConvertI32x4S);
+    if (scaled)
+    {
+      V128Splat32(b, factor_bits);
+      Simd(b, kF32x4Mul);
+    }
+  }
+  Simd(b, kF64x2PromoteLowF32x4);
+  if (w)
+  {
+    op(kF64Const); PutF64(b, 1.0);
+    Simd(b, kF64x2ReplaceLane); op(1);
+  }
+  SimdMem(b, kV128Store, 3, ps0);
+  if (is_float)
+    op(kEnd);
+}
+
+// The quantized store's data, both halves (or ps0 alone for W), from ps0
+// to the host address in local 1.
+inline void EmitPsqStoreSimd(Bytes& b, uint32_t ps0, bool is_float, int size, bool is_signed,
+                             uint32_t factor_bits, bool scaled, float lo, float hi, bool w)
+{
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
+  auto i32c = [&](int32_t v) { op(kI32Const); PutI32(b, v); };
+  auto bits_of = [](float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    return x;
+  };
+  const uint32_t v0 = kV128Local, v1 = kV128Local + 1;
+  lget(1);
+  lget(0); SimdMem(b, kV128Load, 3, ps0);
+  if (is_float)
+  {
+    // ConvertToSingleFTZ (EmitConvertToSingleFTZ) in each 64-bit lane,
+    // the float in its low word: the truncation where the exponent is
+    // above 896 or the value is a zero, the sign alone otherwise.
+    lset(v0);
+    lget(v0); i32c(32); Simd(b, kI64x2ShrU); V128Splat64(b, 0xC0000000u); Simd(b, kV128And);
+    lget(v0); i32c(29); Simd(b, kI64x2ShrU); V128Splat64(b, 0x3FFFFFFFu); Simd(b, kV128And);
+    Simd(b, kV128Or);
+    lget(v0); i32c(32); Simd(b, kI64x2ShrU); V128Splat64(b, 0x80000000u); Simd(b, kV128And);
+    lget(v0); i32c(52); Simd(b, kI64x2ShrU); V128Splat64(b, 0x7FF); Simd(b, kV128And);
+    V128Splat64(b, 896); Simd(b, kI64x2GtS);
+    lget(v0); V128Splat64(b, 0x7FFFFFFFFFFFFFFFull); Simd(b, kV128And);
+    V128Splat64(b, 0); Simd(b, kI64x2Eq);
+    Simd(b, kV128Or);
+    Simd(b, kV128Bitselect);
+    lset(v1);
+    static constexpr uint8_t kPick[16] = {3, 2, 1, 0, 11, 10, 9, 8, 3, 2, 1, 0, 11, 10, 9, 8};
+    EmitShuffle(b, v1, kPick);
+    SimdLane(b, w ? kV128Store32Lane : kV128Store64Lane, 0, 0, 0);
+    return;
+  }
+  // ScaleAndClamp, as the scalar form: to float, scaled, clamped,
+  // truncated; then narrowed to the type's width and stored in guest
+  // order.
+  Simd(b, kF32x4DemoteF64x2Zero);
+  if (scaled)
+  {
+    V128Splat32(b, factor_bits);
+    Simd(b, kF32x4Mul);
+  }
+  V128Splat32(b, bits_of(hi)); Simd(b, kF32x4Min);
+  V128Splat32(b, bits_of(lo)); Simd(b, kF32x4Max);
+  Simd(b, kI32x4TruncSatF32x4S);
+  lset(v0);
+  lget(v0); lget(v0);
+  if (size == 2)
+  {
+    Simd(b, is_signed ? kI16x8NarrowI32x4S : kI16x8NarrowI32x4U);
+    lset(v1);
+    EmitShuffle(b, v1, kSwap16);
+    SimdLane(b, w ? kV128Store16Lane : kV128Store32Lane, 0, 0, 0);
+  }
+  else
+  {
+    Simd(b, kI16x8NarrowI32x4S);
+    lset(v1);
+    lget(v1); lget(v1);
+    Simd(b, is_signed ? kI8x16NarrowI16x8S : kI8x16NarrowI16x8U);
+    SimdLane(b, w ? kV128Store8Lane : kV128Store16Lane, 0, 0, 0);
+  }
+}
+
 // Whether a psq form with this GQR can be emitted inline: there must be
 // values to specialise on, a hatch for the guard to fall back to, and a
 // defined type.
@@ -2479,8 +2724,10 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
   b.push_back(kEnd);
   EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, 0);
 
-  if (!is_store && is_float)
-  {
+  // The float load's conversion, one half at a time (and ps1 = 1.0 for W):
+  // the scalar form, and the vector form's fallback for an infinity or a
+  // NaN.
+  auto scalar_float_load = [&]() {
     for (int h = 0; h < halves; ++h)
     {
       b.push_back(kLocalGet);
@@ -2507,6 +2754,32 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
       PutU32(b, 3);
       PutU32(b, ps0 + 8 * h);
     }
+    if (w)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, 0);
+      b.push_back(kI64Const);
+      PutI64(b, 0x3FF0000000000000ll);
+      b.push_back(kI64Store);
+      PutU32(b, 3);
+      PutU32(b, ps0 + 8);
+    }
+  };
+  // The clamp of an integer store.
+  const float lo = is_signed ? (size == 2 ? -32768.0f : -128.0f) : 0.0f;
+  const float hi = is_signed ? (size == 2 ? 32767.0f : 127.0f) : (size == 2 ? 65535.0f : 255.0f);
+
+  if (l.simd_ps)
+  {
+    if (is_store)
+      EmitPsqStoreSimd(b, ps0, is_float, size, is_signed, factor_bits, e != 0, lo, hi, w);
+    else
+      EmitPsqLoadSimd(b, ps0, is_float, size, is_signed, factor_bits, e != 0, w,
+                      scalar_float_load);
+  }
+  else if (!is_store && is_float)
+  {
+    scalar_float_load();
   }
   else if (!is_store)
   {
@@ -2570,8 +2843,6 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
   else
   {
     // ScaleAndClamp: float(ps) * 2^k, clamped to the type, truncated.
-    const float lo = is_signed ? (size == 2 ? -32768.0f : -128.0f) : 0.0f;
-    const float hi = is_signed ? (size == 2 ? 32767.0f : 127.0f) : (size == 2 ? 65535.0f : 255.0f);
     auto bits_of = [](float f) {
       uint32_t u;
       std::memcpy(&u, &f, sizeof(u));
@@ -2620,7 +2891,7 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
       PutU32(b, static_cast<uint32_t>(size * h + size - 1));
     }
   }
-  if (!is_store && w)
+  if (!is_store && w && !is_float && !l.simd_ps)
   {
     // One half loaded: ps1 is 1.0.
     b.push_back(kLocalGet);
@@ -2914,17 +3185,28 @@ inline void EmitForceSingleOrHatch(Bytes& b, const StateLayout& l, uint32_t ins,
 // float in local 2 into local 6, using 5: normal 0x4/0x8, zero 0x2/0x12,
 // denormal 0x14/0x18 (positive/negative). `select` takes its first
 // operand when the condition holds, so the negative code goes first.
-inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired, bool fprf = true)
+inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired, bool fprf = true,
+                             bool simd = false)
 {
   auto op = [&](uint8_t o) { b.push_back(o); };
   auto u = [&](uint32_t v) { PutU32(b, v); };
   auto i32c = [&](int32_t v) { op(kI32Const); PutI32(b, v); };
   auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
   auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
-  lget(0); lget(2); op(kF32ReinterpretI32); op(kF64PromoteF32); op(kI64ReinterpretF64);
-  op(kI64Store); u(3); u(pd);
-  lget(0); lget(paired ? 3 : 2); op(kF32ReinterpretI32); op(kF64PromoteF32);
-  op(kI64ReinterpretF64); op(kI64Store); u(3); u(pd + 8);
+  if (simd && !paired)
+  {
+    // Both halves with one store (StateLayout::simd_ps).
+    lget(0); lget(2); op(kF32ReinterpretI32); op(kF64PromoteF32);
+    Simd(b, kF64x2Splat);
+    SimdMem(b, kV128Store, 3, pd);
+  }
+  else
+  {
+    lget(0); lget(2); op(kF32ReinterpretI32); op(kF64PromoteF32); op(kI64ReinterpretF64);
+    op(kI64Store); u(3); u(pd);
+    lget(0); lget(paired ? 3 : 2); op(kF32ReinterpretI32); op(kF64PromoteF32);
+    op(kI64ReinterpretF64); op(kI64Store); u(3); u(pd + 8);
+  }
   if (!fprf)
     return;
   lget(2); i32c(31); op(kI32ShrU); lset(5);  // sign
@@ -2936,6 +3218,107 @@ inline void EmitSingleWrites(Bytes& b, uint32_t pd, bool paired, bool fprf = tru
   i32c(0x8); i32c(0x4); lget(5); op(kSelect);
   lget(2); i32c(0x7F800000); op(kI32And); op(kI32Eqz); op(kSelect);
   lset(6);
+}
+
+// The paired arithmetic as vectors, at Dolphin's JIT accuracy (fast_fp,
+// without fprf): what EmitFpBinary's and EmitPsMadd's fast forms do to
+// each half, done to both at once. `madd` selects the multiply-add family
+// (sub, negate as there); otherwise `kind` is EmitFpBinary's. c_half >= 0
+// takes one half of C (of the second operand) for both.
+//
+// Locals: v128 15 A (then a'), 16 C, 17 B, 18 the product (then the
+// error), 19 the result, 20 the tie mask.
+inline void EmitPairedSimd(Bytes& b, const StateLayout& l, uint32_t ins, bool madd, int kind,
+                           bool sub, bool negate, int c_half)
+{
+  const uint32_t fd = (ins >> 21) & 0x1F, fa = (ins >> 16) & 0x1F, fb = (ins >> 11) & 0x1F,
+                 fc = (ins >> 6) & 0x1F;
+  const uint32_t src2 = (madd || kind == 2) ? fc : fb;
+  const uint32_t pd = l.ps_offset + fd * 16, pa = l.ps_offset + fa * 16,
+                 pb = l.ps_offset + fb * 16, p2 = l.ps_offset + src2 * 16;
+  const bool force25 = madd || kind == 2;
+  auto op = [&](uint8_t o) { b.push_back(o); };
+  auto u = [&](uint32_t v) { PutU32(b, v); };
+  auto lget = [&](uint32_t i) { op(kLocalGet); u(i); };
+  auto lset = [&](uint32_t i) { op(kLocalSet); u(i); };
+  auto ltee = [&](uint32_t i) { op(kLocalTee); u(i); };
+  const uint32_t va = kV128Local, vc = va + 1, vb = va + 2, vp = va + 3, vr = va + 4,
+                 vt = va + 5;
+  lget(0); SimdMem(b, kV128Load, 3, pa); lset(va);
+  lget(0);
+  if (force25 && c_half >= 0)
+    SimdMem(b, kV128Load64Splat, 3, p2 + 8 * c_half);
+  else
+    SimdMem(b, kV128Load, 3, p2);
+  if (force25)
+  {
+    // Force25Bit, as the scalar forms do it for a normal or zero C.
+    lset(vc);
+    lget(vc); V128Splat64(b, 0xFFFFFFFFF8000000ull); Simd(b, kV128And);
+    lget(vc); V128Splat64(b, 0x0000000008000000ull); Simd(b, kV128And);
+    Simd(b, kI64x2Add);
+  }
+  lset(vc);
+
+  if (!madd)
+  {
+    lget(va); lget(vc);
+    Simd(b, kind == 0 ? kF64x2Add : kind == 1 ? kF64x2Sub : kind == 2 ? kF64x2Mul : kF64x2Div);
+    lset(vr);
+  }
+  else
+  {
+    lget(0); SimdMem(b, kV128Load, 3, pb);
+    if (sub)
+    {
+      V128Splat64(b, 0x8000000000000000ull);
+      Simd(b, kV128Xor);
+    }
+    lset(vb);
+    lget(va); lget(vc); Simd(b, kF64x2Mul); lset(vp);
+    lget(vp); lget(vb); Simd(b, kF64x2Add); lset(vr);
+    // The float rounding tie, as EmitPsMadd corrects it, in the lanes
+    // that have one.
+    lget(vr); V128Splat64(b, 0x1FFFFFFF); Simd(b, kV128And);
+    V128Splat64(b, 0x10000000); Simd(b, kI64x2Eq);
+    ltee(vt);
+    Simd(b, kV128AnyTrue);
+    op(kIf); op(kVoid);
+    {
+      lget(vb); lget(vr); Simd(b, kF64x2Sub); lset(va);  // a'
+      lget(vp); lget(va); Simd(b, kF64x2Add);
+      lget(vb); lget(vr); lget(va); Simd(b, kF64x2Add); Simd(b, kF64x2Sub);
+      Simd(b, kF64x2Add); lset(vp);  // the error
+      // The lanes to move: a tie with a nonzero error.
+      lget(vt);
+      lget(vp); V128Splat64(b, 0); Simd(b, kF64x2Ne);
+      Simd(b, kV128And); lset(vt);
+      // Down a step where the error and the result differ in sign.
+      lget(vr); V128Splat64(b, 1); Simd(b, kI64x2Sub);
+      lget(vr); V128Splat64(b, 1); Simd(b, kI64x2Add);
+      lget(vp); V128Splat64(b, 0); Simd(b, kF64x2Gt);
+      lget(vr); V128Splat64(b, 0); Simd(b, kF64x2Gt);
+      Simd(b, kV128Xor);
+      Simd(b, kV128Bitselect);
+      lget(vr);
+      lget(vt);
+      Simd(b, kV128Bitselect);
+      lset(vr);
+    }
+    op(kEnd);
+  }
+
+  EmitNiFlushSimd(b, l, vr);
+  lget(0);
+  lget(vr);
+  Simd(b, kF32x4DemoteF64x2Zero);
+  if (negate)
+  {
+    V128Const(b, 0x8000000080000000ull, 0);
+    Simd(b, kV128Xor);
+  }
+  Simd(b, kF64x2PromoteLowF32x4);
+  SimdMem(b, kV128Store, 3, pd);
 }
 
 // ── floating-point arithmetic, the common case inline ──
@@ -2971,6 +3354,11 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
   const uint32_t src2 = (kind == 2) ? fc : fb;
   const uint32_t pd = l.ps_offset + fd * 16, pa = l.ps_offset + fa * 16,
                  p2 = l.ps_offset + src2 * 16;
+  if (paired && l.simd_ps && l.fast_fp && !l.fprf)
+  {
+    EmitPairedSimd(b, l, ins, false, kind, false, false, c_half);
+    return;
+  }
   const int halves = paired ? 2 : 1;
   auto op = [&](uint8_t o) { b.push_back(o); };
   auto u = [&](uint32_t v) { PutU32(b, v); };
@@ -3029,7 +3417,7 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
     }
     if (single)
     {
-      EmitSingleWrites(b, pd, paired, l.fprf);
+      EmitSingleWrites(b, pd, paired, l.fprf, l.simd_ps);
     }
     else
     {
@@ -3134,7 +3522,7 @@ inline void EmitFpBinary(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
   // ── the writes ──
   if (single)
   {
-    EmitSingleWrites(b, pd, paired, l.fprf);
+    EmitSingleWrites(b, pd, paired, l.fprf, l.simd_ps);
   }
   else if (!l.fprf)
   {
@@ -3200,6 +3588,11 @@ inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc
 {
   // scalar: fmadds and its kin (opcode 59), one half -- ps0 of each
   // operand -- and the result in both halves of D.
+  if (!scalar && l.simd_ps && l.fast_fp && !l.fprf)
+  {
+    EmitPairedSimd(b, l, ins, true, 0, sub, negate, c_half);
+    return;
+  }
   const int halves = scalar ? 1 : 2;
   const uint32_t fd = (ins >> 21) & 0x1F, fa = (ins >> 16) & 0x1F, fb = (ins >> 11) & 0x1F,
                  fc = (ins >> 6) & 0x1F;
@@ -3308,7 +3701,7 @@ inline void EmitPsMadd(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc
   }
 
   // ── the writes ──
-  EmitSingleWrites(b, pd, !scalar, l.fprf);
+  EmitSingleWrites(b, pd, !scalar, l.fprf, l.simd_ps);
   if (!l.fprf)
   {
     op(kEnd);
@@ -3343,7 +3736,7 @@ inline void EmitFrspFast(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t 
   b.push_back(kLocalSet);
   PutU32(b, 9);
   EmitForceSingleOrHatch(b, l, ins, pc, n, 9, 2);
-  EmitSingleWrites(b, l.ps_offset + fd * 16, false, l.fprf);
+  EmitSingleWrites(b, l.ps_offset + fd * 16, false, l.fprf, l.simd_ps);
   if (l.fprf)
   {
     b.push_back(kLocalGet);
@@ -6104,8 +6497,15 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
   // declares all eight i32 locals whether or not it needs them.
   if (used_i64)
     used_locals = 8;
+  uint32_t used_v128 = 0;
+  if (used_i64 && layout.simd_ps)
+  {
+    used_i64 = 6;
+    used_v128 = kV128Locals;
+  }
   r.locals = used_locals;
   r.locals_i64 = used_i64;
+  r.locals_v128 = used_v128;
   r.fixups = std::move(fixups);
   if (!emit_module)
   {
@@ -6126,7 +6526,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     mb.ImportFunction("env", "ppc_hatch_exit", {kI32, kI32, kI32, kI32}, {kI32});
     mb.ImportFunction("env", "ppc_mem_slow", {kI32, kI32, kI32, kI32, kI32}, {kI32});
   }
-  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals, used_i64);
+  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals, used_i64, used_v128);
   r.module = mb.Build();
   return r;
 }

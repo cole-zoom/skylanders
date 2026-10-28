@@ -189,7 +189,8 @@ jobs:
         run: harness/wasm-core/run-jitdiff.sh
 
       - name: the four differentials, as the game compiles
-        # The same suite with the slow paths as helper calls and the float
-        # conversions through promote/demote -- the dispatcher's defaults,
-        # both meant to be exact. The module is the one the step above built.
-        run: node --max-old-space-size=8192 --expose-gc /tmp/jitdiff.js --compact --short-convert
+        # The same suite with the slow paths as helper calls, the float
+        # conversions through promote/demote and the paired singles as
+        # vectors -- the dispatcher's defaults, all meant to be exact. The
+        # module is the one the step above built.
+        run: node --max-old-space-size=8192 --expose-gc /tmp/jitdiff.js --compact --short-convert --simd
