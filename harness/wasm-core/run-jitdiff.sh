@@ -21,12 +21,16 @@
 # Each section now reuses its slots, so the instances are collectable.
 #
 #   harness/wasm-core/run-jitdiff.sh [out.js] [--compact] [--short-convert] [--simd]
+#                                     [--warm] [--hints] [--groups] [--direct]
 #
 # The flags compile as the dispatcher does by default: the slow paths as
 # helper calls (StateLayout::hatch_exit_index), the float conversions
-# through promote/demote (StateLayout::short_convert) and the paired
-# singles as vectors (StateLayout::simd_ps). All are meant to be exact, so
-# the same expectations hold either way.
+# through promote/demote (StateLayout::short_convert), the paired singles
+# as vectors (StateLayout::simd_ps), the warm entry (StateLayout::
+# warm_entry), the cold branches hinted (StateLayout::branch_hints) and
+# the access groups (StateLayout::mem_groups); --direct is the arithmetic
+# translation (StateLayout::direct_base), a flag in the dispatcher too.
+# All are meant to be exact, so the same expectations hold either way.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

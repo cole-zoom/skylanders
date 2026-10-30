@@ -1472,6 +1472,14 @@ int main(int argc, char** argv)
   double jit_warm_ratio = 1.4;      // baseline machine-code bytes per wasm byte, assumed at install
   double jit_warm_hot_ratio = 1.2;  // ... and for a block that started a chain: generous, it is hot
   u32 jit_warm_budget = 13000000;   // V8's wasm_tiering_budget (15.6)
+  // --jit-mem=table|direct: how a compiled access finds guest RAM
+  // (StateLayout::direct_base; measured no different, table is the
+  // default); --jit-groups=on|off: accesses through one base register
+  // share a translation (StateLayout::mem_groups).
+  bool jit_mem_direct = false;
+  bool jit_mem_groups = true;
+  // --jit-hints=on|off: the cold branches hinted (StateLayout::branch_hints).
+  bool jit_branch_hints = true;
   bool want_jit_names = false;
   bool want_probe_pad = false;
   bool want_compact = true;
@@ -1970,6 +1978,12 @@ int main(int argc, char** argv)
       jit_warm_hot_ratio = std::strtod(argv[i] + 21, nullptr);
     else if (std::strncmp(argv[i], "--jit-warm-budget=", 18) == 0)
       jit_warm_budget = static_cast<u32>(std::strtoul(argv[i] + 18, nullptr, 0));
+    else if (std::strncmp(argv[i], "--jit-mem=", 10) == 0)
+      jit_mem_direct = std::strcmp(argv[i] + 10, "direct") == 0;
+    else if (std::strncmp(argv[i], "--jit-groups=", 13) == 0)
+      jit_mem_groups = std::strcmp(argv[i] + 13, "off") != 0;
+    else if (std::strncmp(argv[i], "--jit-hints=", 12) == 0)
+      jit_branch_hints = std::strcmp(argv[i] + 12, "off") != 0;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -2969,6 +2983,7 @@ int main(int argc, char** argv)
   // them before the three it does.
   double jit_t_translate = 0.0, jit_t_install = 0.0;
   u64 jit_translates = 0, jit_installs = 0, jit_batched = 0;
+  u64 jit_group_blocks = 0, jit_groups = 0;  // blocks with access groups, and the groups
   // How many blocks each region actually gathered, bucketed 1,2,3,4,5-8,
   // 9-15,16. "Blocks per module" is an average and averages hide the
   // shape: a handful of large regions and a flood of singletons reads the
@@ -3105,6 +3120,19 @@ int main(int argc, char** argv)
     }
   }
   jit_layout.region_table = static_cast<u32>(reinterpret_cast<uintptr_t>(region_table.data()));
+  // The same map computed rather than loaded (--jit-mem=direct): MEM1's
+  // host buffer, MEM2's distance from it, and which 32 MB granules are
+  // RAM. The physical tier sets its own top-bit test below.
+  if (jit_mem_direct)
+  {
+    const u32 ram = static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetRAM()));
+    const u32 exram = static_cast<u32>(reinterpret_cast<uintptr_t>(system.GetMemory().GetEXRAM()));
+    jit_layout.direct_base = ram;
+    jit_layout.direct_mem2_delta = exram ? exram - ram : 0;
+    jit_layout.direct_mask = exram ? 0x301 : 0x001;
+  }
+  jit_layout.mem_groups = jit_mem_groups;
+  jit_layout.branch_hints = jit_branch_hints;
 
   // ── the link table ──
   //
@@ -3298,6 +3326,7 @@ int main(int argc, char** argv)
   jit_layout_phys.link_mask = kLinkEntriesPhys - 1;
   jit_layout_phys.region_table =
       static_cast<u32>(reinterpret_cast<uintptr_t>(region_table_phys.data()));
+  jit_layout_phys.direct_physical = true;
   Tier tier_virt{jit_cache, link_table, jit_layout, false};
   Tier tier_phys{jit_cache_phys, link_table_phys, jit_layout_phys, true};
   // A loaded save state (ServiceStates) can hold other code at the same
@@ -3493,7 +3522,9 @@ int main(int argc, char** argv)
       u32 locals;
       u32 locals_i64;
       u32 locals_v128;
+      u32 locals_tail;
       std::vector<ppc2wasm::DirectFixup> fixups;
+      std::vector<ppc2wasm::BranchHint> hints;
     };
     std::vector<Pending> pending;
 
@@ -3555,9 +3586,14 @@ int main(int argc, char** argv)
         // call needs the function index of its target, and that is not
         // known until the whole region has been discovered -- the target
         // may be a block this walk has not reached yet.
+        if (r.locals_tail)
+        {
+          ++jit_group_blocks;
+          jit_groups += r.locals_tail;
+        }
         pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc,
                            std::move(r.body), r.locals, r.locals_i64, r.locals_v128,
-                           std::move(r.fixups)});
+                           r.locals_tail, std::move(r.fixups), std::move(r.hints)});
         for (u32 i = 0; i < r.nsucc; ++i)
           push(r.succ[i]);
         // The next address in memory after this block, which is past the
@@ -3618,7 +3654,8 @@ int main(int argc, char** argv)
       jit_direct_patched += ppc2wasm::PatchDirectCalls(pending[k].body, pending[k].fixups,
                                                        index_of);
       mb.AddFunction(pending[k].body, "f" + std::to_string(k), pending[k].locals,
-                     pending[k].locals_i64, pending[k].locals_v128);
+                     pending[k].locals_i64, pending[k].locals_v128, pending[k].locals_tail,
+                     pending[k].hints);
       if (want_jit_names)
       {
         char nm[16];
@@ -4806,6 +4843,11 @@ int main(int argc, char** argv)
                       static_cast<unsigned long long>(jit_warm_hist_passes[b] / 1000));
         std::printf("\n");
       }
+      std::printf("  jit       mem: %s translation; access groups %s, %llu blocks with %llu groups; "
+                  "branch hints %s\n",
+                  jit_mem_direct ? "direct" : "table", jit_mem_groups ? "on" : "off",
+                  static_cast<unsigned long long>(jit_group_blocks),
+                  static_cast<unsigned long long>(jit_groups), jit_branch_hints ? "on" : "off");
       if (want_jit_stats)
       {
         std::printf("  jit       exits: uncond-b %u  bl %u  cond-taken %u  fallthrough %u\n",
