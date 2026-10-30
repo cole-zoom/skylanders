@@ -4,6 +4,7 @@
 #include "WGPUPipeline.h"
 
 #include <algorithm>
+#include <list>
 
 #include "Common/Logging/Log.h"
 #include "VideoCommon/VertexShaderGen.h"
@@ -143,42 +144,26 @@ VertexFormat::VertexFormat(const PortableVertexDeclaration& decl) : NativeVertex
   m_layout.attributes = m_attributes.data();
 }
 
-Pipeline::Pipeline(const AbstractPipelineConfig& config, wgpu::RenderPipeline pipeline,
-                   std::vector<Binding> bindings)
-    : AbstractPipeline(config), m_pipeline(std::move(pipeline)), m_bindings(std::move(bindings))
+// The descriptor for a pipeline, with the state it points into.
+struct Pipeline::Description
 {
-}
-
-Pipeline::~Pipeline() = default;
-
-std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
-{
-  const CompileTimer timer;
-  const Shader* vs = static_cast<const Shader*>(config.vertex_shader);
-  const Shader* ps = static_cast<const Shader*>(config.pixel_shader);
-  if (!vs)
-    return nullptr;
-
-  // The shared layout covers groups 0 and 1; storage buffers and compute
-  // images (groups 2 and 3) belong to paths this backend does not report.
-  for (const Shader* s : {vs, ps})
-  {
-    if (!s)
-      continue;
-    for (const Binding& b : s->GetBindings())
-    {
-      if (b.group > 1)
-      {
-        WGPU_LOG("WebGPU: pipeline needs group {} binding {}; not supported yet", b.group,
-                 b.binding);
-        return nullptr;
-      }
-    }
-  }
+  Description(const AbstractPipelineConfig& config, const wgpu::ShaderModule& vs,
+              const wgpu::ShaderModule& ps);
+  Description(const Description&) = delete;
+  Description& operator=(const Description&) = delete;
 
   wgpu::RenderPipelineDescriptor desc{};
+  wgpu::DepthStencilState depth{};
+  wgpu::FragmentState fragment{};
+  std::vector<wgpu::ColorTargetState> targets;
+  wgpu::BlendState blend{};
+};
+
+Pipeline::Description::Description(const AbstractPipelineConfig& config,
+                                   const wgpu::ShaderModule& vs, const wgpu::ShaderModule& ps)
+{
   desc.layout = g_context.pipeline_layout;
-  desc.vertex.module = vs->GetModule();
+  desc.vertex.module = vs;
   desc.vertex.entryPoint = "main";
   if (config.vertex_format)
   {
@@ -218,7 +203,6 @@ std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
     break;
   }
 
-  wgpu::DepthStencilState depth{};
   const AbstractTextureFormat depth_format = config.framebuffer_state.depth_texture_format;
   if (depth_format != AbstractTextureFormat::Undefined)
   {
@@ -232,13 +216,10 @@ std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
     desc.depthStencil = &depth;
   }
 
-  wgpu::FragmentState fragment{};
-  std::vector<wgpu::ColorTargetState> targets;
-  wgpu::BlendState blend{};
   const BlendingState& bs = config.blending_state;
   if (ps)
   {
-    fragment.module = ps->GetModule();
+    fragment.module = ps;
     fragment.entryPoint = "main";
     const AbstractTextureFormat color_format = config.framebuffer_state.color_texture_format;
     const u32 count = (color_format != AbstractTextureFormat::Undefined ? 1 : 0) +
@@ -271,16 +252,150 @@ std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
     desc.fragment = &fragment;
   }
 
-  wgpu::RenderPipeline pipeline;
-  std::optional<CompileTimer> phase(kPipeline);
+}
+
+namespace
+{
+// The pipelines not built yet, oldest first; GPU thread only.
+std::list<const Pipeline*> s_waiting;
+std::vector<const Pipeline*> s_requested;
+// Enough to keep Metal's compilers busy; few enough that a draw asking
+// for its own pipeline is not queued behind them.
+constexpr size_t kInFlight = 4;
+}  // namespace
+
+Pipeline::Pipeline(const AbstractPipelineConfig& config, wgpu::ShaderModule vs,
+                   wgpu::ShaderModule ps, std::vector<Binding> bindings)
+    : AbstractPipeline(config), m_vs(std::move(vs)), m_ps(std::move(ps)),
+      m_bindings(std::move(bindings))
+{
+  s_waiting.push_back(this);
+}
+
+// A request still in flight gets its callback later, when the instance
+// goes at the latest; the answer it writes is shared, so outlives this.
+Pipeline::~Pipeline()
+{
+  if (m_state == State::Waiting)
+    s_waiting.remove(this);
+  else if (m_state == State::Requested)
+    std::erase(s_requested, this);
+}
+
+void Pipeline::Request() const
+{
+  const Description d(m_config, m_vs, m_ps);
+  m_answer = std::make_shared<Answer>();
+  m_future = g_context.device.CreateRenderPipelineAsync(
+      &d.desc, wgpu::CallbackMode::WaitAnyOnly,
+      [answer = m_answer](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline,
+                          wgpu::StringView message) {
+        if (status == wgpu::CreatePipelineAsyncStatus::Success)
+          answer->pipeline = std::move(pipeline);
+        else
+          answer->error.assign(message.data, message.length);
+      });
+  m_state = State::Requested;
+}
+
+void Pipeline::TakeAnswer() const
+{
+  m_pipeline = m_answer->pipeline;
+  if (!m_pipeline)
+    WGPU_LOG("WebGPU: pipeline rejected: {}", m_answer->error);
+  m_answer.reset();
+  m_state = State::Built;
+}
+
+void Pipeline::Build() const
+{
+  const CompileTimer timer;
+  const CompileTimer phase(kPipeline);
+  if (m_state == State::Requested)
+  {
+    // In flight already, behind at most kInFlight - 1 others.
+    std::erase(s_requested, this);
+    g_context.Wait(m_future);
+    TakeAnswer();
+    return;
+  }
+  s_waiting.remove(this);
+  const Description d(m_config, m_vs, m_ps);
   const std::string error = g_context.CaptureValidation(
-      [&] { pipeline = g_context.device.CreateRenderPipeline(&desc); });
-  phase.reset();
+      [&] { m_pipeline = g_context.device.CreateRenderPipeline(&d.desc); });
   if (!error.empty())
   {
+    m_pipeline = nullptr;
     WGPU_LOG("WebGPU: pipeline rejected: {}", error);
-    return nullptr;
   }
+  m_state = State::Built;
+}
+
+const wgpu::RenderPipeline& Pipeline::GetPipeline() const
+{
+  if (m_state != State::Built)
+    Build();
+  return m_pipeline;
+}
+
+void Pipeline::BuildInBackground()
+{
+  // For the log: the first time the queue empties, which is the boot's set.
+  static u32 s_built;
+  static double s_start;
+  static bool s_reported;
+  if (s_requested.empty() && s_waiting.empty())
+    return;
+  if (!s_start)
+    s_start = emscripten_get_now();
+  std::erase_if(s_requested, [](const Pipeline* p) {
+    if (g_context.instance.WaitAny(p->m_future, 0) != wgpu::WaitStatus::Success)
+      return false;
+    p->TakeAnswer();
+    ++s_built;
+    return true;
+  });
+  if (s_requested.empty() && s_waiting.empty() && !s_reported)
+  {
+    s_reported = true;
+    WGPU_LOG("pipelines: {} built in the background over {:.1f} s", s_built,
+             (emscripten_get_now() - s_start) / 1000.0);
+  }
+  while (s_requested.size() < kInFlight && !s_waiting.empty())
+  {
+    const Pipeline* p = s_waiting.front();
+    s_waiting.pop_front();
+    p->Request();
+    s_requested.push_back(p);
+  }
+}
+
+std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
+{
+  const Shader* vs = static_cast<const Shader*>(config.vertex_shader);
+  const Shader* ps = static_cast<const Shader*>(config.pixel_shader);
+  if (!vs)
+    return nullptr;
+
+  // The shared layout covers groups 0 and 1; storage buffers and compute
+  // images (groups 2 and 3) belong to paths this backend does not report.
+  for (const Shader* s : {vs, ps})
+  {
+    if (!s)
+      continue;
+    for (const Binding& b : s->GetBindings())
+    {
+      if (b.group > 1)
+      {
+        WGPU_LOG("WebGPU: pipeline needs group {} binding {}; not supported yet", b.group,
+                 b.binding);
+        return nullptr;
+      }
+    }
+  }
+
+  const wgpu::ShaderModule& vs_module = vs->GetModule();
+  const wgpu::ShaderModule ps_module = ps ? ps->GetModule() : wgpu::ShaderModule();
 
   std::vector<Binding> bindings = vs->GetBindings();
   if (ps)
@@ -295,6 +410,6 @@ std::unique_ptr<Pipeline> Pipeline::Create(const AbstractPipelineConfig& config)
       }
     }
   }
-  return std::make_unique<Pipeline>(config, std::move(pipeline), std::move(bindings));
+  return std::make_unique<Pipeline>(config, vs_module, ps_module, std::move(bindings));
 }
 }  // namespace WebGPU

@@ -798,6 +798,100 @@ between instructions (write-through, so nothing flushed at an exit):
 across the cold paths' calls, and the spills cost more than the loads
 they save.
 
+### Every figure's pipelines, and the shaders kept between visits
+
+A figure the UID file had never seen compiled its pipelines the first
+time it was put on: at the town gate, 1.3 s of compiling for one figure
+and 2.2 s for another, with the worst second at 19-52%.
+`web/make-uidcache.sh` now runs `--cycle-figures=240`: from 240 s, every
+character Spyro's Adventure knows goes on the portal in turn, then each
+magic item beside the last one, while `--input` presses A and B. The UID
+file grows from 406 pipelines to 1,293, and swapping in a figure
+compiles nothing more. Gate state, 15 s, today's file → all figures:
+
+| | shaders / pipelines compiled in the run |
+|---|---|
+| figure 9 on from the start | 449 / 570 → 931 / 1,415 |
+| swap to figure 9 | 452 / 573 → 934 / 1,419 |
+| swap to figure 25 | **468 / 616** → **930 / 1,415** |
+
+Compiling twice as many at boot costs time: 889 shaders take glslang
+1.8 s and Tint 4.2 s on the GPU thread. So the backend now reports
+`bSupportsShaderBinaries`. A shader's "binary" is its WGSL, after a
+version tag (`WebGPU::kBinaryTag`), and Dolphin's shader cache keeps it
+in `Cache/Shaders`, which the page keeps in IndexedDB (`web/saves.js`,
+about 14 MB, not exported). A returning player skips glslang and Tint
+for every shader they have met. A cache with another tag is not used,
+and its shaders are compiled from source (137 of 137 on the level
+capture). Dolphin's cache files carry Dolphin's revision, not this
+backend's, so the tag must be bumped whenever the WGSL a shader becomes
+changes.
+
+**The Metal cache, and pipelines built in the background.** One reload
+in nine took 44 s to bring the backend up. The macOS log for that minute
+showed Chrome's GPU process compiling 467 Metal shaders from source;
+every other run hit the system's Metal cache (shared by every Chrome
+profile, so a fresh profile does not empty it). Chrome for Testing has
+its own Metal cache, which a test can empty. With it empty, as on a
+player's first visit, the boot on main froze the game for 30 s, and
+this branch's first version for 50 s:
+
+- With no compiler threads, Dolphin compiled the shaders at boot but
+  left every pipeline of the UID file to the first frame, and built them
+  there one after another, each waiting for the browser's answer: ~45 ms
+  apiece on an empty Metal cache. A reload, with the shaders cached, built
+  them at boot instead -- the 44 s.
+- The shaders reached the cache files in that first frame too, after the
+  page's first save, so the next visit compiled them again.
+- Metal manages ~35-40 compiles a second however they are asked for:
+  `createRenderPipelineAsync` ran up to 147 at once and 2,111 still took
+  56 s. Building every figure's pipelines up front cannot be fast on a
+  machine that has never run the game.
+
+So `GFX_WAIT_FOR_SHADERS_BEFORE_STARTING` is set (the boot finishes its
+shaders, and writes them, before the game starts), and the backend no
+longer builds a pipeline when Dolphin creates one. `Pipeline::Create`
+checks the description and returns. The browser's pipeline is built at
+the first draw that needs it (one synchronous compile: ~2 ms with the
+Metal cache warm), or in the background before that:
+`Pipeline::BuildInBackground`, once a frame, keeps 4 asynchronous
+requests in flight, so a draw is never queued behind hundreds.
+
+Launch to the first second at ≥50% speed, in the page (Chrome for
+Testing, its Metal cache emptied, fresh profile, then reloads):
+
+| | first visit | reloads |
+|---|---|---|
+| main (406 pipelines) | 38 s (frozen 30 s) | 6-7 s |
+| every figure, built at boot | 52 s (frozen ~40 s) | 4-5 s |
+| every figure, built in the background | **12 s**, never frozen (worst seconds 65%, 75%) | **3-4 s** |
+
+In the player's own Chrome (Metal cache warm), the backend comes up in
+7.4 s on the first visit and 0.57 s after, against 3.2 s on every visit
+before. The 1,253 pipelines of the boot's set are built in the first ~5
+s of play; vortex state, alternating with main: 95.6 / 95.9% against
+96.4 / 96.2% from 3 s, and 98.8 / 99.1% against 98.9 / 99.0% from 10 s,
+so the cost is in those seconds only. A figure swap at the town gate
+compiles for 55 ms instead of 96 ms.
+
+The frames are the same bits. M3 gives the same numbers as before on all
+four captures, and its captures replayed with their own cache gave
+identical frames to a replay compiled from source (max difference 0,
+three scenes).
+
+The saves poll now reads a kept file only when its size or time has
+changed since it was stored, so 14 MB is not copied and compared every
+10 s.
+
+*Tried and not kept:* compiling at boot on worker threads (Dolphin's
+precompiler, with the module and pipeline made later on the GPU thread,
+the only one that may touch the device). With six workers, glslang and
+Tint each became 10-17 times slower per shader: they allocate heavily,
+and dlmalloc has one lock. The backend came up in 18.5 s instead of 8.9 s.
+mimalloc removed the contention (4.8 s), but a save state then peaked at
+836 MB of heap instead of 489 MB, at the same speed (96.8% vs 97.2%).
+That is 350 MB of a player's memory for 4 s at the first boot only.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

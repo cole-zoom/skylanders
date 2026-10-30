@@ -218,10 +218,10 @@ std::unique_ptr<AbstractShader> Gfx::CreateShaderFromSource(ShaderStage stage,
   return Shader::Compile(stage, source, name);
 }
 
-std::unique_ptr<AbstractShader> Gfx::CreateShaderFromBinary(ShaderStage, const void*, size_t,
-                                                            std::string_view)
+std::unique_ptr<AbstractShader> Gfx::CreateShaderFromBinary(ShaderStage stage, const void* data,
+                                                            size_t length, std::string_view name)
 {
-  return nullptr;
+  return Shader::FromBinary(stage, data, length, name);
 }
 
 std::unique_ptr<NativeVertexFormat>
@@ -481,7 +481,7 @@ void Gfx::SetUtilityUniforms(const void* data, u32 size)
 
 bool Gfx::PrepareDraw()
 {
-  if (!m_pipeline || !m_framebuffer)
+  if (!m_pipeline || !m_framebuffer || !m_pipeline->GetPipeline())
     return false;
 
   // The shared layout (WGPUContext.h): every texture slot, whether this
@@ -650,6 +650,8 @@ void Gfx::PresentBackbuffer()
     YieldToBrowser();
   Stats& st = g_stats_wgpu;
   st.yield_ms += emscripten_get_now() - t0;
+  // After the yield, which is when the browser's answers arrive.
+  Pipeline::BuildInBackground();
   if (++st.presents % 600 == 0)
   {
     const double f = 600.0;

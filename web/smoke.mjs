@@ -132,7 +132,9 @@ try {
         // The sound ring (bootgame.cpp's AudioRing): frames written, read,
         // the worklet's short quanta, and the loudest sample in it now.
         audio: (() => {
-          if (!Module._harness_audio) return null;
+          // Not before onRuntimeInitialized (which shows the portal panel):
+          // an export called earlier aborts the emulator.
+          if (!Module._harness_audio || document.getElementById('portal').hidden) return null;
           const a = Module._harness_audio(), b = Module.HEAPU8.buffer;
           const ix = new Uint32Array(b, a, 4), d = new Int16Array(b, a + 16, 2 * ix[2]);
           let peak = 0;

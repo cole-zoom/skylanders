@@ -61,6 +61,7 @@
 #include "Common/WindowSystemInfo.h"
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/GXPipelineTypes.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/VideoBackendBase.h"
@@ -1438,10 +1439,13 @@ int main(int argc, char** argv)
   u64 walk_from = 0;
   bool want_dump_uidcache = false;
   std::string uidcache_url;
+  bool want_dump_shadercache = false;
+  std::vector<std::string> shadercache_urls;
   bool want_skylander = false;
   bool want_audio = false;
   std::string load_state_url;
   double replug_at_s = 0;  // --replug=S
+  double cycle_from_s = 0, cycle_every_s = 8;  // --cycle-figures=S[,EVERY]
   bool keep_nand = false;
   u16 sky_id = 0, sky_var = 0;
   u64 checkpoint = 0;
@@ -1540,6 +1544,16 @@ int main(int argc, char** argv)
     // the game draws with each -- the hitches --frame-times found.
     else if (std::strncmp(argv[i], "--uidcache-url=", 15) == 0)
       uidcache_url = argv[i] + 15;
+    // --dump-shadercache: at the end, print each of Cache/Shaders' files
+    // (the WGSL of every shader the run compiled; WebGPU::Shader::GetBinary)
+    // as --dump-uidcache does, "SHADERCACHE <name> <bytes>" first.
+    else if (std::strcmp(argv[i], "--dump-shadercache") == 0)
+      want_dump_shadercache = true;
+    // --shadercache-url=URL, repeatable: fetch one such file into
+    // Cache/Shaders under the URL's file name before the video backend
+    // starts -- a returning player's browser, which keeps them (web/saves.js).
+    else if (std::strncmp(argv[i], "--shadercache-url=", 18) == 0)
+      shadercache_urls.push_back(argv[i] + 18);
     // --live-input: take buttons, stick and pointer from the page (web/)
     // instead of a script. Replaces --input.
     else if (std::strcmp(argv[i], "--live-input") == 0)
@@ -1558,6 +1572,15 @@ int main(int argc, char** argv)
     // Skylander"); a figure placed afresh is taken instead, as in the page.
     else if (std::strncmp(argv[i], "--replug=", 9) == 0)
       replug_at_s = std::strtod(argv[i] + 9, nullptr);
+    // --cycle-figures=S[,EVERY]: from S emulated seconds into stepping, put
+    // every figure Spyro's Adventure knows on the portal in turn, EVERY
+    // seconds apart (default 8): each character in place of the last, then
+    // each magic item beside the last character, with --input pressing A
+    // and B. A run with --dump-uidcache then records the pipelines each one
+    // draws with (web/make-uidcache.sh), so a player's first swap to a
+    // figure does not stall compiling them.
+    else if (std::strncmp(argv[i], "--cycle-figures=", 16) == 0)
+      std::sscanf(argv[i] + 16, "%lf,%lf", &cycle_from_s, &cycle_every_s);
     // --keep-nand: the Wii's NAND in <user>/Wii/, where the page restores
     // the game's saves before main() (web/saves.js), instead of Dolphin's
     // temporary session root, which is moved aside at every boot.
@@ -2281,13 +2304,13 @@ int main(int argc, char** argv)
   // A file already there was restored by the page (web/saves.js): the
   // pipelines this browser has met, the fetched file's plus every one made
   // since. It is kept rather than replaced.
-  if (!uidcache_url.empty() &&
-      File::Exists(File::GetUserPath(D_CACHE_IDX) +
-                   uidcache_url.substr(uidcache_url.find_last_of('/') + 1)))
-  {
-    std::printf("  uidcache  kept the one from earlier sessions\n");
-  }
-  else if (!uidcache_url.empty())
+  //
+  // The fetched file is merged into it: its entries the kept one lacks are
+  // added, so a returning player still gets pipelines a newer file covers
+  // (every figure, web/make-uidcache.sh). Both are an 8-byte header (magic
+  // and version) and then SerializedGXPipelineUid records; a kept file
+  // whose header differs is replaced, as Dolphin would discard it.
+  if (!uidcache_url.empty())
   {
     emscripten_fetch_attr_t attr;
     emscripten_fetch_attr_init(&attr);
@@ -2296,14 +2319,63 @@ int main(int argc, char** argv)
     emscripten_fetch_t* fetch = emscripten_fetch(&attr, uidcache_url.c_str());
     const std::string name = uidcache_url.substr(uidcache_url.find_last_of('/') + 1);
     const std::string path = File::GetUserPath(D_CACHE_IDX) + name;
-    bool ok = false;
+    constexpr size_t kHeader = 8, kRecord = sizeof(VideoCommon::SerializedGXPipelineUid);
+    std::string fetched;
     if (fetch && fetch->status == 200)
+      fetched.assign(fetch->data, fetch->numBytes);
+    const bool fetched_ok =
+        fetched.size() >= kHeader && (fetched.size() - kHeader) % kRecord == 0;
+    std::string kept;
+    const bool have_kept = File::ReadFileToString(path, kept);
+    const bool kept_ok = have_kept && kept.size() >= kHeader &&
+                         (kept.size() - kHeader) % kRecord == 0;
+    bool ok = false;
+    size_t added = 0;
+    if (fetched_ok && kept_ok && kept.compare(0, kHeader, fetched, 0, kHeader) == 0)
+    {
+      std::set<std::string> have;
+      for (size_t o = kHeader; o < kept.size(); o += kRecord)
+        have.insert(kept.substr(o, kRecord));
+      for (size_t o = kHeader; o < fetched.size(); o += kRecord)
+      {
+        std::string rec = fetched.substr(o, kRecord);
+        if (have.insert(rec).second)
+        {
+          kept += rec;
+          ++added;
+        }
+      }
+      ok = added == 0 || File::WriteStringToFile(path, kept);
+      std::printf("  uidcache  kept the one from earlier sessions, %zu entries added from %s%s\n",
+                  added, uidcache_url.c_str(), ok ? "" : " (NOT written)");
+    }
+    else if (fetched_ok)
     {
       File::CreateFullPath(path);
-      ok = File::WriteStringToFile(path, std::string(fetch->data, fetch->numBytes));
+      ok = File::WriteStringToFile(path, fetched);
+      std::printf("  uidcache  %s: %s (%zu bytes)\n", uidcache_url.c_str(),
+                  ok ? "loaded" : "NOT loaded", fetched.size());
     }
-    std::printf("  uidcache  %s: %s (%llu bytes)\n", uidcache_url.c_str(),
-                ok ? "loaded" : "NOT loaded",
+    else
+    {
+      std::printf("  uidcache  %s: NOT loaded%s\n", uidcache_url.c_str(),
+                  kept_ok ? "; kept the one from earlier sessions" : "");
+    }
+    if (fetch)
+      emscripten_fetch_close(fetch);
+  }
+  for (const std::string& url : shadercache_urls)
+  {
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_SYNCHRONOUS;
+    emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
+    const std::string path =
+        File::GetUserPath(D_SHADERCACHE_IDX) + url.substr(url.find_last_of('/') + 1);
+    const bool ok = fetch && fetch->status == 200 && File::CreateFullPath(path) &&
+                    File::WriteStringToFile(path, std::string(fetch->data, fetch->numBytes));
+    std::printf("  shaders   %s: %s (%llu bytes)\n", url.c_str(), ok ? "loaded" : "NOT loaded",
                 fetch ? static_cast<unsigned long long>(fetch->numBytes) : 0ull);
     if (fetch)
       emscripten_fetch_close(fetch);
@@ -2514,6 +2586,12 @@ int main(int argc, char** argv)
     WebGPU::g_context.no_draws = want_webgpu_no_draws;
     WebGPU::g_context.no_present = want_webgpu_no_present;
     WebGPU::g_context.uniform_dedup = want_webgpu_uniform_dedup;
+    // Everything the UID file names is made before the game starts. Without
+    // this, with no compiler threads, the boot compiled the shaders and left
+    // every pipeline to the first frame -- frozen for a minute on a browser
+    // whose Metal cache had never seen them -- and wrote the shaders to the
+    // cache that late, after the page's first save.
+    Config::SetCurrent(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
     g_backend_info.DisplayName = g_video_backend->GetDisplayName();
     g_video_backend->InitBackendInfo(wsi);
     g_Config.VerifyValidity();
@@ -2593,6 +2671,7 @@ int main(int argc, char** argv)
   // thread stays the CPU thread.
   bool video_up = false;
   HarnessThread gpu_thread;
+  const auto video_t0 = std::chrono::steady_clock::now();
   if (want_dual_core)
   {
     std::promise<bool> init_from_thread;
@@ -2615,6 +2694,22 @@ int main(int argc, char** argv)
     video_up = g_video_backend && g_video_backend->Initialize(wsi);
   }
   check(video_up, "video backend initialised");
+  // Most of it is compiling the pipelines the UID file names.
+  std::printf("  video     backend up in %.0f ms\n",
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                        video_t0)
+                  .count());
+#if defined(HARNESS_WEBGPU)
+  {
+    static const char* const kPhase[] = {"glslang", "tint", "module", "pipeline"};
+    std::printf("  compile   at boot:");
+    for (int p = 0; p < WebGPU::kCompilePhases; ++p)
+      std::printf(" %s %llu in %.0f ms;", kPhase[p],
+                  static_cast<unsigned long long>(WebGPU::g_phase_n[p].load()),
+                  WebGPU::g_phase_us[p].load() / 1000.0);
+    std::printf("\n");
+  }
+#endif
   std::printf("  threads   %s\n", want_dual_core ? "dual core: the GPU on its own thread" :
                                                    "single core: the GPU on this thread");
   INIT_MARK("video backend done");
@@ -3941,6 +4036,65 @@ int main(int argc, char** argv)
         std::printf("  replug    figure on at %.1f s\n", t);
       }
     }
+    if (cycle_from_s > 0 && (i & 0xFFFF) == 0)
+    {
+      // The characters (variant 0, the Legendaries included), then the
+      // magic items. Not the adventure packs' location pieces, which
+      // start a level, nor the sidekicks, which are a later game's.
+      static std::vector<std::pair<u16, bool>> order;  // id, is an item
+      static size_t next_k = 0;
+      static int char_slot = -1, item_slot = -1;
+      static bool removed = false;
+      if (order.empty())
+      {
+        for (const auto& [ids, data] : IOS::HLE::USB::list_skylanders)
+          if (data.game == IOS::HLE::USB::Game::SpyrosAdv && ids.second == 0 &&
+              data.type == IOS::HLE::USB::Type::Skylander)
+            order.push_back({ids.first, false});
+        for (const auto& [ids, data] : IOS::HLE::USB::list_skylanders)
+          if (data.game == IOS::HLE::USB::Game::SpyrosAdv && ids.second == 0 &&
+              data.type == IOS::HLE::USB::Type::Item && ids.first < 300)
+            order.push_back({ids.first, true});
+      }
+      const double t = (system.GetCoreTiming().GetTicks() - ticks_at_step_start) / 729e6;
+      const double at = cycle_from_s + next_k * cycle_every_s;
+      if (next_k < order.size() && !removed && t >= at - 1.0)
+      {
+        // Off a second before the next goes on, as a player's hand would.
+        auto take_off = [&system](int& slot) {
+          if (slot >= 0 && g_portal.slots[slot].present)
+          {
+            system.GetSkylanderPortal().RemoveSkylander(static_cast<u8>(slot));
+            g_portal.slots[slot] = {};
+          }
+          slot = -1;
+        };
+        if (next_k == 0)
+        {
+          for (u8 slot = 0; slot < MAX_SKYLANDERS; ++slot)
+          {
+            int s = slot;
+            take_off(s);
+          }
+          std::pair<const char*, const char*> a, b;
+          if (LookupButton("A", &a) && LookupButton("B", &b))
+            g_input_sequence = {a, b};
+        }
+        take_off(item_slot);
+        if (!order[next_k].second)
+          take_off(char_slot);
+        removed = true;
+      }
+      else if (next_k < order.size() && removed && t >= at)
+      {
+        const auto [id, is_item] = order[next_k];
+        const int slot = PlaceFigure(system, id, 0);
+        (is_item ? item_slot : char_slot) = slot;
+        std::printf("  cycle     %u at %.1f s (slot %d)\n", id, t, slot);
+        removed = false;
+        ++next_k;
+      }
+    }
 
     // Events are logged over the same window as the trace. --events turns
     // logging on from the first step, which --from cannot express: a window
@@ -4247,6 +4401,19 @@ int main(int argc, char** argv)
         std::printf("UIDCACHE END\n");
       }
     }
+    if (want_dump_shadercache)
+    {
+      std::fflush(nullptr);
+      for (const auto& entry :
+           File::ScanDirectoryTree(File::GetUserPath(D_SHADERCACHE_IDX), false).children)
+      {
+        std::string data;
+        File::ReadFileToString(entry.physicalName, data);
+        std::printf("SHADERCACHE %s %zu\n", entry.virtualName.c_str(), data.size());
+        EmitBase64(std::vector<u8>(data.begin(), data.end()));
+        std::printf("SHADERCACHE END\n");
+      }
+    }
     if (want_frame_times)
     {
 #if defined(HARNESS_WEBGPU)
@@ -4260,6 +4427,9 @@ int main(int argc, char** argv)
         std::printf("\n");
       }
 #endif
+      // The heap only grows, so its top is the run's high water mark.
+      std::printf("  heap      top at %.0f MB\n",
+                  reinterpret_cast<uintptr_t>(sbrk(0)) / 1048576.0);
       ReportFrameTimes("whole run", 0.0);
       if (speed_from)
         ReportFrameTimes("window", speed_from / 729e6);

@@ -4,6 +4,7 @@
 #include "WGPUShader.h"
 
 #include <cstdlib>
+#include <cstring>
 
 #include "src/tint/api/tint.h"
 #include "src/tint/lang/core/ir/module.h"
@@ -228,9 +229,32 @@ std::unique_ptr<Shader> Shader::Compile(ShaderStage stage, std::string_view sour
     WGPU_LOG("WebGPU: Tint could not write {}: {}", name, out.Failure().reason);
     return nullptr;
   }
-  std::string wgsl = std::move(out->wgsl);
-  phase.emplace(kModule);
+  phase.reset();
+  return FromWgsl(stage, std::move(out->wgsl), name);
+}
 
+AbstractShader::BinaryData Shader::GetBinary() const
+{
+  BinaryData data(kBinaryTag.size() + m_wgsl.size());
+  std::memcpy(data.data(), kBinaryTag.data(), kBinaryTag.size());
+  std::memcpy(data.data() + kBinaryTag.size(), m_wgsl.data(), m_wgsl.size());
+  return data;
+}
+
+std::unique_ptr<Shader> Shader::FromBinary(ShaderStage stage, const void* data, size_t size,
+                                           std::string_view name)
+{
+  const std::string_view binary(static_cast<const char*>(data), size);
+  if (!binary.starts_with(kBinaryTag))
+    return nullptr;
+  const CompileTimer timer;
+  return FromWgsl(stage, std::string(binary.substr(kBinaryTag.size())), name);
+}
+
+std::unique_ptr<Shader> Shader::FromWgsl(ShaderStage stage, std::string wgsl,
+                                         std::string_view name)
+{
+  std::optional<CompileTimer> phase(kModule);
   wgpu::ShaderSourceWGSL wsrc{};
   wsrc.code = {wgsl.data(), wgsl.size()};
   wgpu::ShaderModuleDescriptor mdesc{};

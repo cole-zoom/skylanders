@@ -85,7 +85,7 @@ void VideoBackend::InitBackendInfo(const WindowSystemInfo&)
   bi.bSupportsLargePoints = false;
   bi.bSupportsPartialDepthCopies = false;
   bi.bSupportsDepthReadback = true;
-  bi.bSupportsShaderBinaries = false;
+  bi.bSupportsShaderBinaries = true;  // the WGSL; see Shader::GetBinary
   bi.bSupportsPipelineCacheData = false;
   bi.bSupportsCoarseDerivatives = false;
   bi.bSupportsTextureQueryLevels = true;

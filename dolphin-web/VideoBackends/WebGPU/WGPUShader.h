@@ -41,6 +41,12 @@ struct Binding
 constexpr u32 kSamplerBase = 32;
 constexpr u32 kNumTextures = 8;
 
+// Starts every cached WGSL. Dolphin's cache files carry Dolphin's revision,
+// not this backend's: bump the number whenever the WGSL a shader becomes
+// changes (kHeader, RewriteForWebGPU, Tint's options, a Tint update), or
+// players keep the old translation.
+constexpr std::string_view kBinaryTag = "dolphin-web wgsl 1\n";
+
 class Shader final : public AbstractShader
 {
 public:
@@ -50,7 +56,10 @@ public:
 
   const wgpu::ShaderModule& GetModule() const { return m_module; }
   const std::vector<Binding>& GetBindings() const { return m_bindings; }
-  BinaryData GetBinary() const override { return {}; }
+  // The WGSL, after kBinaryTag: Dolphin keeps it in its shader cache
+  // (Cache/Shaders, which the page keeps in IndexedDB), so a shader met in
+  // an earlier session skips glslang and Tint.
+  BinaryData GetBinary() const override;
 
   // GLSL from VideoCommon's generators to a WebGPU module: glslang to
   // SPIR-V (VideoCommon/Spirv.cpp, as the Metal backend does), Tint to
@@ -58,8 +67,16 @@ public:
   // any of the three refuses it.
   static std::unique_ptr<Shader> Compile(ShaderStage stage, std::string_view source,
                                          std::string_view name);
+  // A GetBinary from an earlier session; null if its tag is not this
+  // build's, and the shader is compiled from source instead.
+  static std::unique_ptr<Shader> FromBinary(ShaderStage stage, const void* data, size_t size,
+                                            std::string_view name);
 
 private:
+  // The browser's module from the WGSL, and the bindings it declares.
+  static std::unique_ptr<Shader> FromWgsl(ShaderStage stage, std::string wgsl,
+                                          std::string_view name);
+
   wgpu::ShaderModule m_module;
   std::vector<Binding> m_bindings;
   std::string m_wgsl;
