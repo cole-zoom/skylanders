@@ -1489,6 +1489,7 @@ int main(int argc, char** argv)
   bool want_webgpu_no_draws = false;
   bool want_webgpu_no_present = false;
   bool want_webgpu_uniform_dedup = true;
+  std::string webgpu_pipeline_wait;
   bool want_osd = true;
   std::string fifo_path;
   u64 record_fifo_at = 0;  // --record-fifo=TICKS
@@ -1810,6 +1811,13 @@ int main(int argc, char** argv)
     // thread's slowdown under this backend (docs/PHASE3-WEBGPU.md M4).
     else if (std::strcmp(argv[i], "--webgpu-no-present") == 0)
       want_webgpu_no_present = true;
+    // --webgpu-pipeline-wait=MS|forever: how long a draw waits for a
+    // pipeline the browser is still building before the draw is skipped
+    // (WebGPU::Context::pipeline_wait_ns has the default). "forever" draws
+    // everything, as before, and is what a --fifo replay gets regardless:
+    // it compares frames.
+    else if (std::strncmp(argv[i], "--webgpu-pipeline-wait=", 23) == 0)
+      webgpu_pipeline_wait = argv[i] + 23;
     // --fifo=FILE: replay a FIFO capture (.dff) with Dolphin's FifoPlayer
     // instead of running the game: the same GX commands and memory, frame
     // for frame, whatever the backend -- what docs/PHASE3-WEBGPU.md M3
@@ -2592,6 +2600,11 @@ int main(int argc, char** argv)
     WebGPU::g_context.no_draws = want_webgpu_no_draws;
     WebGPU::g_context.no_present = want_webgpu_no_present;
     WebGPU::g_context.uniform_dedup = want_webgpu_uniform_dedup;
+    if (!fifo_path.empty() || webgpu_pipeline_wait == "forever")
+      WebGPU::g_context.pipeline_wait_ns = UINT64_MAX;
+    else if (!webgpu_pipeline_wait.empty())
+      WebGPU::g_context.pipeline_wait_ns =
+          static_cast<u64>(std::strtod(webgpu_pipeline_wait.c_str(), nullptr) * 1e6);
     // Everything the UID file names is made before the game starts. Without
     // this, with no compiler threads, the boot compiled the shaders and left
     // every pipeline to the first frame -- frozen for a minute on a browser
@@ -4431,6 +4444,25 @@ int main(int argc, char** argv)
                       static_cast<unsigned long long>(WebGPU::g_phase_n[p].load()),
                       WebGPU::g_phase_us[p].load() / 1000.0);
         std::printf("\n");
+        // The pipeline phase above is draws waiting for their pipelines
+        // (Pipeline::GetPipeline): how many ran out of the wait, and how
+        // long the ones that got a pipeline took, by doubling ms.
+        const u64 wait_ns = WebGPU::g_context.pipeline_wait_ns;
+        std::printf("  pipelines %llu asked for by a draw; %llu draws skipped, their pipeline "
+                    "not built in %s; waits that ended with one:",
+                    static_cast<unsigned long long>(WebGPU::g_pipelines_at_draw.load()),
+                    static_cast<unsigned long long>(WebGPU::g_draws_skipped.load()),
+                    wait_ns == UINT64_MAX ? "forever" :
+                                            fmt::format("{:.1f} ms", wait_ns / 1e6).c_str());
+        for (int b = 0; b < WebGPU::kWaitBuckets; ++b)
+        {
+          if (b < WebGPU::kWaitBuckets - 1)
+            std::printf(" <%d ms %llu,", 1 << b,
+                        static_cast<unsigned long long>(WebGPU::g_pipeline_wait_hist[b].load()));
+          else
+            std::printf(" more %llu\n",
+                        static_cast<unsigned long long>(WebGPU::g_pipeline_wait_hist[b].load()));
+        }
       }
 #endif
       // The heap only grows, so its top is the run's high water mark.

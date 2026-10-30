@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <list>
+#include <optional>
 
 #include "Common/Logging/Log.h"
 #include "VideoCommon/VertexShaderGen.h"
@@ -307,34 +308,53 @@ void Pipeline::TakeAnswer() const
   m_state = State::Built;
 }
 
-void Pipeline::Build() const
-{
-  const CompileTimer timer;
-  const CompileTimer phase(kPipeline);
-  if (m_state == State::Requested)
-  {
-    // In flight already, behind at most kInFlight - 1 others.
-    std::erase(s_requested, this);
-    g_context.Wait(m_future);
-    TakeAnswer();
-    return;
-  }
-  s_waiting.remove(this);
-  const Description d(m_config, m_vs, m_ps);
-  const std::string error = g_context.CaptureValidation(
-      [&] { m_pipeline = g_context.device.CreateRenderPipeline(&d.desc); });
-  if (!error.empty())
-  {
-    m_pipeline = nullptr;
-    WGPU_LOG("WebGPU: pipeline rejected: {}", error);
-  }
-  m_state = State::Built;
-}
-
 const wgpu::RenderPipeline& Pipeline::GetPipeline() const
 {
-  if (m_state != State::Built)
-    Build();
+  if (m_state == State::Built)
+    return m_pipeline;
+  if (m_state == State::Waiting)
+  {
+    // Ahead of the background's queue; counted as in flight, so that
+    // BuildInBackground takes the answer if no draw does.
+    s_waiting.remove(this);
+    Request();
+    s_requested.push_back(this);
+    m_at_draw = true;
+    g_pipelines_at_draw.fetch_add(1, std::memory_order_relaxed);
+  }
+  // A wait with a timeout suspends this thread and lets the browser answer
+  // (JSPI); one of 0 only looks whether it already has. Later draws only
+  // look: the wait was spent on the first.
+  u64 wait_ns = g_context.pipeline_wait_ns;
+  if (wait_ns != UINT64_MAX && m_waited)
+    wait_ns = 0;
+  m_waited = true;
+  // A wait is time the GPU thread spends on a pipeline, as a build was;
+  // a look is not.
+  std::optional<CompileTimer> timer, phase;
+  if (wait_ns)
+  {
+    timer.emplace();
+    phase.emplace(kPipeline);
+  }
+  const double t0 = emscripten_get_now();
+  if (g_context.instance.WaitAny(m_future, wait_ns) != wgpu::WaitStatus::Success)
+  {
+    // Still being built: this draw goes without, the pipeline stays in
+    // flight and BuildInBackground or a later draw takes the answer.
+    g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
+    return m_pipeline;
+  }
+  if (wait_ns)
+  {
+    const double ms = emscripten_get_now() - t0;
+    int bucket = 0;
+    for (double bound = 1.0; ms >= bound && bucket < kWaitBuckets - 1; bound *= 2.0)
+      ++bucket;
+    g_pipeline_wait_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+  }
+  std::erase(s_requested, this);
+  TakeAnswer();
   return m_pipeline;
 }
 
@@ -360,6 +380,13 @@ void Pipeline::BuildInBackground()
     s_reported = true;
     WGPU_LOG("pipelines: {} built in the background over {:.1f} s", s_built,
              (emscripten_get_now() - s_start) / 1000.0);
+  }
+  // Not while a draw's pipeline is in flight: Metal compiles ~40 a second
+  // however they are asked for, and that one is wanted this frame.
+  if (std::any_of(s_requested.begin(), s_requested.end(),
+                  [](const Pipeline* p) { return p->m_at_draw; }))
+  {
+    return;
   }
   while (s_requested.size() < kInFlight && !s_waiting.empty())
   {
