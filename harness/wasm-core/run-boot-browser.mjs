@@ -15,7 +15,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+// CHROME=<binary> runs another Chrome: Chrome for Testing has a Metal
+// shader cache of its own that a test may empty, for what a first visit's
+// compiles cost (docs/PHASE3-WEBGPU.md); the player's Chrome's is never
+// touched.
+const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
 // Refuse to start while anything holds the ports. A Chrome or a server left
 // over from a killed run keeps them, the new ones fail to bind with their

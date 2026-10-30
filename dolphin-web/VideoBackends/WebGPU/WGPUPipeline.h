@@ -35,10 +35,14 @@ public:
            std::vector<Binding> bindings);
   ~Pipeline() override;
 
-  // The browser's pipeline, built now if the background has not got to it
-  // (one compile: ~2 ms on a browser that has met it before, ~40 ms on one
-  // whose Metal cache never has). Null if the browser refused it (logged
-  // then), and the draw is skipped. GPU thread only.
+  // The browser's pipeline. Asked for now if the background has not got
+  // to it, ahead of the background's queue, and waited for up to
+  // Context::pipeline_wait_ns (1-4 ms is enough on a browser that has met
+  // the shaders before; one whose Metal cache never has takes 25-50 ms).
+  // Null while the browser is still building it, and the draw is skipped
+  // -- a frame or two without that effect, instead of a game frozen for
+  // every new pipeline of a fight -- or if the browser refused it (logged
+  // then). GPU thread only.
   const wgpu::RenderPipeline& GetPipeline() const;
   // The union of the vertex and pixel shaders' declarations: what a bind
   // group for this pipeline must contain, no more.
@@ -74,7 +78,6 @@ private:
 
   void Request() const;
   void TakeAnswer() const;
-  void Build() const;
 
   wgpu::ShaderModule m_vs;
   wgpu::ShaderModule m_ps;
@@ -83,5 +86,12 @@ private:
   mutable wgpu::Future m_future;
   mutable std::shared_ptr<Answer> m_answer;
   mutable wgpu::RenderPipeline m_pipeline;
+  // A draw has waited for this pipeline once; later draws only look
+  // whether it has arrived (the answer comes with a frame's yield). The
+  // bound is paid once per pipeline, not once per draw or per frame.
+  mutable bool m_waited = false;
+  // Asked for by a draw: the background sends nothing more until the
+  // browser has answered, so that Metal's compilers are its alone.
+  mutable bool m_at_draw = false;
 };
 }  // namespace WebGPU

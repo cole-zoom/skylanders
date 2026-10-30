@@ -892,6 +892,57 @@ mimalloc removed the contention (4.8 s), but a save state then peaked at
 836 MB of heap instead of 489 MB, at the same speed (96.8% vs 97.2%).
 That is 350 MB of a player's memory for 4 s at the first boot only.
 
+### A draw waits 4 ms for its pipeline, then goes without
+
+A 17-minute play session (sheep level, the fight; the log
+`docs/HANDOFF-FIGHT-SPEED.md` §2 describes) had its seconds at 0-40%
+when 10-23 shaders and pipelines were compiled in them, 40-60 ms each:
+fight effects the UID file does not cover, each built the first time it
+was drawn, with the GPU thread waiting for the browser's answer and the
+CPU thread waiting for the GPU thread. A warm Metal cache answers in
+1-4 ms; one that has never met the shader takes 25-50 ms, and Metal
+manages ~40 a second however they are asked for.
+
+Now every pipeline is asked for asynchronously. A draw whose pipeline is
+not built asks for it ahead of the background's queue and waits up to
+`Context::pipeline_wait_ns` (4 ms) for the answer; past that the draw is
+skipped and a later frame draws it, once the answer has come with a
+frame's yield. The wait is paid once per pipeline, not per draw or per
+frame, and the background sends nothing more while a draw's pipeline is
+in flight, so Metal's compilers are its alone. A FIFO replay (M3) waits
+for every pipeline, as before: it compares frames.
+
+The fight state, Chrome for Testing with its Metal cache emptied before
+each run (a first visit's compiles), window from 3 s, one run each:
+
+| wait for a pipeline | window | frames over 100 ms | CPU thread waited | worst second |
+|---|---|---|---|---|
+| until built (before) | 55.8% | 15, 7.0 s | 6.8 s (22%) | 12% |
+| 8 ms | 64.6% | 3, 0.8 s | 1.1 s | 41% |
+| **4 ms** | **66.2%** | **2, 0.4 s** | **0.7 s** | **46%** |
+| 0 ms (never) | 65.3% | 1, 0.2 s | 0.4 s | 46% |
+
+Cold, the 388 new pipelines of the fight scene arrive at Metal's pace:
+about 20,000 of the run's 300,000 draws go without one, the scene
+filling in over the first seconds instead of frozen for them. What is
+left of the cold cost is the 117 new shaders, still compiled on the GPU
+thread (glslang, Tint and the module: 1.3 s over the run), and Chrome's
+GPU process compiling Metal shaders on the same four cores.
+
+Warm (the player's own Chrome, the fight again): until built 77.4%,
+382 ms waited; 4 ms 76.4%, 381 ms waited, 15 draws skipped over the
+run, every wait under 4 ms (63 under 1 ms, 82 under 2, 184 under 4).
+At 8 ms nothing was skipped and 17 waits took 4-8 ms, so 4 ms draws
+about 5% of a warm scene's new pipelines one frame late and halves
+what a cold scene pays in waits. Vortex 95.8 → 95.0%, gate 82.1 →
+81.9%, walking 115.5 → 114.6%; M3 passes on all four captures.
+
+`--webgpu-pipeline-wait=MS|forever` sets the bound; `--frame-times`
+prints the waits by doubling milliseconds and the draws skipped.
+`CHROME=<binary>` points the harness at Chrome for Testing for a cold
+run (its Metal cache is `$(getconf DARWIN_USER_CACHE_DIR)com.google.chrome.for.testing*/com.apple.metal`;
+the player's Chrome's is never touched).
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

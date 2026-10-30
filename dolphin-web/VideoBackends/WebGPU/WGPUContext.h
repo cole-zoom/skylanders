@@ -64,6 +64,14 @@ struct Context
   bool no_present = false;
   // Skip GX uniform uploads equal to the slot's last (Gfx::SetGXUniforms).
   bool uniform_dedup = true;
+  // How long a draw waits for a pipeline the browser is still building
+  // before the draw is skipped (Pipeline::GetPipeline). The browser
+  // answers in 1-4 ms for 95% of pipelines when its Metal cache has met
+  // the shaders, and in 25-50 ms when it has not; a fight brings dozens
+  // of new ones a second, and waiting for every one froze the game.
+  // UINT64_MAX waits for every pipeline, which is what a replay that
+  // compares frames needs.
+  u64 pipeline_wait_ns = 4'000'000;
 
   // The one layout every render pipeline shares (WGPUShader.h has the
   // numbering): group 0 the three uniform blocks, group 1 eight textures
@@ -133,6 +141,16 @@ inline std::atomic<u64> g_compiles{0};
 enum CompilePhase { kGlslang, kTint, kModule, kPipeline, kCompilePhases };
 inline std::atomic<u64> g_phase_us[kCompilePhases];
 inline std::atomic<u64> g_phase_n[kCompilePhases];
+// The kPipeline phase is a draw's wait for its pipeline (Pipeline::
+// GetPipeline), bounded by Context::pipeline_wait_ns. Alongside: the
+// pipelines a draw asked for before the background got to them, the draws
+// skipped because the wait ran out, and how long the waits that ended
+// with a pipeline took, by doubling milliseconds (<1, <2, ... <64, more),
+// for choosing the bound.
+inline std::atomic<u64> g_pipelines_at_draw{0};
+inline std::atomic<u64> g_draws_skipped{0};
+constexpr int kWaitBuckets = 8;
+inline std::atomic<u64> g_pipeline_wait_hist[kWaitBuckets];
 
 // Adds the time from construction to destruction to g_compile_us, and to
 // a phase's counter when given one.
