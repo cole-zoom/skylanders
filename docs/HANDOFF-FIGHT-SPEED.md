@@ -137,7 +137,11 @@ differentials (`run-jitdiff.sh`) and M3 (`harness/wasm-core/run-m3.sh`).
    "Left"). A fastmem-style direct mapping for the common BAT case.
 4. **Guest registers in wasm locals** across a block/region instead of
    loads and stores to `PowerPCState` per instruction.
-5. **Dispatcher** (6.5%): `_main_thread`, link table, budget exits.
+5. **Dispatcher** (6.5%): `_main_thread`, link table, budget exits. *Done:
+   `docs/PHASE3-WEBGPU.md` "The transition: exits to earlier blocks bound as
+   imports" -- the cost was the block-to-block transition through the link
+   table and `return_call_indirect`, charged to the blocks; exits to blocks
+   compiled earlier are now imports of the module: fight +2, walking +5.*
 6. Small: hatch instructions (`cror`, `ps_sum0`, hardware stores; ~2%),
    `GPFifo::UpdateGatherPipe` (1.2%), DSP HLE on the CPU thread.
 

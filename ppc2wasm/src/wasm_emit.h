@@ -328,6 +328,18 @@ public:
     m_func_imports.push_back({module, name, params, results});
     return static_cast<uint32_t>(m_func_imports.size() - 1);
   }
+
+  // Import another module's BLOCK under "env": a function of the block
+  // signature (type 0), so that a direct tail call to it is a `return_call`
+  // of an import -- V8 makes that a load of the callee's entry and a jump,
+  // where a call through the function table costs the table's bounds and
+  // signature checks and the lookup before them. The caller binds the
+  // name to the earlier block's exported function when it instantiates.
+  uint32_t ImportBlock(const std::string& name)
+  {
+    m_func_imports.push_back({"env", name, m_params, m_results, true});
+    return static_cast<uint32_t>(m_func_imports.size() - 1);
+  }
   uint32_t ImportCount() const { return static_cast<uint32_t>(m_func_imports.size()); }
 
   // params/results describe the signature EVERY function in the module
@@ -406,11 +418,15 @@ public:
   {
     Bytes out{0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00};
 
-    // Type section: the block signature, then one type per imported
-    // function.
+    // Type section: the block signature, then one type per imported host
+    // function; an imported block uses type 0.
+    std::vector<uint32_t> import_type(m_func_imports.size(), 0);
     {
       Bytes p;
-      PutU32(p, 1 + static_cast<uint32_t>(m_func_imports.size()));
+      uint32_t host_imports = 0;
+      for (const FuncImport& fi : m_func_imports)
+        host_imports += fi.block_type ? 0 : 1;
+      PutU32(p, 1 + host_imports);
       auto put_type = [&](const std::vector<uint8_t>& params, const std::vector<uint8_t>& results) {
         p.push_back(kFuncType);
         PutU32(p, static_cast<uint32_t>(params.size()));
@@ -421,8 +437,14 @@ public:
           p.push_back(t);
       };
       put_type(m_params, m_results);
-      for (const FuncImport& fi : m_func_imports)
-        put_type(fi.params, fi.results);
+      uint32_t next = 1;
+      for (size_t i = 0; i < m_func_imports.size(); ++i)
+      {
+        if (m_func_imports[i].block_type)
+          continue;
+        put_type(m_func_imports[i].params, m_func_imports[i].results);
+        import_type[i] = next++;
+      }
       PutSection(out, 1, p);
     }
 
@@ -457,7 +479,7 @@ public:
         PutName(p, m_func_imports[i].module);
         PutName(p, m_func_imports[i].name);
         p.push_back(0x00);  // func
-        PutU32(p, static_cast<uint32_t>(1 + i));  // its type
+        PutU32(p, import_type[i]);
       }
       PutSection(out, 2, p);
     }
@@ -628,6 +650,7 @@ private:
   {
     std::string module, name;
     std::vector<uint8_t> params, results;
+    bool block_type = false;  // typed as the block signature, type 0
   };
   std::vector<FuncImport> m_func_imports;
   bool m_import_memory = false;

@@ -1164,6 +1164,75 @@ only, so a wrong one costs speed and never correctness; V8 ignores a
 malformed section silently, which is why `jit-asm.mjs` under node with the
 flag is the check that the cold code moved; `harness/wasm-core/dumpblock.cpp` compiles a program natively and writes its module for that, or for `wasm2wat`.
 
+### The transition: exits to earlier blocks bound as imports
+
+The fifth item of `docs/HANDOFF-FIGHT-SPEED.md` §4 named the dispatcher,
+6.5% of the CPU thread in the profile. The profile charges a block's exit
+to the block, and that is where the transition's cost was. A block ends
+with a tail call to the next: a `return_call` when the target is in the
+same module (a sibling of the region), otherwise a lookup in the link
+table and a `return_call_indirect` through the function table. From the
+machine code of a fight block, the second is
+
+```
+ldr  w9, [x8, #772]; sub; str      ; the downcount
+cmp  w9, #0; b.le                  ; the budget
+movz/movk; ldr w8, [x1, x8]        ; the link table's slot, folded to a constant
+movn/movk; cmp w8, w9; b.ne        ; the stored PC against this exit's
+movz/movk; ldr w1, [x1, x6]        ; the function index
+ldur x8; ldur w10; madd; ldur x6   ; the function table's length and base
+cmp  w1, w10; b.hs                 ; its bounds check
+ldr  w6; ldr w1; cmp; b.ne         ; the signature check
+ldr  x7; ldr x1                    ; the callee's instance and entry
+ldp; add sp; br x17                ; the tail call
+```
+
+thirty-five instructions before the callee's prologue, where the sibling
+call is a jump. A fight makes 48 million transitions a second, and once
+the game is warm most of a new region's exits lead to blocks compiled
+before it, in other modules, which no sibling call can reach: of the
+fight's 97,782 exit holes, 55,022 named a sibling.
+
+*What changes.* A region's exits to blocks already compiled are bound as
+imports of its module (`ModuleBuilder::ImportBlock`, typed as the block
+signature; `--jit-imports`, the default): the hole becomes a
+`return_call` of the import, which V8 compiles as a load of the callee's
+entry and a jump, and `JitInstallBatch` binds each import to the earlier
+block's exported function (`env.b0`, `env.b1`, ... by table index). The
+fallback to the table stays for targets compiled later -- a module is
+immutable once instantiated -- and for the dynamic exits (`blr`, `bcctr`),
+whose targets are not known when the block is compiled. Over the fight:
+25,017 more holes bound, through 16,277 imports, 3.3 a module.
+
+| | off | imports |
+|---|---|---|
+| fight, 3-20 s | 104.2% (statistics build 95.9 / 95.8%) | 106.1% (99.0 / 98.6%) |
+| the vortex, 3-30 s | 127.3% | 130.0% |
+| the town gate, 3-20 s | 109.1% | 110.8% |
+| walking, 300-400 s | 133.6 / 133.6% | 138.6 / 138.2% |
+
+Frames identical in every pair. M3 passes on all four captures. The
+chain differential now splits a third of its chains over two modules,
+the second calling the first through imports, and passes.
+
+*The call, in machine code* (a fight block from a run, `jit-asm.mjs`): an
+exit bound to an import is
+
+```
+ldur x1, [x6, #7]; ldur x7, [x1, #39]   ; the import's instance
+ldur x1, [x6, #31]; ldur x1, [x1, #39]  ; its entry
+ldp fp, lr, [fp]; add sp, sp, #0xa0     ; this frame
+mov x17, x1; br x17                     ; the tail call
+```
+
+nine instructions for the thirty-five of the table path: no lookup, no
+bounds check, no signature check.
+
+The walking pairs are off, on, on, off in one sitting: a single pair on
+this scene moved 6-9 points with the run order alone (the second of two
+long runs slower, the battery charging), and two pairs in opposite orders
+said -9 and +6; four runs in a row say +5 twice, with the two offs equal.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.
