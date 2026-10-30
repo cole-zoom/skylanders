@@ -104,7 +104,9 @@ walking window (`--input=A --skylander --ticks=291600000000
 --speed-from=218700000000`, see PHASE3-HANDOFF.md §6). Then the
 differentials (`run-jitdiff.sh`) and M3 (`harness/wasm-core/run-m3.sh`).
 
-1. **No freezes on new shaders.** When a pipeline is not ready, skip the
+1. **No freezes on new shaders.** *Done, #107: `docs/PHASE3-WEBGPU.md`
+   "A draw waits 4 ms for its pipeline, then goes without".* When a
+   pipeline is not ready, skip the
    draw instead of waiting (Dolphin's "asynchronous, skip drawing" idea).
    Pieces already there: `Pipeline::Request` / `BuildInBackground`
    (async `CreateRenderPipelineAsync`, `dolphin-web/VideoBackends/WebGPU/WGPUPipeline.cpp`);
@@ -115,7 +117,8 @@ differentials (`run-jitdiff.sh`) and M3 (`harness/wasm-core/run-m3.sh`).
    mimalloc +350 MB heap; PHASE3-WEBGPU.md "Tried and not kept"). Check
    M3 still matches (it waits for everything) and what a skipped draw
    looks like in the fight.
-2. **Get hot blocks to TurboFan sooner, without flags.** Players cannot
+2. **Get hot blocks to TurboFan sooner, without flags.** *Done: the warm
+   entry, `docs/PHASE3-WEBGPU.md` "Hot blocks optimised sooner".* Players cannot
    pass `--js-flags`; the +12 points above have to come from how code is
    packaged. V8 tiers up per function when its budget (decremented by
    code size executed, at returns and loop back-edges) runs out; a fight

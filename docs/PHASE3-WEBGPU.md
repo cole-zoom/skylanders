@@ -943,6 +943,110 @@ prints the waits by doubling milliseconds and the draws skipped.
 run (its Metal cache is `$(getconf DARWIN_USER_CACHE_DIR)com.google.chrome.for.testing*/com.apple.metal`;
 the player's Chrome's is never touched).
 
+### Hot blocks optimised sooner: the warm entry
+
+The second item of `docs/HANDOFF-FIGHT-SPEED.md` §4. With nothing
+compiling, the fight ran 77-78% in the harness window (3-20 emulated s
+from the player's save state) and `--wasm-tiering-budget=100000` made
+that 89.7%; in a later window, 30-50 s, 119.2% against 129.0%. A player
+cannot pass V8 flags, so this is about how the blocks are packaged.
+
+*How Chrome decides.* V8 15.6 (Chrome 156) compiles a wasm function
+with Liftoff and recompiles it with TurboFan once a per-function budget
+of 13,000,000 is spent. The budget is charged in machine-code bytes
+executed, approximately: at every `return` and tail call, the offset of
+that instruction in the function's code (its size up to there) plus 60;
+at a loop back-edge, the distance jumped. Measured here with
+`harness/wasm-core/tierup-probe/` (a page that builds a function, calls
+it, and asks `%IsTurboFanFunction` under `--allow-natives-syntax`: a
+flag for the measurement, never for a player). A block of this
+recompiler averages 9 guest instructions and about 2 KB of Liftoff code
+(1.25-2.9 bytes per wasm byte over the fight's hot blocks, 1.9 in the
+middle, Chrome and node's Liftoff agreeing;
+`harness/wasm-core/liftoff-size.mjs`), so it is optimised after some
+six thousand executions -- and the fight runs 42,000 blocks, a flat
+profile (the top 500 are 39% of block time), most of them a few
+thousand times in twenty seconds. Most of a fight runs in Liftoff code.
+Compilation hints (`metadata.code.compilation_priority`) are ignored by
+Chrome 156, with or without `--experimental-wasm-compilation-hints`.
+
+*The warm entry* (`StateLayout::warm_entry`). Every block begins with
+one compare and branch: a NEGATIVE state argument, -K, runs none of the
+block -- a loop around the block goes round K times with the argument
+as its counter, each back-edge jumping over every byte of the block's
+code and charging all of it, and the block returns 0. One call from
+the dispatcher spends a block's budget in K passes of about 2.5 ns, and
+V8 optimises it in the background (a batch of 27 blocks measured
+optimised within 6 ms). K comes from the wasm body size and an assumed
+1.4 bytes of code per byte; a block estimated above its real size gets
+more passes than it needs (a second trip of the budget is ignored), one
+estimated below is finished by its own runs.
+
+*Which blocks, measured on the fight* (window 3-20 s, one run per cell,
+noise about ±1 here; `--jit-warm`):
+
+| policy | window | passes over the run |
+|---|---|---|
+| off (four runs) | 77.9-78.4% | |
+| the entry test alone (`check`) | 77.7% | 0 |
+| warm a block on the 1st chain that starts at it (`1`) | 83.3% | 15,187 blocks, 1.35 s |
+| ... on the 2nd (`2`) | 81.5% | 11,543 blocks, 0.9 s |
+| every block when installed (`install`), 1.4 bytes per byte assumed | 87.3% | 37,657 blocks, 552M passes, 2.9 s |
+| ... 1.8 assumed | 87.0 / 86.7% | 439M passes, 2.4 s |
+| ... 2.2 assumed | 85.7% | 364M passes, 2.1 s |
+| `--wasm-tiering-budget=100000` (reference) | 89.7% | |
+
+A chain starts where a slice ended or a link missed, which samples
+blocks by the time spent in them -- but warming every block at install
+beat it, even at 2.4 s of passes over the run: what matters is breadth
+and earliness, not picking. Where the passes go: 62% to blocks under
+512 bytes of wasm (a third of the blocks; a block of 300 bytes needs
+28,000 passes, 150 µs), 89% to blocks under a kilobyte, most of them
+cold.
+
+Where the passes go also says where a cap would save: capped at 2,000,
+4,000 or 8,000 passes at install, with the blocks a chain starts at
+topped up to their whole budget afterwards, the window was 85.2, 83.2
+and 86.3%; capped at 4,000 without the top-up, 81.7%. The small blocks
+are worth their passes. So every block is warmed fully at install, and
+the other policies stay behind flags for another machine to re-measure.
+
+The first version of the warm path tail-called the block itself for
+each pass (a direct-call hole, filled like a sibling's), which pays a
+function entry and V8's stack check per pass: 5.3 ns, 2.9 s over the
+run. The loop around the block: 2.4 ns, 1.35 s. The window was the same
+(87.3 / 87.3% against 87.4%); the whole run, whose first three seconds
+compile and warm most of the scene, 79.0% against 75.8%, and its worst
+second 64-65% against 59%. Liftoff spills a function's locals at a loop
+head and keeps them on the stack through the body, which the window
+says costs nothing measurable.
+
+*The result* (`--jit-warm=install`, the default, against `off`; each
+pair alternated, one run each):
+
+| scene | off | warmed at install | passes over the run |
+|---|---|---|---|
+| the fight, 3-20 s | 77.7% (median second 79%, p10 67%) | **87.7%** (88%, 79%) | 37,665 blocks, 1.3 s |
+| the vortex (`s941.sav`), 3-30 s | 96.8% | **106.2%** | 26,925 blocks, 1.0 s |
+| the town gate, 3-20 s | 83.2% | **91.0%** | 36,086 blocks, 1.3 s |
+| walking, 300-400 s | 114.6% | 113.8% | 51,790 blocks, 1.8 s |
+
+Frames identical in every pair (1197, 1799, 1198, 23846). The walking
+window is a scene whose blocks were long since optimised either way, so
+it shows what the entry test costs: nothing beyond that window's noise
+(±3). The whole fight run from the save state, first seconds included,
+72.5 → 79.6%, its worst second 60 → 65%. M3 passes on all four
+captures; the differentials pass with and without the entry.
+
+*Flags.* `--jit-warm=install[+N]|N|check|off` (the default is `install`),
+`--jit-warm-cap=P` (passes at install at most), `--jit-warm-ratio=R`
+and `--jit-warm-hot-ratio=R` (bytes of code assumed per wasm byte, at
+install and for a block that started a chain), `--jit-warm-budget=B`.
+The `jit warm` line of a run says how many blocks were warmed, topped
+up, how many passes and milliseconds, and the passes by body size.
+`run-jitdiff.sh --warm` compiles every differential's blocks with the
+entry and calls each hand-written case with a negative state first.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

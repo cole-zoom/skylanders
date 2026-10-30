@@ -221,7 +221,11 @@ int main(int argc, char** argv)
   // meant to be exact, so every expectation below holds with them on.
   // --simd: paired singles as vectors (StateLayout::simd_ps); here, with
   // the arithmetic exact, that is the quantized loads and stores.
-  bool want_compact = false, want_short_convert = false, want_simd = false;
+  // --warm: the warm entry (StateLayout::warm_entry), as the dispatcher
+  // has it with --jit-warm: every block carries the negative-state test,
+  // and the hand-written cases also call each block with a negative state
+  // and expect nothing to have run.
+  bool want_compact = false, want_short_convert = false, want_simd = false, want_warm = false;
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--compact") == 0)
@@ -230,10 +234,12 @@ int main(int argc, char** argv)
       want_short_convert = true;
     else if (std::strcmp(argv[i], "--simd") == 0)
       want_simd = true;
+    else if (std::strcmp(argv[i], "--warm") == 0)
+      want_warm = true;
   }
-  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s\n\n",
+  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s%s\n\n",
               want_compact ? "  [compact]" : "", want_short_convert ? "  [short-convert]" : "",
-              want_simd ? "  [simd]" : "");
+              want_simd ? "  [simd]" : "", want_warm ? "  [warm]" : "");
 
   auto& system = Core::System::GetInstance();
   Config::Init();
@@ -347,6 +353,7 @@ int main(int argc, char** argv)
   }
   layout.short_convert = want_short_convert;
   layout.simd_ps = want_simd;
+  layout.warm_entry = want_warm;
   // The GQRs above, specialised on as the dispatcher does; the guard the
   // emitted code carries is exercised by the mtspr-to-GQR case below.
   layout.gqr_values = &state.spr[SPR_GQR0];
@@ -673,6 +680,23 @@ int main(int argc, char** argv)
     state.pc = state.npc = BASE;
 
     BlockFn f = reinterpret_cast<BlockFn>(idx);
+    if (want_warm)
+    {
+      // A negative state runs nothing: three passes of the warm loop, 0
+      // back, and the guest as it was.
+      const u32 r0 = f(static_cast<u32>(-3));
+      bool untouched = r0 == 0 && state.pc == BASE && state.downcount == 1000;
+      for (int i = 0; i < 32 && untouched; ++i)
+        untouched = state.gpr[i] == 0;
+      if (!untouched)
+      {
+        char lbl[128];
+        std::snprintf(lbl, sizeof(lbl), "%s: warm call ran something (returned %08x)",
+                      c.name, r0);
+        check(false, lbl);
+        continue;
+      }
+    }
     const u32 got_pc = RunBlock(idx, state, ppc);
 
     if (c.expect_bail_at >= 0)

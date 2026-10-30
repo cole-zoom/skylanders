@@ -466,6 +466,31 @@ struct StateLayout
   uint32_t hatch_exit_index = 0;
   uint32_t mem_slow_index = 0;
   uint32_t exit_value_addr = 0;
+
+  // ── the warm entry ──
+  //
+  // When set, a block called with a NEGATIVE state argument, -K, runs
+  // none of its code: a loop around the block goes round K times with
+  // the argument as the counter, and the block returns 0. That is for
+  // the caller to get the block optimised. Chrome runs a function in its
+  // baseline compiler's code until a budget (13,000,000 in V8 15.6) is
+  // used up by machine-code bytes executed, charged at every return and
+  // tail call as the offset of that instruction -- the size of the
+  // function up to there -- and at a loop's back-edge as the distance
+  // jumped. A block of nine guest instructions is a couple of kilobytes
+  // of baseline code, so it takes thousands of executions, and a game
+  // that runs forty thousand blocks a few thousand times each spends
+  // most of its time in baseline code. Each pass of the loop jumps back
+  // over the whole block and charges all of it, in about 2.5 ns, so one
+  // call spends any block's budget the moment the caller knows the block
+  // matters. The entry test costs one compare and branch per block
+  // entry; a real state pointer is a heap address and never negative.
+  // (The same passes as self tail calls, which pay a function entry and
+  // V8's stack check each, measured 5-6 ns a pass and the same speed in
+  // the fight's window; the loop halves what a scene's first seconds
+  // pay. Liftoff spills the locals at a loop head, which cost nothing
+  // measurable.)
+  bool warm_entry = false;
 };
 
 namespace detail
@@ -6490,6 +6515,39 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     // The block's result is the PC to resume at.
     body.push_back(kI32Const);
     PutI32(body, static_cast<int32_t>(r.end_pc));
+  }
+
+  if (layout.warm_entry)
+  {
+    // loop (result i32); block (result i32); i32.const 0; local.get 0;
+    // i32.const 0; i32.lt_s; br_if 0; drop; <the block>; end; then
+    // local 0 += 1 and br_if 0 (the loop) while it is negative; end. A
+    // negative state takes the first branch with the 0, lands after
+    // every byte of the block's code, and goes round. The br_if to the
+    // loop keeps the block's result beneath it for the fall-through --
+    // the link epilogue's miss, leaving the next PC with a positive
+    // local 0 -- and discards it when taken, as the spec has it. The
+    // fixups move with the body, as above.
+    Bytes warm{kLoop,     kI32,  kBlock, kI32,  kI32Const, 0x00, kLocalGet,
+               0x00,      kI32Const, 0x00, kI32LtS, kBrIf, 0x00, kDrop};
+    for (DirectFixup& f : fixups)
+      f.offset += static_cast<uint32_t>(warm.size());
+    PutBytes(warm, body);
+    warm.push_back(kEnd);
+    warm.push_back(kLocalGet);
+    PutU32(warm, 0);
+    warm.push_back(kI32Const);
+    PutI32(warm, 1);
+    warm.push_back(kI32Add);
+    warm.push_back(kLocalTee);
+    PutU32(warm, 0);
+    warm.push_back(kI32Const);
+    PutI32(warm, 0);
+    warm.push_back(kI32LtS);
+    warm.push_back(kBrIf);
+    PutU32(warm, 0);
+    warm.push_back(kEnd);
+    body = std::move(warm);
   }
 
   // The i64 locals start at 9 by construction -- 9 and 10 for most forms,

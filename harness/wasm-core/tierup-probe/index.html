@@ -1,0 +1,220 @@
+<!doctype html><meta charset=utf8><title>v8 tier-up probe</title>
+<pre id=out></pre>
+<script>
+// How V8 (Chrome 156) tiers a wasm function up, measured. Run through
+// probe.mjs next to this file; see its header.
+//
+// Modes, by query:
+//   pad=P&chunk=C[&hints=1&hc=..&ho=..]   a synthetic function (below)
+//   mod=<file>&k=<n>&trip=1[&arg=-1]       the smallest call count that trips a
+//                                          dumped block's budget (--jit-dump, then
+//                                          harness/wasm-core/liftoff-size.mjs
+//                                          writes the .wasm files)
+//   mod=<file>&k=<n>[&arg=-1]              the same, calling until optimised
+//                                          (measures the compile latency, ~8 ms)
+//   queue=<file>,<file>[&ratio=R]          warm every function of those modules
+//                                          and time V8's queue draining
+//
+// A function (i32)->i32 whose argument 0 skips its body and returns through
+// the END of the function: the tier-up check at that return charges the
+// machine-code offset of the return, i.e. the whole function's code size,
+// so calling f(0) N times drains the per-function budget (13,000,000 in
+// V8 15.6) N*(S+60) bytes. The page calls f(0) in chunks and reports the
+// first chunk after which %IsTurboFanFunction(f) is true.
+//
+// Query: pad=P (body: P copies of a 6-instruction arithmetic unit),
+//        chunk=C (calls per check), hints=1 (a metadata.code.compilation_priority
+//        section naming f), max=M (give up after M calls), warm=W (call f(1)
+//        W times first, to see what real executions cost), tag=T (label).
+// Needs --allow-natives-syntax (for %IsTurboFanFunction / %IsLiftoffFunction).
+window.__lines = []; window.__done = false;
+const log = (s) => { window.__lines.push(s); document.getElementById('out').textContent += s + '\n'; };
+const q = new URLSearchParams(location.search);
+const P = Number(q.get('pad') ?? 20), C = Number(q.get('chunk') ?? 1000);
+const HINTS = q.get('hints') === '1', MAX = Number(q.get('max') ?? 5e6);
+const WARM = Number(q.get('warm') ?? 0), TAG = q.get('tag') ?? '';
+const HINT_C = Number(q.get('hc') ?? 0), HINT_O = q.get('ho');  // compilation / optimization priority
+
+const u32 = (v) => { const o = []; do { let b = v & 0x7f; v >>>= 7; if (v) b |= 0x80; o.push(b); } while (v); return o; };
+const i32 = (v) => { const o = []; let more = true; while (more) { let b = v & 0x7f; v >>= 7; if ((v === 0 && !(b & 0x40)) || (v === -1 && (b & 0x40))) more = false; else b |= 0x80; o.push(b); } return o; };
+const name = (s) => [...u32(s.length), ...new TextEncoder().encode(s)];
+const section = (id, payload) => [id, ...u32(payload.length), ...payload];
+
+function build() {
+  // body
+  const b = [];
+  b.push(0x02, 0x40);                 // block (void)
+  b.push(0x20, 0, 0x45, 0x0d, 0);     // local.get 0; i32.eqz; br_if 0
+  for (let i = 0; i < P; i++) {
+    // local.get 0; i32.const 7; i32.mul; i32.const 3; i32.add; local.set 0
+    b.push(0x20, 0, 0x41, ...i32(7 + (i & 3)), 0x6c, 0x41, ...i32(3), 0x6a, 0x21, 0);
+  }
+  b.push(0x20, 0, 0x0f);              // local.get 0; return
+  b.push(0x0b);                       // end block
+  b.push(0x41, 0, 0x0b);              // i32.const 0; end (function)
+  const body = [0 /* no locals */, ...b];
+  const type = section(1, [1, 0x60, 1, 0x7f, 1, 0x7f]);
+  const func = section(3, [1, 0]);
+  const exp = section(7, [1, ...name('f'), 0, 0]);
+  const code = section(10, [1, ...u32(body.length), ...body]);
+  const mod = [0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...type, ...func];
+  if (HINTS) {
+    // metadata.code.compilation_priority: count, then per function:
+    // func index, byte offset (0), hint length, compilation priority
+    // [, optimization priority]. (V8 15.6 module-decoder-impl.h)
+    const hint = [...u32(HINT_C), ...(HINT_O != null ? u32(Number(HINT_O)) : [])];
+    const payload = [...name('metadata.code.compilation_priority'), 1, ...u32(0), ...u32(0), ...u32(hint.length), ...hint];
+    mod.push(...section(0, payload));
+  }
+  mod.push(...exp, ...code);
+  return new Uint8Array(mod);
+}
+
+async function loadDumped() {
+  // ?mod=<file.wasm>&k=<n>: a module a run dumped (--jit-dump), instantiated
+  // with stand-ins for the game's imports, its function f<k> warmed with a
+  // null state: the real Liftoff size of a real block, from the calls it
+  // takes to trip the budget.
+  const bytes = new Uint8Array(await (await fetch(q.get('mod'))).arrayBuffer());
+  const memory = new WebAssembly.Memory({ initial: 8192, maximum: 8192, shared: true });
+  const table = new WebAssembly.Table({ initial: 16, element: 'anyfunc' });
+  const stub = () => 0;
+  const imports = { env: { memory, __indirect_function_table: table, ppc_interp_op: stub, ppc_hatch_exit: stub, ppc_mem_slow: stub } };
+  return { bytes, inst: new WebAssembly.Instance(new WebAssembly.Module(bytes), imports), name: 'f' + (q.get('k') ?? '0') };
+}
+
+async function tripSearch() {
+  // ?mod=<file>&k=<n>&trip=1[&arg=A][&n0=100][&wait=150]: the smallest call
+  // count that trips the budget, found by geometric search, each count on
+  // a FRESH module (a custom section makes the bytes unique, so V8 does not
+  // hand back the same native module), with a pause after the calls so
+  // the detection does not wait on the compile.
+  const base = new Uint8Array(await (await fetch(q.get('mod'))).arrayBuffer());
+  const memory = new WebAssembly.Memory({ initial: 8192, maximum: 8192, shared: true });
+  const table = new WebAssembly.Table({ initial: 16, element: 'anyfunc' });
+  const stub = () => 0;
+  const imports = { env: { memory, __indirect_function_table: table, ppc_interp_op: stub, ppc_hatch_exit: stub, ppc_mem_slow: stub } };
+  const fname = 'f' + (q.get('k') ?? '0'), arg = Number(q.get('arg') ?? 0);
+  const wait = Number(q.get('wait') ?? 150);
+  let lo = 0, hi = -1;
+  for (let N = Number(q.get('n0') ?? 100); N <= MAX; N = Math.round(N * 1.25)) {
+    const tagged = new Uint8Array([...base, ...section(0, [...name('probe'), ...new TextEncoder().encode('N=' + N)])]);
+    const inst = new WebAssembly.Instance(new WebAssembly.Module(tagged), imports);
+    const f = inst.exports[fname];
+    for (let i = 0; i < N; i++) f(arg);
+    await new Promise(r => setTimeout(r, wait));
+    if (eval('%IsTurboFanFunction(f)')) { hi = N; break; }
+    lo = N;
+  }
+  log(`trip ${q.get('mod')} ${fname}: tripped between ${lo} and ${hi} calls, so S+60 is ${hi > 0 ? (13e6 / hi).toFixed(0) : '?'}..${lo > 0 ? (13e6 / lo).toFixed(0) : '?'} bytes`);
+}
+
+async function queueProbe() {
+  // ?queue=a.wasm,b.wasm[&ratio=1.8]: every function of every module is
+  // warmed (a negative-state call, passes from the body size), then the
+  // page polls until all of them are optimised: how fast V8 drains a
+  // queue of tier-up requests on this machine.
+  const files = q.get('queue').split(',');
+  const ratio = Number(q.get('ratio') ?? 1.8);
+  const memory = new WebAssembly.Memory({ initial: 8192, maximum: 8192, shared: true });
+  const table = new WebAssembly.Table({ initial: 16, element: 'anyfunc' });
+  const stub = () => 0;
+  const imports = { env: { memory, __indirect_function_table: table, ppc_interp_op: stub, ppc_hatch_exit: stub, ppc_mem_slow: stub } };
+  const fns = [];
+  let totalBody = 0;
+  for (const file of files) {
+    const bytes = new Uint8Array(await (await fetch(file)).arrayBuffer());
+    // body sizes from the code section
+    let p = 8; const u32r = () => { let r = 0, sh = 0, b; do { b = bytes[p++]; r |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80); return r >>> 0; };
+    let sizes = [];
+    while (p < bytes.length) { const id = bytes[p++]; const len = u32r(); const end = p + len; if (id === 10) { const n = u32r(); for (let i = 0; i < n; i++) { const sz = u32r(); sizes.push(sz); p += sz; } break; } p = end; }
+    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports);
+    sizes.forEach((sz, k) => { fns.push({ f: inst.exports['f' + k], sz, name: file + ' f' + k }); totalBody += sz; });
+  }
+  // Liftoff-compile each with one real-looking pass first? No: the warm call compiles it lazily.
+  const t0 = performance.now();
+  let passes = 0;
+  for (const x of fns) { const n = Math.floor(13e6 / (ratio * x.sz + 60)) + 1; x.f((-n) >>> 0); passes += n; }
+  const t1 = performance.now();
+  let done = 0, polls = 0;
+  const times = [];
+  while (done < fns.length && performance.now() - t0 < 60000) {
+    await new Promise(r => setTimeout(r, 5));
+    polls++;
+    for (const x of fns) if (!x.done && eval('%IsTurboFanFunction(x.f)')) { x.done = true; done++; times.push(performance.now() - t1); }
+  }
+  times.sort((a, b) => a - b);
+  log(`queue: ${fns.length} functions, ${totalBody} body bytes, ${passes} passes in ${(t1 - t0).toFixed(1)} ms (${((t1 - t0) * 1e6 / passes).toFixed(1)} ns each); optimised ${done}/${fns.length}: first after ${times[0]?.toFixed(0)} ms, median ${times[Math.floor(times.length / 2)]?.toFixed(0)} ms, last ${times[times.length - 1]?.toFixed(0)} ms -> ${(fns.length / (times[times.length - 1] / 1000)).toFixed(0)} functions/s, ${(totalBody / 1024 / (times[times.length - 1] / 1000)).toFixed(0)} KB/s`);
+}
+
+(async () => {
+  try {
+    if (q.get('queue')) { await queueProbe(); window.__done = true; return; }
+    if (q.get('mod') && q.get('trip')) { await tripSearch(); window.__done = true; return; }
+    if (q.get('mod')) {
+      const { bytes, inst, name } = await loadDumped();
+      const f = inst.exports[name];
+      const isTF = () => eval('%IsTurboFanFunction(f)');
+      let calls = 0, sink = 0;
+      const tc0 = performance.now();
+      while (calls < MAX) {
+        for (let i = 0; i < C; i++) sink += f(0);
+        calls += C;
+        if (isTF()) break;
+        if (calls % (C * 50) === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      const ms = performance.now() - tc0;
+      log(`dumped ${q.get('mod')} ${name}: module ${bytes.length} bytes; turbofan=${isTF()} after ${calls} null-state calls (${(ms * 1e6 / calls).toFixed(1)} ns each); implied S+60 = ${(13e6 / calls).toFixed(0)} bytes${sink ? ' sink ' + sink : ''}`);
+      window.__done = true;
+      return;
+    }
+    const bytes = build();
+    const t0 = performance.now();
+    const mod = new WebAssembly.Module(bytes);
+    const inst = new WebAssembly.Instance(mod, {});
+    const f = inst.exports.f;
+    log(`probe ${TAG} pad=${P} chunk=${C} hints=${HINTS ? `c=${HINT_C} o=${HINT_O}` : 'no'} module ${bytes.length} bytes, compiled+instantiated in ${(performance.now() - t0).toFixed(2)} ms`);
+    let natives = true;
+    try { eval('%IsLiftoffFunction(f)'); } catch (e) { natives = false; log('no natives syntax: ' + e.message); }
+    const isTF = () => natives ? eval('%IsTurboFanFunction(f)') : false;
+    const isLO = () => natives ? eval('%IsLiftoffFunction(f)') : false;
+    const isUn = () => natives ? eval('%IsUncompiledWasmFunction(f)') : false;
+    log(`before any call: uncompiled=${isUn()} liftoff=${isLO()} turbofan=${isTF()}`);
+    // One call compiles it lazily (Liftoff).
+    let r = f(1);
+    log(`after f(1)=${r}: uncompiled=${isUn()} liftoff=${isLO()} turbofan=${isTF()}`);
+    if (HINTS) {
+      // Does a hint alone get it optimised, given a little time?
+      for (let i = 0; i < 20 && !isTF(); i++) await new Promise(r => setTimeout(r, 25));
+      log(`hinted, after 500 ms and one call: liftoff=${isLO()} turbofan=${isTF()}`);
+    }
+    for (let i = 0; i < WARM; i++) f(1);
+    if (WARM) log(`after ${WARM} real calls: liftoff=${isLO()} turbofan=${isTF()}`);
+    let calls = 0, trippedAt = -1, tTrip = 0;
+    const tc0 = performance.now();
+    let sink = 0;
+    while (calls < MAX) {
+      for (let i = 0; i < C; i++) sink += f(0);
+      calls += C;
+      if (isTF()) { trippedAt = calls; tTrip = performance.now(); break; }
+      if (calls % (C * 50) === 0) await new Promise(r => setTimeout(r, 0));
+    }
+    const tc1 = performance.now();
+    if (trippedAt < 0) {
+      // Not yet: wait and look again -- the compile may be in flight.
+      for (let i = 0; i < 40 && !isTF(); i++) await new Promise(r => setTimeout(r, 25));
+      log(`after ${calls} no-op calls (${((tc1 - tc0) * 1e6 / calls).toFixed(1)} ns each): turbofan=${isTF()} (after a 1 s wait), liftoff=${isLO()}`);
+    } else {
+      log(`turbofan after ${trippedAt} no-op calls (within a chunk of ${C}); ${(tTrip - tc0).toFixed(1)} ms of calling, ${((tTrip - tc0) * 1e6 / trippedAt).toFixed(1)} ns per call; implied S+60 = ${(13e6 / trippedAt).toFixed(0)} bytes if the budget is 13,000,000`);
+      // Speed of the optimised no-op path, for the cost model.
+      const t2 = performance.now();
+      for (let i = 0; i < 1e6; i++) sink += f(0);
+      log(`optimised no-op call: ${((performance.now() - t2)).toFixed(1)} ns each`);
+    }
+    log(`sink ${sink}`);
+  } catch (e) {
+    log('ERROR ' + e + '\n' + (e.stack || ''));
+  }
+  window.__done = true;
+})();
+</script>
