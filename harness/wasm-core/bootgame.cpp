@@ -1464,6 +1464,14 @@ int main(int argc, char** argv)
   bool want_jit_stats = false;
   bool want_idle_skip = true;
   u32 jit_threshold = 16;
+  // --jit-warm: see StateLayout::warm_entry and the dispatcher.
+  bool jit_warm_entry = true;       // blocks carry the warm entry
+  bool jit_warm_install = true;     // every block warmed when installed, up to jit_warm_cap passes
+  int jit_warm_n = 0;               // > 0: a block is warmed fully on its N-th chain start
+  u32 jit_warm_cap = 0;             // passes a block gets at install at most; 0 = all it needs
+  double jit_warm_ratio = 1.4;      // baseline machine-code bytes per wasm byte, assumed at install
+  double jit_warm_hot_ratio = 1.2;  // ... and for a block that started a chain: generous, it is hot
+  u32 jit_warm_budget = 13000000;   // V8's wasm_tiering_budget (15.6)
   bool want_jit_names = false;
   bool want_probe_pad = false;
   bool want_compact = true;
@@ -1934,6 +1942,34 @@ int main(int argc, char** argv)
     }
     else if (std::strncmp(argv[i], "--jit-threshold=", 16) == 0)
       jit_threshold = static_cast<u32>(std::strtoul(argv[i] + 16, nullptr, 0));
+    // --jit-warm=install[+N]|N|check|off: get a block optimised as soon
+    // as it is compiled instead of after thousands of executions
+    // (StateLayout::warm_entry; the dispatcher below). install, the
+    // default: every block of a module when it is installed, up to
+    // --jit-warm-cap=P passes (0, all it needs). N: a block is warmed
+    // fully on the N-th chain that starts at it. check: the entry test
+    // alone, nothing warmed. --jit-warm-ratio=R (install) and
+    // --jit-warm-hot-ratio=R (chain start): the baseline code size
+    // assumed per wasm byte; --jit-warm-budget=B: V8's budget. Together
+    // they set the passes a block takes.
+    else if (std::strncmp(argv[i], "--jit-warm=", 11) == 0)
+    {
+      const char* v = argv[i] + 11;
+      jit_warm_entry = std::strcmp(v, "off") != 0;
+      jit_warm_install = std::strncmp(v, "install", 7) == 0;
+      if (jit_warm_install && v[7] == '+')
+        jit_warm_n = static_cast<int>(std::strtol(v + 8, nullptr, 0));
+      else if (!jit_warm_install && std::strcmp(v, "check") != 0 && std::strcmp(v, "off") != 0)
+        jit_warm_n = static_cast<int>(std::strtol(v, nullptr, 0));
+    }
+    else if (std::strncmp(argv[i], "--jit-warm-cap=", 15) == 0)
+      jit_warm_cap = static_cast<u32>(std::strtoul(argv[i] + 15, nullptr, 0));
+    else if (std::strncmp(argv[i], "--jit-warm-ratio=", 17) == 0)
+      jit_warm_ratio = std::strtod(argv[i] + 17, nullptr);
+    else if (std::strncmp(argv[i], "--jit-warm-hot-ratio=", 21) == 0)
+      jit_warm_hot_ratio = std::strtod(argv[i] + 21, nullptr);
+    else if (std::strncmp(argv[i], "--jit-warm-budget=", 18) == 0)
+      jit_warm_budget = static_cast<u32>(std::strtoul(argv[i] + 18, nullptr, 0));
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -3121,6 +3157,7 @@ int main(int argc, char** argv)
   // separates a publishing or lookup fault from a successor that genuinely
   // was not compiled yet.
   u64 miss_but_cached = 0, miss_total = 0;
+  jit_layout.warm_entry = jit_warm_entry;
   jit_layout.enable_linking = want_link;
   // A hole is only worth reserving because compile_region fills it. Tied
   // to linking because a direct tail call IS the link.
@@ -3275,6 +3312,95 @@ int main(int argc, char** argv)
     std::fill(link_table_phys.begin(), link_table_phys.end(), 0u);
   };
   u64 jit_phys_dispatches = 0;
+
+  // ── warming: the optimising compiler sooner ──
+  //
+  // Chrome compiles a block with its baseline compiler and recompiles it
+  // with the optimising one only once the block has used up a budget of
+  // 13,000,000 machine-code bytes executed, charged at each return or
+  // tail call as the code size up to it. A block of nine guest
+  // instructions is a couple of kilobytes of baseline code, so that is
+  // thousands of executions -- and this game runs forty thousand blocks
+  // a few thousand times each, so most of a fight's time is spent in
+  // baseline code. --wasm-tiering-budget=100000 measured the fight's
+  // window 77 -> 89% and its 30-50 s 119 -> 129%; a player cannot pass
+  // V8 flags.
+  //
+  // Calling a block with a negative state, -K, runs none of it: a loop
+  // around its code goes round K times, and each pass charges the whole
+  // block (StateLayout::warm_entry). One such call spends a block's
+  // budget -- 2.5 ns a pass, so tens of microseconds for a block of a
+  // kilobyte, a hundred for a tiny one -- and V8 recompiles it in the
+  // background (a batch of 27 blocks measured optimised within 6 ms).
+  // Which blocks, measured on the fight (docs/PHASE3-WEBGPU.md): every
+  // block as it is installed, 87% against 78%. Warming only the blocks
+  // a chain starts at -- a slice ended in it or a link missed into it,
+  // which samples blocks by the time spent in them -- was 83% on the
+  // first start, 81.5% on the second; a cap on the passes at install
+  // with the sampled blocks topped up later 83-86%, even though 62% of
+  // the passes go to blocks under 512 bytes of wasm, a third of the
+  // blocks. Breadth and earliness beat picking. Those policies stay
+  // behind --jit-warm=N, --jit-warm=install+N and --jit-warm-cap for
+  // another machine to re-measure.
+  //
+  // V8 does not say how big its code is, so the size is estimated from
+  // the wasm body. Measured on this game's blocks in Chrome 156 (the
+  // calls a block took to trip the budget) and in node's Liftoff: 1.25
+  // to 2.9 bytes per wasm byte, 1.9 in the middle. A block estimated
+  // above its real size gets more passes than it needs (a second trip is
+  // ignored by V8); one estimated below it is not optimised by the
+  // passes alone, and its own runs spend the rest -- so the ratio
+  // assumed errs low, and lower still for a block that is known hot.
+  std::vector<u32> jit_fn_bytes;   // by table index: the block's wasm body size
+  std::vector<u32> jit_warm_done;  // by table index: passes made so far
+  std::vector<u8> jit_warm_seen;   // by table index: chain starts so far, 0xFF once warmed fully
+  u64 jit_warmed = 0, jit_warm_calls = 0, jit_warm_topped = 0, jit_warm_top_calls = 0;
+  double jit_warm_ms = 0.0, jit_warm_top_ms = 0.0;
+  // Blocks and passes at install by wasm body size: <128, <256, ... <8K,
+  // more. Where the warming time goes -- a small block needs the most.
+  u64 jit_warm_hist_n[8] = {}, jit_warm_hist_passes[8] = {};
+  // Passes for a block's whole budget at `ratio` bytes of code per wasm
+  // byte, + V8's charge per check and per function entry (20 + 40).
+  auto warm_passes = [&](int index, double ratio) -> u32 {
+    return static_cast<u32>(jit_warm_budget / (ratio * jit_fn_bytes[index] + 60.0)) + 1;
+  };
+  auto warm_run = [&](int index, u32 passes) {
+    reinterpret_cast<u32 (*)(u32)>(index)(static_cast<u32>(-static_cast<s32>(passes)));
+    jit_warm_done[index] += passes;
+  };
+  // At install: what it needs, or the cap.
+  auto warm_block = [&](int index) {
+    u32 passes = warm_passes(index, jit_warm_ratio);
+    if (jit_warm_cap && passes > jit_warm_cap)
+      passes = jit_warm_cap;
+    else
+      jit_warm_seen[index] = 0xFF;  // fully warmed; nothing to top up
+    {
+      int b = 0;
+      for (u32 edge = 128; b < 7 && jit_fn_bytes[index] >= edge; edge <<= 1)
+        ++b;
+      ++jit_warm_hist_n[b];
+      jit_warm_hist_passes[b] += passes;
+    }
+    const double t0 = JitNow();
+    warm_run(index, passes);
+    jit_warm_ms += JitNow() - t0;
+    ++jit_warmed;
+    jit_warm_calls += passes;
+  };
+  // On the N-th chain start: the rest of the budget, at the hot ratio.
+  auto warm_top_up = [&](int index) {
+    jit_warm_seen[index] = 0xFF;
+    const u32 want = warm_passes(index, jit_warm_hot_ratio);
+    if (jit_warm_done[index] >= want)
+      return;
+    const u32 passes = want - jit_warm_done[index];
+    const double t0 = JitNow();
+    warm_run(index, passes);
+    jit_warm_top_ms += JitNow() - t0;
+    ++jit_warm_topped;
+    jit_warm_top_calls += passes;
+  };
 
   auto compile_region = [&](Tier& tier, u32 seed) {
     // The tier's state, under the names the rest of this lambda uses.
@@ -3515,6 +3641,18 @@ int main(int argc, char** argv)
                         static_cast<int>(pending.size()));
     if (want_jit_stats)
       jit_t_install += JitNow() - t_install0;
+    if (base >= 0)
+    {
+      const size_t end = static_cast<size_t>(base) + pending.size();
+      jit_fn_bytes.resize(end, 0);
+      jit_warm_done.resize(end, 0);
+      jit_warm_seen.resize(end, 0);
+      for (size_t k = 0; k < pending.size(); ++k)
+        jit_fn_bytes[static_cast<size_t>(base) + k] = static_cast<u32>(pending[k].body.size());
+      if (jit_warm_install)
+        for (size_t k = 0; k < pending.size(); ++k)
+          warm_block(base + static_cast<int>(k));
+    }
     ++jit_installs;
     jit_batched += pending.size();
     {
@@ -3731,6 +3869,14 @@ int main(int argc, char** argv)
     BlockFn f = reinterpret_cast<BlockFn>(index);
     if (!entry)
       ++jit_fast_lookups;
+    if (jit_warm_n > 0 && static_cast<size_t>(index) < jit_warm_seen.size())
+    {
+      // A chain starts here. On the N-th time, spend the rest of the
+      // block's budget so that V8 optimises it now (see warm_top_up).
+      u8& seen = jit_warm_seen[index];
+      if (seen != 0xFF && ++seen >= jit_warm_n)
+        warm_top_up(index);
+    }
 
     // Blocks decrement the downcount themselves, so what a chain consumed
     // is simply the difference. No chain ever runs with a non-positive
@@ -4641,6 +4787,23 @@ int main(int argc, char** argv)
         std::printf("  jit       region sizes:");
         for (int k = 0; k < 7; ++k)
           std::printf("  %s=%llu", kLbl[k], static_cast<unsigned long long>(region_hist[k]));
+        std::printf("\n");
+      }
+      if (jit_warm_entry)
+      {
+        std::printf("  jit       warm: %llu blocks warmed at install (cap %u passes, %.2f bytes per "
+                    "wasm byte assumed), %llu passes, %.0f ms; %llu topped up on chain start %d "
+                    "(%.2f assumed), %llu passes, %.0f ms; budget %u\n",
+                    static_cast<unsigned long long>(jit_warmed), jit_warm_cap, jit_warm_ratio,
+                    static_cast<unsigned long long>(jit_warm_calls), jit_warm_ms,
+                    static_cast<unsigned long long>(jit_warm_topped), jit_warm_n, jit_warm_hot_ratio,
+                    static_cast<unsigned long long>(jit_warm_top_calls), jit_warm_top_ms,
+                    jit_warm_budget);
+        static const char* kSz[8] = {"<128", "<256", "<512", "<1K", "<2K", "<4K", "<8K", "8K+"};
+        std::printf("  jit       warm at install by body size (blocks/passes):");
+        for (int b = 0; b < 8; ++b)
+          std::printf("  %s %llu/%lluK", kSz[b], static_cast<unsigned long long>(jit_warm_hist_n[b]),
+                      static_cast<unsigned long long>(jit_warm_hist_passes[b] / 1000));
         std::printf("\n");
       }
       if (want_jit_stats)
