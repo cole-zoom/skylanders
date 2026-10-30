@@ -19,6 +19,8 @@ const logEl = $('log');
 // The boot's first lines are kept whole (they say what loaded and what
 // failed), then a rolling tail.
 const head = [], lines = [];
+// Lines for the server (see the speed readout below): the log, and a speed.
+let readouts = [];
 
 const say = (text, failed = false) => {
   status.textContent = text;
@@ -26,6 +28,7 @@ const say = (text, failed = false) => {
   status.classList.toggle('failed', failed);
 };
 const log = text => {
+  readouts.push(`${new Date().toISOString()} log ${text}`);
   if (head.length < 200) head.push(text);
   else lines.push(text);
   if (lines.length > 400) lines.splice(0, lines.length - 400);
@@ -70,16 +73,17 @@ const readStage = () => {
 // The speed readout: emulated seconds per wall second, over the last second.
 // Every reading is also sent to the server (web/serve.mjs writes them to a
 // file), so a play session leaves a record of where it was slow.
-let lastEmulated = 0, lastWall = 0;
-let readouts = [];
-const sendReadouts = () => {
+let lastEmulated = 0, lastWall = 0, lastCompiles = 0, lastCompileMs = 0;
+// keepalive (a send that outlives the page) only when the page is going:
+// the browser refuses a keepalive body over 64 KB, and the boot's log is more.
+const sendReadouts = (keepalive = false) => {
   if (!readouts.length) return;
-  fetch('readout', { method: 'POST', body: readouts.join('\n') + '\n', keepalive: true })
+  fetch('readout', { method: 'POST', body: readouts.join('\n') + '\n', keepalive })
     .catch(() => {});
   readouts = [];
 };
 setInterval(sendReadouts, 10000);
-addEventListener('pagehide', sendReadouts);
+addEventListener('pagehide', () => sendReadouts(true));
 const hud = () => {
   const stage = readStage();
   if (!stage.startsWith('stepping')) {
@@ -90,13 +94,20 @@ const hud = () => {
     const wall = performance.now() / 1000;
     // A loaded save state moves the emulated clock; that second is skipped.
     const pct = (100 * (emulated - lastEmulated)) / (wall - lastWall);
+    // And what was compiled in that second: a slow second spent compiling
+    // is a stall, not the emulator running slowly.
+    const compiles = Module._harness_compiles?.() ?? 0;
+    const compileMs = Module._harness_compile_ms?.() ?? 0;
     if (lastWall && pct >= 0 && pct < 1000) {
       $('speed').textContent = `${pct.toFixed(0)}%`;
       readouts.push(`${new Date().toISOString()} emulated ${emulated.toFixed(1)} s ` +
-                    `readout ${pct.toFixed(0)}%`);
+                    `readout ${pct.toFixed(0)}% compiled ${compiles - lastCompiles} ` +
+                    `in ${(compileMs - lastCompileMs).toFixed(0)} ms`);
     }
     lastEmulated = emulated;
     lastWall = wall;
+    lastCompiles = compiles;
+    lastCompileMs = compileMs;
   }
 };
 

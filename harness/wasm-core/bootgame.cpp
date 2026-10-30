@@ -434,6 +434,12 @@ volatile double g_harness_emulated_s = 0.0;
 #if defined(__EMSCRIPTEN__)
 EMSCRIPTEN_KEEPALIVE volatile double* harness_emulated_seconds() { return &g_harness_emulated_s; }
 #endif
+// Shaders and pipelines made so far, and the time spent making them, so the
+// page's readout can say whether a slow second was a slow second of compiling.
+#if defined(__EMSCRIPTEN__) && defined(HARNESS_WEBGPU)
+EMSCRIPTEN_KEEPALIVE double harness_compiles() { return WebGPU::g_compiles.load(); }
+EMSCRIPTEN_KEEPALIVE double harness_compile_ms() { return WebGPU::g_compile_us.load() / 1000.0; }
+#endif
 }
 
 // Names from WiimoteEmu.h, Nunchuk.h and ControllerEmu.h. A D-pad direction
