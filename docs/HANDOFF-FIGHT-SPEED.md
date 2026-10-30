@@ -135,7 +135,9 @@ differentials (`run-jitdiff.sh`) and M3 (`harness/wasm-core/run-m3.sh`).
    156) move them out of line: fight 87 → 105%.* ~14 wasm instructions
    per guest access with a dependent table load (PHASE3-WEBGPU.md,
    "Left"). A fastmem-style direct mapping for the common BAT case.
-4. **Guest registers in wasm locals** across a block/region instead of
+4. **Guest registers in wasm locals** *Done: `docs/PHASE3-WEBGPU.md` "Guest
+   registers in locals" -- write-through locals, walking +6, the gate +3,
+   the fight +1.5.* across a block/region instead of
    loads and stores to `PowerPCState` per instruction.
 5. **Dispatcher** (6.5%): `_main_thread`, link table, budget exits. *Done:
    `docs/PHASE3-WEBGPU.md` "The transition: exits to earlier blocks bound as

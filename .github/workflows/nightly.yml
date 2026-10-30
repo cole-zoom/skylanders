@@ -194,4 +194,4 @@ jobs:
         # vectors, the warm entry, the cold branches hinted and the access
         # groups -- the dispatcher's defaults, all meant to be exact. The
         # module is the one the step above built.
-        run: node --max-old-space-size=8192 --expose-gc /tmp/jitdiff.js --compact --short-convert --simd --warm --hints --groups
+        run: node --max-old-space-size=8192 --expose-gc /tmp/jitdiff.js --compact --short-convert --simd --warm --hints --groups --regs

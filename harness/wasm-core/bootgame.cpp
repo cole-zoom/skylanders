@@ -1495,6 +1495,9 @@ int main(int argc, char** argv)
   // other modules, bound as imports at instantiation so they are direct
   // tail calls rather than lookups in the link table (compile_region).
   bool jit_block_imports = true;
+  // --jit-regs=on|off: guest registers kept in wasm locals across a block
+  // (StateLayout::reg_cache).
+  bool jit_reg_cache = true;
   bool want_jit_names = false;
   bool want_probe_pad = false;
   bool want_compact = true;
@@ -2001,6 +2004,8 @@ int main(int argc, char** argv)
       jit_branch_hints = std::strcmp(argv[i] + 12, "off") != 0;
     else if (std::strncmp(argv[i], "--jit-imports=", 14) == 0)
       jit_block_imports = std::strcmp(argv[i] + 14, "off") != 0;
+    else if (std::strncmp(argv[i], "--jit-regs=", 11) == 0)
+      jit_reg_cache = std::strcmp(argv[i] + 11, "off") != 0;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -3153,6 +3158,7 @@ int main(int argc, char** argv)
   }
   jit_layout.mem_groups = jit_mem_groups;
   jit_layout.branch_hints = jit_branch_hints;
+  jit_layout.reg_cache = jit_reg_cache;
 
   // ── the link table ──
   //
@@ -3606,10 +3612,10 @@ int main(int argc, char** argv)
         // call needs the function index of its target, and that is not
         // known until the whole region has been discovered -- the target
         // may be a block this walk has not reached yet.
-        if (r.locals_tail)
+        if (r.groups)
         {
           ++jit_group_blocks;
-          jit_groups += r.locals_tail;
+          jit_groups += r.groups;
         }
         pending.push_back({bpc, r.instructions, stop, {r.succ[0], r.succ[1]}, r.nsucc,
                            std::move(r.body), r.locals, r.locals_i64, r.locals_v128,
@@ -4907,10 +4913,11 @@ int main(int argc, char** argv)
         std::printf("\n");
       }
       std::printf("  jit       mem: %s translation; access groups %s, %llu blocks with %llu groups; "
-                  "branch hints %s\n",
+                  "branch hints %s; registers in locals %s\n",
                   jit_mem_direct ? "direct" : "table", jit_mem_groups ? "on" : "off",
                   static_cast<unsigned long long>(jit_group_blocks),
-                  static_cast<unsigned long long>(jit_groups), jit_branch_hints ? "on" : "off");
+                  static_cast<unsigned long long>(jit_groups), jit_branch_hints ? "on" : "off",
+                  jit_reg_cache ? "on" : "off");
       if (want_jit_stats)
       {
         std::printf("  jit       exits: uncond-b %u  bl %u  cond-taken %u  fallthrough %u\n",

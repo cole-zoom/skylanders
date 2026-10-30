@@ -4,7 +4,7 @@
 // --experimental-wasm-branch-hinting for the hints to count).
 //
 //   g++ -std=c++23 -O0 harness/wasm-core/dumpblock.cpp -o /tmp/dumpblock
-//   /tmp/dumpblock out.wasm [groups] [direct] [hints] [warm] [l1] -- <hex words...>
+//   /tmp/dumpblock out.wasm [groups] [direct] [hints] [warm] [l1] [regs] -- <hex words...>
 //
 // The layout is the dispatcher's shape with made-up addresses: the code is
 // what is being read, not run, so only the offsets' structure matters.
@@ -19,7 +19,7 @@ int main(int argc, char** argv)
 {
   if (argc < 3)
   {
-    std::fprintf(stderr, "usage: dumpblock out.wasm [groups] [direct] [hints] [warm] [l1] -- "
+    std::fprintf(stderr, "usage: dumpblock out.wasm [groups] [direct] [hints] [warm] [l1] [regs] -- "
                          "<hex words...>\n");
     return 2;
   }
@@ -75,6 +75,8 @@ int main(int argc, char** argv)
       L.warm_entry = true;
     else if (std::strcmp(argv[i], "l1") == 0)
       L.l1_cache_base = 0x06000000;
+    else if (std::strcmp(argv[i], "regs") == 0)
+      L.reg_cache = true;
     else
     {
       std::fprintf(stderr, "unknown option %s\n", argv[i]);
