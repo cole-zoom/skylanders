@@ -17,6 +17,7 @@
 // module is a far better error than a subtly wrong one this code "fixed".
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -25,6 +26,14 @@
 namespace ppc2wasm
 {
 using Bytes = std::vector<uint8_t>;
+
+// A branch hint for an `if` or `br_if` at `offset` in a function body:
+// whether its condition is likely true. See ModuleBuilder::AddFunction.
+struct BranchHint
+{
+  uint32_t offset;
+  bool likely;
+};
 
 // LEB128, the variable-length integer encoding wasm uses everywhere.
 inline void PutU32(Bytes& out, uint32_t v)
@@ -332,12 +341,14 @@ public:
   // stack cannot be indexed twice without recomputing.
   void SetFunction(const std::vector<uint8_t>& params, const std::vector<uint8_t>& results,
                    const Bytes& body, const std::string& export_name, uint32_t i32_locals = 0,
-                   uint32_t i64_locals = 0, uint32_t v128_locals = 0)
+                   uint32_t i64_locals = 0, uint32_t v128_locals = 0,
+                   uint32_t tail_i32_locals = 0, std::vector<BranchHint> hints = {})
   {
     m_params = params;
     m_results = results;
     m_funcs.clear();
-    AddFunction(body, export_name, i32_locals, i64_locals, v128_locals);
+    AddFunction(body, export_name, i32_locals, i64_locals, v128_locals, tail_i32_locals,
+                std::move(hints));
   }
 
   // Add one more function to the module, returning its index.
@@ -352,11 +363,24 @@ public:
   // the first i64 local is index N + 1. Floating-point blocks use them for
   // 64-bit register values and byte swaps. v128_locals follow those, for
   // paired singles held as vectors.
+  // tail_i32_locals are i32 locals declared AFTER the v128 ones, so their
+  // indices start at 1 + i32 + i64 + v128: the block compiler's access
+  // groups keep a host base in each (BlockResult::locals_tail), and a
+  // fourth run is what lets them exist without moving the fixed slots
+  // the floating-point and vector forms index by number.
+  //
+  // `hints` are the body's branch hints (BranchHint): the offset of an
+  // `if` or `br_if` opcode within `body`, and whether its condition is
+  // likely true. Build writes them to the "metadata.code.branch_hint"
+  // custom section with the locals declaration's length added, as the
+  // proposal counts offsets from there.
   uint32_t AddFunction(const Bytes& body, const std::string& export_name,
                        uint32_t i32_locals = 0, uint32_t i64_locals = 0,
-                       uint32_t v128_locals = 0)
+                       uint32_t v128_locals = 0, uint32_t tail_i32_locals = 0,
+                       std::vector<BranchHint> hints = {})
   {
-    m_funcs.push_back({body, export_name, i32_locals, i64_locals, v128_locals});
+    m_funcs.push_back({body, export_name, i32_locals, i64_locals, v128_locals, tail_i32_locals,
+                       std::move(hints)});
     return static_cast<uint32_t>(m_funcs.size() - 1);
   }
 
@@ -462,31 +486,90 @@ public:
       PutSection(out, 7, p);
     }
 
+    // The locals declaration a function body starts with: the runs of
+    // i32, i64, v128 and trailing i32 locals.
+    auto locals_decl = [](const Func& f) {
+      Bytes d;
+      const uint32_t groups = (f.locals ? 1u : 0u) + (f.locals_i64 ? 1u : 0u) +
+                              (f.locals_v128 ? 1u : 0u) + (f.locals_tail ? 1u : 0u);
+      PutU32(d, groups);
+      if (f.locals)
+      {
+        PutU32(d, f.locals);  // how many
+        d.push_back(kI32);
+      }
+      if (f.locals_i64)
+      {
+        PutU32(d, f.locals_i64);
+        d.push_back(kI64);
+      }
+      if (f.locals_v128)
+      {
+        PutU32(d, f.locals_v128);
+        d.push_back(kV128);
+      }
+      if (f.locals_tail)
+      {
+        PutU32(d, f.locals_tail);
+        d.push_back(kI32);
+      }
+      return d;
+    };
+
+    // Branch hints (the branch-hinting proposal, decoded by V8 without a
+    // flag): a custom section "metadata.code.branch_hint" that must come
+    // before the code section. Per function with hints, in index order:
+    // the function index, then each hint as the opcode's byte offset from
+    // the start of the locals declaration, a size of 1, and 0 (likely
+    // false) or 1 (likely true). Offsets must increase strictly, so they
+    // are sorted and a repeated offset keeps its first hint. V8 ignores a
+    // malformed section silently; harness/wasm-core/jit-asm.mjs shows
+    // whether the cold code moved.
+    {
+      Bytes p;
+      uint32_t count = 0;
+      for (size_t i = 0; i < m_funcs.size(); ++i)
+      {
+        const Func& f = m_funcs[i];
+        if (f.hints.empty())
+          continue;
+        std::vector<BranchHint> hints = f.hints;
+        std::sort(hints.begin(), hints.end(),
+                  [](const BranchHint& a, const BranchHint& b) { return a.offset < b.offset; });
+        Bytes h;
+        uint32_t n = 0;
+        const uint32_t base = static_cast<uint32_t>(locals_decl(f).size());
+        for (size_t k = 0; k < hints.size(); ++k)
+        {
+          if (k && hints[k].offset == hints[k - 1].offset)
+            continue;
+          PutU32(h, base + hints[k].offset);
+          PutU32(h, 1);
+          h.push_back(hints[k].likely ? 1 : 0);
+          ++n;
+        }
+        PutU32(p, static_cast<uint32_t>(m_func_imports.size() + i));
+        PutU32(p, n);
+        PutBytes(p, h);
+        ++count;
+      }
+      if (count)
+      {
+        Bytes s;
+        PutName(s, "metadata.code.branch_hint");
+        PutU32(s, count);
+        PutBytes(s, p);
+        PutSection(out, 0, s);
+      }
+    }
+
     // Code section.
     {
       Bytes p;
       PutU32(p, static_cast<uint32_t>(m_funcs.size()));
       for (const Func& f : m_funcs)
       {
-        Bytes body;
-        const uint32_t groups =
-            (f.locals ? 1u : 0u) + (f.locals_i64 ? 1u : 0u) + (f.locals_v128 ? 1u : 0u);
-        PutU32(body, groups);
-        if (f.locals)
-        {
-          PutU32(body, f.locals);  // how many
-          body.push_back(kI32);
-        }
-        if (f.locals_i64)
-        {
-          PutU32(body, f.locals_i64);
-          body.push_back(kI64);
-        }
-        if (f.locals_v128)
-        {
-          PutU32(body, f.locals_v128);
-          body.push_back(kV128);
-        }
+        Bytes body = locals_decl(f);
         PutBytes(body, f.body);
         body.push_back(kEnd);
 
@@ -536,6 +619,8 @@ private:
     uint32_t locals = 0;
     uint32_t locals_i64 = 0;
     uint32_t locals_v128 = 0;
+    uint32_t locals_tail = 0;
+    std::vector<BranchHint> hints;
     std::string debug_name;
   };
 

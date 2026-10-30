@@ -18,6 +18,7 @@
 // to make well once the simple case is measured.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -66,6 +67,13 @@ struct BlockResult
   uint32_t end_pc;        // where the interpreter should resume
   const char* stopped_on; // why the block ended, for diagnostics
 
+  // i32 locals declared after the v128 ones, one per access group
+  // (StateLayout::mem_groups); their indices start at 1 + locals +
+  // locals_i64 + locals_v128.
+  uint32_t locals_tail = 0;
+  // Branch hints for `body` (StateLayout::branch_hints): every bail,
+  // miss and hatch branch marked unlikely, for ModuleBuilder::AddFunction.
+  std::vector<BranchHint> hints;
   // Where control can go from here, when that is knowable at compile time.
   //
   // This is what lets a caller compile a REGION: follow the successors,
@@ -174,6 +182,51 @@ struct StateLayout
   // Zero keeps the MEM1-only guard, which the existing differentials were
   // written against.
   uint32_t region_table = 0;
+  // ── the same map, computed instead of loaded ──
+  //
+  // When direct_base is non-zero an access does not read the region
+  // table: the address is tested arithmetically -- the top bit as the tier
+  // wants it (set with translation on, clear along with bit 30 with it
+  // off), and bit (ea >> 25) & 31 of direct_mask set, which picks the 32 MB
+  // granules that are RAM: 0x301 is MEM1 and the two halves of MEM2 in
+  // either mirror -- and the host address is direct_base + (ea &
+  // 0x03FFFFFF), plus direct_mem2_delta when bit 28 is set (MEM2's host
+  // buffer against MEM1's). Everything the table refused is refused here
+  // too, through the same miss path.
+  //
+  // The table's one load sat on the address path of every access: ea ->
+  // index -> entry -> host address -> the data. Measured from a hot
+  // block's machine code, the table costs six instructions plus that
+  // dependent load; this costs about nine and no load. Which is faster is
+  // a measurement, not an argument, so both stay.
+  uint32_t direct_base = 0;
+  uint32_t direct_mem2_delta = 0;
+  uint32_t direct_mask = 0x301;
+  bool direct_physical = false;
+  // ── access groups ──
+  //
+  // When set, a block's displacement-form accesses through one base
+  // register share one translation. The first (the leader) translates as
+  // usual and, when the whole span the group touches lies in the same RAM
+  // granule, parks the host address of its lowest member in a local; each
+  // later member adds its offset to that local instead of translating,
+  // and falls back to its own translation when the leader left zero. A
+  // write to the base register ends the group, except an update form or
+  // an addi to itself, whose constant is folded into the members' offsets.
+  // Exact by construction: a member only takes the short path when the
+  // leader proved its address is RAM in the same granule.
+  bool mem_groups = false;
+  // ── branch hints ──
+  //
+  // When set, every branch to a bail, a translation miss, a hatch or an
+  // exit is marked unlikely in the module's "metadata.code.branch_hint"
+  // section (BlockResult::hints), which TurboFan honours: the cold code
+  // goes to the end of the function, the hot path becomes contiguous,
+  // and spills move into the cold blocks. The code is the same; only its
+  // layout changes. A measurement that adds a never-taken copy of each
+  // miss path to every access (probe_cold_pad) costs a seventh of the
+  // speed, which is what this is for.
+  bool branch_hints = false;
   uint32_t xer_ca_offset = 0;    // offsetof(PowerPCState, xer_ca)
   uint32_t xer_stringctrl_offset = 0;  // offsetof(PowerPCState, xer_stringctrl)
   // Floating point. ps[] is 32 PairedSingle of two u64 each (ps0 at +0,
@@ -561,6 +614,48 @@ inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
   PutU32(b, l.gpr_offset + n * 4);
 }
 
+// ── branch hints (StateLayout::branch_hints) ──
+//
+// The emitters write into whatever buffer they are handed and know nothing
+// of the block, so the hints go through a sink CompileBlockFetch installs
+// for the duration of a compile: the body being built and the list to
+// append to. A hint is recorded only for the buffer that is the body, so an
+// emitter writing into a scratch buffer records nothing (there is none
+// today; the check is what makes that safe). Call just BEFORE pushing the
+// `if` or `br_if` opcode: the hint names the opcode's offset.
+inline thread_local std::vector<BranchHint>* g_hint_sink = nullptr;
+inline thread_local const Bytes* g_hint_body = nullptr;
+
+inline void HintUnlikely(const Bytes& b)
+{
+  if (g_hint_sink && &b == g_hint_body)
+    g_hint_sink->push_back({static_cast<uint32_t>(b.size()), false});
+}
+
+inline void HintLikely(const Bytes& b)
+{
+  if (g_hint_sink && &b == g_hint_body)
+    g_hint_sink->push_back({static_cast<uint32_t>(b.size()), true});
+}
+
+// Installs the sink for one compile and removes it on the way out.
+struct HintScope
+{
+  std::vector<BranchHint>* prev_sink;
+  const Bytes* prev_body;
+  HintScope(std::vector<BranchHint>* sink, const Bytes* body)
+      : prev_sink(g_hint_sink), prev_body(g_hint_body)
+  {
+    g_hint_sink = sink;
+    g_hint_body = body;
+  }
+  ~HintScope()
+  {
+    g_hint_sink = prev_sink;
+    g_hint_body = prev_body;
+  }
+};
+
 // The body of a refusal, assuming an `if` is already open.
 inline void EmitBailBody(Bytes& b, const StateLayout& l, uint32_t bail_pc, uint32_t insts_before)
 {
@@ -617,6 +712,7 @@ inline void EmitGuard(Bytes& b, const StateLayout& l, uint32_t ea_local, uint32_
   b.push_back(kI32Const);
   PutI32(b, static_cast<int32_t>(l.guard_value));
   b.push_back(kI32Ne);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBailBody(b, l, bail_pc, insts_before);
@@ -677,6 +773,7 @@ inline void EmitIsMmio(Bytes& b, uint32_t ea_local)
 // helper's result (on the stack) is non-zero.
 inline void EmitSlowExit(Bytes& b, const StateLayout& l)
 {
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   b.push_back(kI32Const);
@@ -714,6 +811,7 @@ inline void EmitHatchCall(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t
   PutI32(b, static_cast<int32_t>(pc));
   b.push_back(kCall);
   PutU32(b, 0);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   if (l.enable_linking)
@@ -839,6 +937,7 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
     b.push_back(kI32Const);
     PutI32(b, static_cast<int32_t>(l.guard_value));
     b.push_back(kI32Ne);
+    HintUnlikely(b);
     b.push_back(kIf);
     b.push_back(kVoid);
     emit_gather_pipe();
@@ -857,26 +956,11 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
     EmitToHostAddress(b, l, ea_local);
     return;
   }
-  // base = table[ea >> 25]
-  b.push_back(kLocalGet);
-  PutU32(b, ea_local);
-  b.push_back(kI32Const);
-  PutI32(b, 25);
-  b.push_back(kI32ShrU);
-  b.push_back(kI32Const);
-  PutI32(b, 2);
-  b.push_back(kI32Shl);
-  b.push_back(kI32Const);
-  PutI32(b, static_cast<int32_t>(l.region_table));
-  b.push_back(kI32Add);
-  b.push_back(kI32Load);
-  PutU32(b, 2);
-  PutU32(b, 0);
-  b.push_back(kLocalTee);
-  PutU32(b, scratch_local);
-  b.push_back(kI32Eqz);
-  b.push_back(kIf);
-  b.push_back(kVoid);
+  // The miss path, written once for both ways of finding the granule.
+  // It runs inside one construct (the table's `if`, or the direct path's
+  // outer block), so its branch depths are the same either way: the
+  // locked cache sets the base and leaves for the tail, the rest leaves
+  // the instruction or the block.
   auto emit_miss = [&]() {
   if (l.l1_cache_base)
   {
@@ -937,15 +1021,91 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
   }
   EmitBailBody(b, l, bail_pc, insts_before);
   };
-  emit_miss();
-  b.push_back(kEnd);
-  // ea = base + (ea & 0x01FFFFFF)
+  if (l.direct_base)
+  {
+    // block; block; <wrong half> br_if 0; <not a RAM granule> br_if 0;
+    // scratch = bit 28 ? base + delta : base; br 1; end; <miss>; end.
+    b.push_back(kBlock);
+    b.push_back(kVoid);
+    b.push_back(kBlock);
+    b.push_back(kVoid);
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, l.direct_physical ? 0x40000000 : 0);
+    b.push_back(l.direct_physical ? kI32GeU : kI32GeS);
+    HintUnlikely(b);
+    b.push_back(kBrIf);
+    PutU32(b, 0);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.direct_mask));
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, 25);
+    b.push_back(kI32ShrU);
+    b.push_back(kI32ShrU);  // the count is taken mod 32: bits 25-29
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32And);
+    b.push_back(kI32Eqz);
+    HintUnlikely(b);
+    b.push_back(kBrIf);
+    PutU32(b, 0);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.direct_base + l.direct_mem2_delta));
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.direct_base));
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, 0x10000000);
+    b.push_back(kI32And);
+    b.push_back(kSelect);
+    b.push_back(kLocalSet);
+    PutU32(b, scratch_local);
+    b.push_back(kBr);
+    PutU32(b, 1);
+    b.push_back(kEnd);
+    emit_miss();
+    b.push_back(kEnd);
+  }
+  else
+  {
+    // base = table[ea >> 25]
+    b.push_back(kLocalGet);
+    PutU32(b, ea_local);
+    b.push_back(kI32Const);
+    PutI32(b, 25);
+    b.push_back(kI32ShrU);
+    b.push_back(kI32Const);
+    PutI32(b, 2);
+    b.push_back(kI32Shl);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.region_table));
+    b.push_back(kI32Add);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, 0);
+    b.push_back(kLocalTee);
+    PutU32(b, scratch_local);
+    b.push_back(kI32Eqz);
+    HintUnlikely(b);
+    b.push_back(kIf);
+    b.push_back(kVoid);
+    emit_miss();
+    b.push_back(kEnd);
+  }
+  // ea = base + (ea & mask). The table's granules are 32 MB and MEM2's
+  // second half has its own entry; the direct base is MEM2's start, so
+  // its offset keeps bit 25 (clear in any address that reached here
+  // through MEM1's granule, or the locked cache's).
   b.push_back(kLocalGet);
   PutU32(b, scratch_local);
   b.push_back(kLocalGet);
   PutU32(b, ea_local);
   b.push_back(kI32Const);
-  PutI32(b, 0x01FFFFFF);
+  PutI32(b, l.direct_base ? 0x03FFFFFF : 0x01FFFFFF);
   b.push_back(kI32And);
   b.push_back(kI32Add);
   b.push_back(kLocalSet);
@@ -964,6 +1124,188 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
     emit_miss();
     b.push_back(kEnd);
   }
+}
+
+// ── access groups (StateLayout::mem_groups) ──
+//
+// The role the second compile pass gives a displacement-form access. The
+// leader is the group's first access: it translates as usual, then sets the
+// group's local to the host address of the group's LOWEST address when the
+// span [lowest, highest] lies in one RAM granule, and to zero otherwise. A
+// member reads the local: non-zero, its host address is local + k with no
+// translation; zero, it translates on its own, exactly as without groups.
+struct MemRole
+{
+  enum Kind : uint8_t
+  {
+    kNone,
+    kLeader,
+    kMember
+  };
+  Kind kind = kNone;
+  uint32_t local = 0;  // the group's host-base local
+  // The access's address minus the group's lowest, as a displacement: the
+  // base register's value is the same for every member once the constants
+  // the group folded (update forms, addi to itself) are counted in.
+  int32_t k = 0;
+  uint32_t span = 0;  // leader only: highest minus lowest
+};
+
+struct MemPlan
+{
+  std::vector<MemRole> roles;  // by instruction, in block order
+  uint32_t groups = 0;
+  // The first pass's local counts, which fix where the group locals start.
+  uint32_t locals = 0, locals_i64 = 0, locals_v128 = 0;
+};
+
+// What the first pass records per instruction, for the plan.
+struct MemScanEntry
+{
+  uint32_t ins = 0;
+  bool access = false;  // a displacement-form access this compiler translates
+  uint32_t ra = 0;
+  int32_t disp = 0;
+  bool update = false;
+};
+
+// After a leader's translation: local 1 holds the host address, the guest
+// address is `guest` (a local) or recomputed from the base register, and
+// scratch local 2 holds the granule's base (the locked cache's base on that
+// path, which a group must not span: it is 256 KB, not 32 MB). Sets the
+// group's local to host - k when lowest and highest share a granule, else 0.
+inline void EmitOpenGroup(Bytes& b, const StateLayout& l, const MemRole& role, uint32_t ra,
+                          int32_t disp, int guest_local)
+{
+  auto push_guest = [&]() {
+    if (guest_local >= 0)
+    {
+      b.push_back(kLocalGet);
+      PutU32(b, static_cast<uint32_t>(guest_local));
+      return;
+    }
+    LoadGprOrZero(b, l, ra);
+    if (disp)
+    {
+      b.push_back(kI32Const);
+      PutI32(b, disp);
+      b.push_back(kI32Add);
+    }
+  };
+  // host - k
+  b.push_back(kLocalGet);
+  PutU32(b, 1);
+  if (role.k)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, role.k);
+    b.push_back(kI32Sub);
+  }
+  const bool test_span = role.span != 0;
+  const bool test_l1 = l.l1_cache_base != 0;
+  if (!test_span && !test_l1)
+  {
+    b.push_back(kLocalSet);
+    PutU32(b, role.local);
+    return;
+  }
+  b.push_back(kI32Const);
+  PutI32(b, 0);
+  if (test_span)
+  {
+    // ((lowest ^ (lowest + span)) & 0xFE000000) == 0
+    push_guest();
+    if (role.k)
+    {
+      b.push_back(kI32Const);
+      PutI32(b, role.k);
+      b.push_back(kI32Sub);
+    }
+    b.push_back(kLocalTee);
+    PutU32(b, role.local);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(role.span));
+    b.push_back(kI32Add);
+    b.push_back(kLocalGet);
+    PutU32(b, role.local);
+    b.push_back(kI32Xor);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(0xFE000000u));
+    b.push_back(kI32And);
+    b.push_back(kI32Eqz);
+  }
+  if (test_l1)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 2);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(l.l1_cache_base));
+    b.push_back(kI32Ne);
+    if (test_span)
+      b.push_back(kI32And);
+  }
+  b.push_back(kSelect);
+  b.push_back(kLocalSet);
+  PutU32(b, role.local);
+}
+
+// A member's short path: `if (local) { local 1 = local + k; [guest address
+// into local 3 for an update form; the alignment bail of a float form]
+// } else`. Returns after emitting the `else`; the caller emits its usual
+// address computation and translation (with one more level of nesting for
+// the translation's branches) and then the `end`. A leader zeroes its
+// local first, so a translation that leaves the instruction another way
+// leaves it closed.
+inline void BeginMemberPath(Bytes& b, const StateLayout& l, const MemRole& role, uint32_t ra,
+                            int32_t disp, bool update, bool align4 = false, uint32_t bail_pc = 0,
+                            uint32_t insts_before = 0)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, role.local);
+  HintLikely(b);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  if (update)
+  {
+    LoadGprOrZero(b, l, ra);
+    if (disp)
+    {
+      b.push_back(kI32Const);
+      PutI32(b, disp);
+      b.push_back(kI32Add);
+    }
+    b.push_back(kLocalSet);
+    PutU32(b, 3);
+  }
+  b.push_back(kLocalGet);
+  PutU32(b, role.local);
+  if (role.k)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, role.k);
+    b.push_back(kI32Add);
+  }
+  if (align4)
+  {
+    // Guest RAM's host buffer is page-aligned, so the host address has the
+    // guest address's low bits.
+    b.push_back(kLocalTee);
+    PutU32(b, 1);
+    b.push_back(kI32Const);
+    PutI32(b, 3);
+    b.push_back(kI32And);
+    HintUnlikely(b);
+    b.push_back(kIf);
+    b.push_back(kVoid);
+    EmitBailBody(b, l, bail_pc, insts_before);
+    b.push_back(kEnd);
+  }
+  else
+  {
+    b.push_back(kLocalSet);
+    PutU32(b, 1);
+  }
+  b.push_back(kElse);
 }
 
 // Compute the effective address of a d(rA) operand into ea_local.
@@ -1590,6 +1932,7 @@ inline void EmitStaticExit(Bytes& b, const StateLayout& l, uint32_t target,
   b.push_back(kI32Const);
   PutI32(b, 0);
   b.push_back(kI32LeS);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBumpStatBy(b, l, 2, 1);  // budget exhausted
@@ -1654,6 +1997,7 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
   b.push_back(kI32Const);
   PutI32(b, 0);
   b.push_back(kI32LeS);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBumpStat(b, l, 2);  // budget exhausted
@@ -1693,6 +2037,7 @@ inline void EmitLinkEpilogue(Bytes& b, const StateLayout& l)
   b.push_back(kLocalGet);
   PutU32(b, 4);
   b.push_back(kI32Eq);
+  HintLikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBumpStat(b, l, 0);  // hit
@@ -1862,6 +2207,7 @@ inline void EmitConvertToDoubleShort(Bytes& b, uint32_t local)
   b.push_back(kI32Const);
   PutI32(b, 0x7F800000);
   b.push_back(kI32Eq);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kI64);
   EmitConvertToDouble(b, local);
@@ -1899,6 +2245,7 @@ inline void EmitConvertToSingleShort(Bytes& b, uint32_t local)
   PutI64(b, 0x7FF0000000000000ll);
   b.push_back(kI64Eq);
   b.push_back(kI32Or);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kI32);
   EmitConvertToSingle(b, local);
@@ -1938,6 +2285,7 @@ inline void EmitConvertToDouble(Bytes& b, uint32_t local)
   PutI32(b, 0);
   b.push_back(kI32Ne);
   b.push_back(kI32And);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kI64);
   {
@@ -2175,6 +2523,7 @@ inline void EmitFpAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
   PutI32(b, 1 << 13);
   b.push_back(kI32And);
   b.push_back(kI32Eqz);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBailBody(b, l, bail_pc, insts_before);
@@ -2197,6 +2546,7 @@ inline void EmitPseAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
   PutI32(b, 1 << 29);
   b.push_back(kI32And);
   b.push_back(kI32Eqz);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBailBody(b, l, bail_pc, insts_before);
@@ -2215,10 +2565,21 @@ inline void EmitPseAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
 inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t insts_before,
                         uint32_t ra, uint32_t rb, int32_t disp, bool indexed, uint32_t freg,
                         bool is_double, bool is_store, bool update, bool as_integer,
-                        uint32_t ins = 0)
+                        uint32_t ins = 0, const MemRole* role = nullptr)
 {
   b.push_back(kBlock);
   b.push_back(kVoid);
+  const bool member = role && role->kind == MemRole::kMember;
+  const bool leader = role && role->kind == MemRole::kLeader;
+  if (member)
+    BeginMemberPath(b, l, *role, ra, disp, update, true, this_pc, insts_before);
+  if (leader)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, 0);
+    b.push_back(kLocalSet);
+    PutU32(b, role->local);
+  }
   LoadGprOrZero(b, l, ra);
   if (indexed)
   {
@@ -2283,7 +2644,12 @@ inline void EmitFpMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32
       PutU32(bb, 0);
     };
   }
-  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, 0, gp.size ? &gp : nullptr);
+  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, member ? 1 : 0,
+                gp.size ? &gp : nullptr);
+  if (leader)
+    EmitOpenGroup(b, l, *role, ra, disp, update ? 3 : -1);
+  if (member)
+    b.push_back(kEnd);
 
   if (is_store)
   {
@@ -2461,6 +2827,7 @@ inline void EmitConvertToSingleFTZ(Bytes& b, uint32_t local)
   b.push_back(kI64And);
   b.push_back(kI64Eqz);
   b.push_back(kI32Or);
+  HintLikely(b);
   b.push_back(kIf);
   b.push_back(kI32);
   {
@@ -2513,6 +2880,7 @@ inline void EmitLsqeAvailable(Bytes& b, const StateLayout& l, uint32_t bail_pc,
   PutI32(b, static_cast<int32_t>(1u << 31));
   b.push_back(kI32And);
   b.push_back(kI32Eqz);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitBailBody(b, l, bail_pc, insts_before);
@@ -2689,7 +3057,8 @@ inline bool PsqInline(const StateLayout& l, uint32_t gqr_index, bool is_store)
 // update form, 5 scratch for the conversions, 9 the i64 scratch.
 inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t insts_before,
                     uint32_t ra, uint32_t rb, int32_t disp, bool indexed, uint32_t freg,
-                    uint32_t gqr_index, bool w, bool is_store, bool update, uint32_t ins)
+                    uint32_t gqr_index, bool w, bool is_store, bool update, uint32_t ins,
+                    const MemRole* role = nullptr)
 {
   const uint32_t gqr = l.gqr_values[gqr_index];
   const uint32_t type = is_store ? (gqr & 7) : ((gqr >> 16) & 7);
@@ -2711,6 +3080,35 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
 
   b.push_back(kBlock);
   b.push_back(kVoid);
+  // The guard: the GQR must still hold the value this code was built for.
+  // First, before the address: it decides the whole instruction, and a
+  // group member's short path must be guarded the same.
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.spr_offset + (912 + gqr_index) * 4);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(gqr));
+  b.push_back(kI32Ne);
+  HintUnlikely(b);
+  b.push_back(kIf);
+  b.push_back(kVoid);
+  EmitHatchCall(b, l, ins, this_pc, insts_before);
+  b.push_back(kBr);
+  PutU32(b, 1);
+  b.push_back(kEnd);
+  const bool member = role && role->kind == MemRole::kMember;
+  const bool leader = role && role->kind == MemRole::kLeader;
+  if (member)
+    BeginMemberPath(b, l, *role, ra, disp, update);
+  if (leader)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, 0);
+    b.push_back(kLocalSet);
+    PutU32(b, role->local);
+  }
   LoadGprOrZero(b, l, ra);
   if (indexed)
   {
@@ -2732,22 +3130,11 @@ inline void EmitPsq(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t i
     b.push_back(kLocalSet);
     PutU32(b, 3);
   }
-  // The guard: the GQR must still hold the value this code was built for.
-  b.push_back(kLocalGet);
-  PutU32(b, 0);
-  b.push_back(kI32Load);
-  PutU32(b, 2);
-  PutU32(b, l.spr_offset + (912 + gqr_index) * 4);
-  b.push_back(kI32Const);
-  PutI32(b, static_cast<int32_t>(gqr));
-  b.push_back(kI32Ne);
-  b.push_back(kIf);
-  b.push_back(kVoid);
-  EmitHatchCall(b, l, ins, this_pc, insts_before);
-  b.push_back(kBr);
-  PutU32(b, 1);
-  b.push_back(kEnd);
-  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, 0);
+  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, member ? 1 : 0);
+  if (leader)
+    EmitOpenGroup(b, l, *role, ra, disp, update ? 3 : -1);
+  if (member)
+    b.push_back(kEnd);
 
   // The float load's conversion, one half at a time (and ps1 = 1.0 for W):
   // the scalar form, and the vector form's fallback for an infinity or a
@@ -3100,6 +3487,7 @@ inline void EmitFcmp(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc,
     b.push_back(kI64GtU);
   }
   b.push_back(kI32Or);
+  HintUnlikely(b);
   b.push_back(kIf);
   b.push_back(kVoid);
   EmitHatchCall(b, l, ins, pc, insts_before);
@@ -3933,12 +4321,24 @@ inline void EmitLoadStoreMultiple(Bytes& b, const StateLayout& l, uint32_t this_
 // update form.
 inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t insts_before,
                       uint32_t ra, uint32_t rb, int32_t disp, bool indexed, uint32_t reg,
-                      int size, bool is_store, bool sign_extend, bool update, uint32_t ins = 0)
+                      int size, bool is_store, bool sign_extend, bool update, uint32_t ins = 0,
+                      const MemRole* role = nullptr)
 {
   // Everything after the address computation sits in a block, so that a
   // translation miss handled by the interpreter can skip it.
   b.push_back(kBlock);
   b.push_back(kVoid);
+  const bool member = role && role->kind == MemRole::kMember;
+  const bool leader = role && role->kind == MemRole::kLeader;
+  if (member)
+    BeginMemberPath(b, l, *role, ra, disp, update);
+  if (leader)
+  {
+    b.push_back(kI32Const);
+    PutI32(b, 0);
+    b.push_back(kLocalSet);
+    PutU32(b, role->local);
+  }
   // Effective address.
   LoadGprOrZero(b, l, ra);
   if (indexed)
@@ -4023,7 +4423,12 @@ inline void EmitMemOp(Bytes& b, const StateLayout& l, uint32_t this_pc, uint32_t
 
   // Local 2 is the value, which is not loaded until after translation, so
   // it is free to hold the table entry here.
-  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, 0, gp.size ? &gp : nullptr);
+  EmitTranslate(b, l, 1, 2, this_pc, insts_before, ins, member ? 1 : 0,
+                gp.size ? &gp : nullptr);
+  if (leader)
+    EmitOpenGroup(b, l, *role, ra, disp, update ? 3 : -1);
+  if (member)
+    b.push_back(kEnd);
 
   if (is_store)
   {
@@ -4165,6 +4570,208 @@ inline bool IdleClassify(uint32_t ins, uint32_t* in, uint32_t* out)
     return false;  // stores, branches, everything not listed
   }
 }
+
+// Which general-purpose registers an instruction may write, as a bitmask,
+// for the access groups: a group through a register ends where the
+// register is written (BuildMemPlan). Returns false when the answer is not
+// known here, which ends every group -- conservative, never wrong. Covers
+// what the translator emits and what it hands the interpreter alike: a
+// hatched instruction writes its registers just the same.
+inline bool GprWrites(uint32_t ins, uint32_t* out)
+{
+  *out = 0;
+  const auto reg = [](uint32_t r) { return 1u << r; };
+  const uint32_t op = Opcode(ins);
+  switch (op)
+  {
+  case 3:             // twi
+  case 10: case 11:   // cmpli, cmpi
+  case 16: case 18:   // bc, b
+  case 17:            // sc
+  case 19:            // bclr, bcctr, the CR ops, isync, rfi, mcrf
+  case 36: case 38: case 44:  // stw, stb, sth
+  case 47:            // stmw
+  case 48: case 50: case 52: case 54:  // lfs, lfd, stfs, stfd
+  case 56: case 60:   // psq_l, psq_st
+  case 59: case 63:   // floating point
+    return true;
+  case 7: case 8: case 12: case 13: case 14: case 15:  // mulli, subfic, addic, addic., addi, addis
+  case 32: case 34: case 40: case 42:                  // lwz, lbz, lhz, lha
+    *out = reg(RS(ins));
+    return true;
+  case 33: case 35: case 41: case 43:  // lwzu, lbzu, lhzu, lhau
+    *out = reg(RS(ins)) | reg(RA(ins));
+    return true;
+  case 20: case 21: case 23:                             // rlwimi, rlwinm, rlwnm
+  case 24: case 25: case 26: case 27: case 28: case 29:  // ori, oris, xori, xoris, andi., andis.
+  case 37: case 39: case 45:                             // stwu, stbu, sthu
+  case 49: case 51: case 53: case 55:                    // lfsu, lfdu, stfsu, stfdu
+  case 57: case 61:                                      // psq_lu, psq_stu
+    *out = reg(RA(ins));
+    return true;
+  case 46:  // lmw: rD through r31
+    *out = ~0u << RS(ins);
+    return true;
+  case 4:
+  {
+    // Paired singles write no GPR, except the indexed quantized update
+    // forms; the six-bit field sits above the Rc bit.
+    const uint32_t sub = (ins >> 1) & 0x3F;
+    if (sub == 38 || sub == 39)  // psq_lux, psq_stux
+      *out = reg(RA(ins));
+    return true;
+  }
+  case 31:
+  {
+    const uint32_t xo = XO(ins);
+    switch (xo & 0x1FF)  // the OE bit changes nothing about what is written
+    {
+    case 266: case 10: case 138: case 234: case 202:  // add, addc, adde, addme, addze
+    case 40: case 8: case 136: case 232: case 200:    // subf, subfc, subfe, subfme, subfze
+    case 104: case 235: case 75: case 11:             // neg, mullw, mulhw, mulhwu
+    case 491: case 459:                               // divw, divwu
+      *out = reg(RS(ins));
+      return true;
+    default:
+      break;
+    }
+    switch (xo)
+    {
+    case 23: case 87: case 279: case 343:  // lwzx, lbzx, lhzx, lhax
+    case 534: case 790: case 20:           // lwbrx, lhbrx, lwarx
+    case 339: case 371: case 19: case 83:  // mfspr, mftb, mfcr, mfmsr
+    case 595: case 659:                    // mfsr, mfsrin
+      *out = reg(RS(ins));
+      return true;
+    case 55: case 119: case 311: case 375:  // lwzux, lbzux, lhzux, lhaux
+      *out = reg(RS(ins)) | reg(RA(ins));
+      return true;
+    case 183: case 247: case 439:            // stwux, stbux, sthux
+    case 567: case 631: case 695: case 759:  // lfsux, lfdux, stfsux, stfdux
+    case 28: case 60: case 444: case 412:    // and, andc, or, orc
+    case 316: case 476: case 124: case 284:  // xor, nand, nor, eqv
+    case 24: case 536: case 792: case 824:   // slw, srw, sraw, srawi
+    case 26: case 954: case 922:             // cntlzw, extsb, extsh
+      *out = reg(RA(ins));
+      return true;
+    case 151: case 215: case 407: case 662: case 918: case 150:  // stwx, stbx, sthx, stwbrx, sthbrx, stwcx.
+    case 535: case 599: case 663: case 727: case 983:            // lfsx, lfdx, stfsx, stfdx, stfiwx
+    case 0: case 32: case 4:                                     // cmp, cmpl, tw
+    case 54: case 86: case 278: case 246: case 470: case 1014:   // dcbst, dcbf, dcbt, dcbtst, dcbi, dcbz
+    case 982: case 598: case 854:                                // icbi, sync, eieio
+    case 467: case 144: case 146: case 210: case 242:            // mtspr, mtcrf, mtmsr, mtsr, mtsrin
+    case 306: case 566: case 512:                                // tlbie, tlbsync, mcrxr
+      return true;
+    default:
+      return false;  // the string forms, anything else
+    }
+  }
+  default:
+    return false;
+  }
+}
+
+// The most groups a block carries; each costs a local.
+constexpr uint32_t kMaxMemGroups = 4;
+
+// From the first pass's record of a block, which accesses share a
+// translation (StateLayout::mem_groups). A group is the displacement-form
+// accesses through one base register, in order, until the register is
+// written -- except by one of its own update forms or an addi to itself,
+// whose constant every later member's displacement absorbs. Groups of one
+// are not groups. The result's roles are indexed like `scan`.
+inline MemPlan BuildMemPlan(const std::vector<MemScanEntry>& scan, uint32_t locals,
+                            uint32_t locals_i64, uint32_t locals_v128)
+{
+  MemPlan plan;
+  plan.locals = locals;
+  plan.locals_i64 = locals_i64;
+  plan.locals_v128 = locals_v128;
+  struct Open
+  {
+    bool open = false;
+    int32_t adjust = 0;  // the base register now, relative to the leader's
+    std::vector<std::pair<uint32_t, int32_t>> members;  // instruction index, displacement
+  };
+  Open open[32];
+  std::vector<std::vector<std::pair<uint32_t, int32_t>>> groups;
+  auto close = [&](uint32_t r) {
+    if (!open[r].open)
+      return;
+    if (open[r].members.size() >= 2)
+      groups.push_back(std::move(open[r].members));
+    open[r] = Open{};
+  };
+  for (uint32_t i = 0; i < scan.size(); ++i)
+  {
+    const MemScanEntry& e = scan[i];
+    if (e.access)
+    {
+      Open& o = open[e.ra];
+      o.open = true;
+      o.members.push_back({i, e.disp + o.adjust});
+    }
+    uint32_t w = 0;
+    if (!GprWrites(e.ins, &w))
+    {
+      for (uint32_t r = 0; r < 32; ++r)
+        close(r);
+      continue;
+    }
+    const uint32_t op = Opcode(e.ins);
+    // A load with update into its own base register (invalid on the real
+    // machine, so whatever the interpreter does) leaves the register
+    // unknown, not adjusted.
+    const bool load_into_base =
+        (op == 33 || op == 35 || op == 41 || op == 43) && RS(e.ins) == RA(e.ins);
+    for (uint32_t r = 0; r < 32; ++r)
+    {
+      if (!(w & (1u << r)))
+        continue;
+      if (e.access && e.update && r == e.ra && !load_into_base)
+      {
+        open[r].adjust += e.disp;  // rA = rA + d, after the access
+        continue;
+      }
+      if ((op == 14 || op == 15) && r != 0 && RA(e.ins) == r && RS(e.ins) == r)
+      {
+        open[r].adjust += op == 14 ? SIMM(e.ins) : (SIMM(e.ins) << 16);
+        continue;
+      }
+      close(r);
+    }
+  }
+  for (uint32_t r = 0; r < 32; ++r)
+    close(r);
+  if (groups.empty())
+    return plan;
+  // The largest groups get the locals.
+  std::sort(groups.begin(), groups.end(),
+            [](const auto& a, const auto& b) { return a.size() > b.size(); });
+  if (groups.size() > kMaxMemGroups)
+    groups.resize(kMaxMemGroups);
+  plan.roles.assign(scan.size(), MemRole{});
+  const uint32_t first_local = 1 + locals + locals_i64 + locals_v128;
+  for (uint32_t g = 0; g < groups.size(); ++g)
+  {
+    int32_t lo = groups[g][0].second, hi = lo;
+    for (const auto& m : groups[g])
+    {
+      lo = std::min(lo, m.second);
+      hi = std::max(hi, m.second);
+    }
+    for (size_t j = 0; j < groups[g].size(); ++j)
+    {
+      MemRole& role = plan.roles[groups[g][j].first];
+      role.kind = j == 0 ? MemRole::kLeader : MemRole::kMember;
+      role.local = first_local + g;
+      role.k = groups[g][j].second - lo;
+      role.span = j == 0 ? static_cast<uint32_t>(hi - lo) : 0;
+    }
+  }
+  plan.groups = static_cast<uint32_t>(groups.size());
+  return plan;
+}
 }  // namespace detail
 
 // Translate instructions starting at `code[0]` (guest address `start_pc`)
@@ -4177,13 +4784,27 @@ inline bool IdleClassify(uint32_t ins, uint32_t* in, uint32_t* out)
 // that does not decode (zero will do) for an address the caller cannot
 // supply. Threading a PC rather than walking an array is what lets a block
 // FOLLOW a branch instead of stopping at it.
+// `plan` is the second pass's input under StateLayout::mem_groups: the
+// first pass records every instruction and its access, BuildMemPlan turns
+// that into roles, and the block is compiled again with them. Both passes
+// take the same decisions about what to translate and where to stop, so
+// the roles line up by instruction.
 template <typename Fetch>
 inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t max_insts,
-                                     const StateLayout& layout, bool emit_module = true)
+                                     const StateLayout& layout, bool emit_module = true,
+                                     const detail::MemPlan* plan = nullptr)
 {
   using namespace detail;
   Bytes body;
   uint32_t n = 0;
+  // Access groups: the first pass records, the second applies.
+  std::vector<MemScanEntry> scan;
+  const bool scanning =
+      layout.mem_groups && !plan && (layout.region_table || layout.direct_base);
+  uint32_t iter = 0;
+  // Branch hints, collected as the emitters mark them (HintUnlikely).
+  std::vector<BranchHint> hints;
+  HintScope hint_scope(layout.branch_hints ? &hints : nullptr, &body);
   // Scratch locals above the state parameter: 1 = effective/host address,
   // 2 = the value being stored. Declared only if used, so a block of pure
   // register arithmetic still emits none.
@@ -4251,6 +4872,23 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
   {
     const uint32_t this_pc = cur_pc;
     const uint32_t ins = fetch(this_pc);
+    if (scanning)
+      scan.push_back({ins});
+    const MemRole* role =
+        (plan && iter < plan->roles.size() && plan->roles[iter].kind != MemRole::kNone)
+            ? &plan->roles[iter]
+            : nullptr;
+    ++iter;
+    // Record a displacement-form access for the plan.
+    auto scan_access = [&](uint32_t ra, int32_t disp, bool update) {
+      if (!scanning)
+        return;
+      MemScanEntry& e = scan.back();
+      e.access = true;
+      e.ra = ra;
+      e.disp = disp;
+      e.update = update;
+    };
     // Classify for the idle rule BEFORE the instruction is emitted, since
     // the switch below `break`s out of several nested scopes.
     if (idle_ok && ins != 0x60000000u)  // nop is `ori r0,r0,0` and would fail the rule
@@ -4482,8 +5120,9 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       if (update && RA(ins) == 0)
         break;
       need_fp(this_pc, n);
+      scan_access(RA(ins), SIMM(ins), update);
       EmitFpMemOp(body, layout, this_pc, n, RA(ins), 0, SIMM(ins), false, RS(ins), is_double,
-                  is_store, update, false, ins);
+                  is_store, update, false, ins, role);
       touches_memory = true;
       used_locals = used_locals < 4 ? 4 : used_locals;
       handled = true;
@@ -4505,8 +5144,9 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       if (!PsqInline(layout, gqr_i, is_store))
         break;
       need_lsqe(this_pc, n);
+      scan_access(RA(ins), d12, update);
       EmitPsq(body, layout, this_pc, n, RA(ins), 0, d12, false, RS(ins), gqr_i, w, is_store,
-              update, ins);
+              update, ins, role);
       touches_memory = true;
       used_locals = used_locals < 4 ? 4 : used_locals;
       handled = true;
@@ -5039,6 +5679,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           body.push_back(kI32Const);
           PutI32(body, 1 << 14);
           body.push_back(kI32And);
+          HintUnlikely(body);
           body.push_back(kIf);
           body.push_back(kVoid);
           EmitBailBody(body, layout, this_pc, n);
@@ -5133,6 +5774,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         body.push_back(kI32Const);
         PutI32(body, 3);
         body.push_back(kI32And);
+        HintUnlikely(body);
         body.push_back(kIf);
         body.push_back(kVoid);
         EmitBailBody(body, layout, this_pc, n);
@@ -5186,6 +5828,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           PutU32(body, 3);
           body.push_back(kI32Eq);
           body.push_back(kI32And);
+          HintLikely(body);  // the reservation is normally still held
           body.push_back(kIf);
           body.push_back(kI32);
           {
@@ -5271,6 +5914,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           body.push_back(kI32Const);
           PutI32(body, 1 << 14);
           body.push_back(kI32And);
+          HintUnlikely(body);
           body.push_back(kIf);
           body.push_back(kVoid);
           EmitBailBody(body, layout, this_pc, n);
@@ -5299,6 +5943,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         PutI32(body, 1 << 14);
         body.push_back(kI32And);
         body.push_back(kI32Eqz);
+        HintUnlikely(body);
         body.push_back(kIf);
         body.push_back(kVoid);
         EmitBailBody(body, layout, this_pc, n);
@@ -5460,6 +6105,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         {
           LoadGpr(body, layout, RB(ins));
           body.push_back(kI32Eqz);
+          HintUnlikely(body);
           body.push_back(kIf);
           body.push_back(kI32);
           body.push_back(kI32Const);
@@ -5484,6 +6130,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           body.push_back(kI32Eq);
           body.push_back(kI32And);
           body.push_back(kI32Or);
+          HintUnlikely(body);
           body.push_back(kIf);
           body.push_back(kI32);
           LoadGpr(body, layout, RA(ins));
@@ -5745,6 +6392,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         body.push_back(kI32Const);
         PutI32(body, 1 << 14);  // MSR[PR]
         body.push_back(kI32And);
+        HintUnlikely(body);
         body.push_back(kIf);
         body.push_back(kVoid);
         EmitBailBody(body, layout, this_pc, n);
@@ -5787,6 +6435,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         body.push_back(kI32Const);
         PutI32(body, 1 << 14);  // MSR[PR] -- privileged, as mfmsr
         body.push_back(kI32And);
+        HintUnlikely(body);
         body.push_back(kIf);
         body.push_back(kVoid);
         EmitBailBody(body, layout, this_pc, n);
@@ -5834,6 +6483,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
             PutU32(body, layout.exceptions_offset);
             body.push_back(kI32Or);
           }
+          HintUnlikely(body);
           body.push_back(kIf);
           body.push_back(kVoid);
           body.push_back(kLocalGet);
@@ -5916,6 +6566,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
           PutU32(body, 0);
           PutU32(body, layout.pagetable_pending_offset);
           body.push_back(kI32Or);
+          HintUnlikely(body);
           body.push_back(kIf);
           body.push_back(kVoid);
           // downcount -= n + 1: this instruction ran.
@@ -6344,8 +6995,9 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       // An update form with rA == 0 has no register to write back.
       if (form.update && RA(ins) == 0)
         break;
+      scan_access(RA(ins), SIMM(ins), form.update);
       EmitMemOp(body, layout, this_pc, n, RA(ins), 0, SIMM(ins), false, RS(ins),
-                form.size, form.store, form.sign, form.update, ins);
+                form.size, form.store, form.sign, form.update, ins, role);
       touches_memory = true;
       used_locals = used_locals < 4 ? 4 : used_locals;
       handled = true;
@@ -6483,7 +7135,10 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     // shape a bug can have here.
     for (DirectFixup& f : fixups)
       f.offset += 2;
+    for (BranchHint& h : hints)
+      h.offset += 2;
     PutBytes(wrapped, body);
+    g_hint_body = &wrapped;  // the epilogue's own hints, until the swap below
     // Fall-through case: continue at the instruction after the block,
     // having run all of it. A static target like any other, and the most
     // common one, so it gets a direct-call hole too.
@@ -6508,6 +7163,7 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     wrapped.push_back(kEnd);
     EmitLinkEpilogue(wrapped, layout);
     body = std::move(wrapped);
+    g_hint_body = &body;
     used_locals = used_locals < 8 ? 8 : used_locals;
   }
   else
@@ -6532,6 +7188,12 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
                0x00,      kI32Const, 0x00, kI32LtS, kBrIf, 0x00, kDrop};
     for (DirectFixup& f : fixups)
       f.offset += static_cast<uint32_t>(warm.size());
+    for (BranchHint& h : hints)
+      h.offset += static_cast<uint32_t>(warm.size());
+    // Both of the warm loop's branches are taken only while warming: the
+    // entry test (the br_if at index 11 above) and the back edge.
+    if (layout.branch_hints)
+      hints.push_back({11, false});
     PutBytes(warm, body);
     warm.push_back(kEnd);
     warm.push_back(kLocalGet);
@@ -6544,6 +7206,8 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     warm.push_back(kI32Const);
     PutI32(warm, 0);
     warm.push_back(kI32LtS);
+    if (layout.branch_hints)
+      hints.push_back({static_cast<uint32_t>(warm.size()), false});
     warm.push_back(kBrIf);
     PutU32(warm, 0);
     warm.push_back(kEnd);
@@ -6561,10 +7225,28 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     used_i64 = 6;
     used_v128 = kV128Locals;
   }
+  if (scanning)
+  {
+    // The first pass is done: if any two accesses can share a translation,
+    // compile again with the roles. The locals are the same both times
+    // (a member uses what its instruction already used), so the first
+    // pass's counts place the group locals.
+    const MemPlan p = BuildMemPlan(scan, used_locals, used_i64, used_v128);
+    if (p.groups)
+      return CompileBlockFetch(fetch, start_pc, max_insts, layout, emit_module, &p);
+  }
+  if (plan)
+  {
+    used_locals = plan->locals;
+    used_i64 = plan->locals_i64;
+    used_v128 = plan->locals_v128;
+    r.locals_tail = plan->groups;
+  }
   r.locals = used_locals;
   r.locals_i64 = used_i64;
   r.locals_v128 = used_v128;
   r.fixups = std::move(fixups);
+  r.hints = std::move(hints);
   if (!emit_module)
   {
     r.body = std::move(body);
@@ -6584,7 +7266,8 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     mb.ImportFunction("env", "ppc_hatch_exit", {kI32, kI32, kI32, kI32}, {kI32});
     mb.ImportFunction("env", "ppc_mem_slow", {kI32, kI32, kI32, kI32, kI32}, {kI32});
   }
-  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals, used_i64, used_v128);
+  mb.SetFunction({kI32}, {kI32}, body, "f", used_locals, used_i64, used_v128, r.locals_tail,
+                 r.hints);
   r.module = mb.Build();
   return r;
 }

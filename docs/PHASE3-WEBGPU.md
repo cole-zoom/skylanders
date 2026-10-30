@@ -1047,6 +1047,123 @@ up, how many passes and milliseconds, and the passes by body size.
 `run-jitdiff.sh --warm` compiles every differential's blocks with the
 entry and calls each hand-written case with a negative state first.
 
+### The memory path: the cold code was the cost, and a hint moves it
+
+The third item of `docs/HANDOFF-FIGHT-SPEED.md` §4 called the memory path
+"~14 wasm instructions per guest access with a dependent table load".
+Measured first, from the machine code TurboFan makes of five hot fight
+blocks (`--jit-dump`, `harness/wasm-core/jit-asm.mjs`): the table's
+address is kept in a register for the whole block, so a translation is
+
+```
+lsr  w9, w2, #25            ; granule
+add  w9, w10, w9, lsl #2    ; the entry's address
+ldr  w9, [x1, x9]           ; the entry -- a load the data address waits for
+cbnz w9, hit
+...                         ; the miss path: ~45 instructions, inline
+hit: and w13, w2, #0x1ffffff
+add  w9, w9, w13            ; host address
+```
+
+six instructions and one dependent load, then the access itself (for a
+word store: a register load, four for the byte swap, the store). The
+spills the cold paths' calls force are per block, not per access.
+
+*Two changes to the hot path, neither of which mattered.* Both exact,
+both measured on the fight state (window 3-20 s, the four variants in
+turn, two rounds):
+
+- **Direct translation** (`--jit-mem=direct`, `StateLayout::direct_base`):
+  the table's answer computed instead of loaded -- the top bit as the
+  tier wants it, bit `(ea >> 25) & 31` of a mask of the RAM granules,
+  `base + (ea & 0x03FFFFFF)` plus MEM2's distance from MEM1 when bit 28 is
+  set. About nine instructions, no load, the same miss path.
+- **Access groups** (`--jit-groups=on`, `StateLayout::mem_groups`): a
+  block's displacement-form accesses through one base register share one
+  translation. The block is compiled twice: the first pass records every
+  instruction and its access, `BuildMemPlan` turns the record into roles,
+  the second pass emits them. The group's first access translates as
+  usual and then, in four instructions (`add; eor; tst; csel`), parks the
+  host address of the group's lowest address in a local -- when the span
+  lies in one 32 MB granule and is not the locked cache -- or zero. Each
+  later member tests the local and adds its offset: `cbnz; add`. A member
+  whose leader left zero translates on its own, so the pipe, the hardware
+  registers and a bail behave as before. An update form and an `addi` to
+  the register itself fold their constants into the offsets; any other
+  write to the register ends the group (`GprWrites`, which ends every
+  group at an instruction it does not know). Up to four groups a block.
+
+| | table (before) | direct | groups | direct + groups |
+|---|---|---|---|---|
+| fight, 3-20 s | 86.7 / 87.3% | 87.9 / 87.2% | 87.1 / 86.7% | 87.6 / 87.4% |
+
+Nothing, inside the noise, with 16,460 of 37,660 blocks carrying 24,200
+groups. The instructions an access executes were not the limit.
+
+*What was.* Three probes with flags that already existed, one run each:
+
+| probe | fight | what it changes |
+|---|---|---|
+| none | 87.1-87.6% | |
+| `--jit-no-gp` | 84.8% | the inline gather-pipe path removed from every store; those stores (1.5M a second) go through the hatch |
+| `--jit-no-l1` | 71.0% | the locked-cache path removed; the fight keeps a lot in the locked cache, and every access there bails |
+| `--jit-probe-pad` | 73.0% | one more never-taken copy of the miss path behind every access |
+
+The pad costs a seventh of the speed for code that never runs. TurboFan
+lays a wasm `if` out in program order, so each access's ~45 instructions
+of miss path sat between its hot instructions and the next access's: the
+hot path of a block was spread over three times its own length of code,
+and a fight runs ten thousand blocks a second, most of them a few times.
+
+*The hint.* The branch-hinting proposal's custom section
+(`metadata.code.branch_hint`: per function, the byte offset of an `if` or
+`br_if` and whether its condition is likely true) is decoded by V8 15.6
+with no flag -- Chrome 156 honours it; node 22 needs
+`--experimental-wasm-branch-hinting`. With `StateLayout::branch_hints`
+(`--jit-hints`, the default), every branch to a bail, a translation miss,
+a hatch, an exit or a float special case is hinted unlikely, and the
+link epilogue's hit and a group member's short path likely. The emitters
+mark a hint just before pushing the opcode, through a sink the compile
+installs (`HintUnlikely`); the offsets move with the link and warm
+wrapping as the direct-call holes do, and the module builder writes the
+section before the code section with the locals declaration's length
+added. The code is the same; TurboFan now puts every cold block after the
+function's hot path and keeps the hot path's registers out of the stack:
+a grouped store is `cbz; add; ldr; and; and; ror; orr; str`, nothing
+between it and the next.
+
+| | off | hints | hints + groups | hints + groups + direct |
+|---|---|---|---|---|
+| fight, window 3-20 s | 87.1 / 87.6% | **103.9 / 103.8%** | **104.9 / 105.4%** | 105.0 / 104.8% |
+| median second | 87 / 88% | 105 / 105% | 107 / 107% | 107 / 105% |
+| p25 | 82 / 81% | 100 / 100% | 102 / 101% | 101 / 103% |
+| whole run from the save state | 79.1 / 79.1% | 91.5 / 91.2% | 91.4 / 91.5% | 91.1 / 91.0% |
+| worst second | 66% | 73-75% | 71% | 71% |
+
+Frames identical (1,197) in every run. The hint is worth sixteen points
+on the window and twelve on the whole run; the groups a point more on
+the window, consistent in both rounds and inside the noise of either;
+the direct translation nothing, so it stays a flag. Hints and groups are
+the defaults.
+
+| scene | off | hints + groups |
+|---|---|---|
+| the vortex, 3-30 s | 105.4% | 127.0% |
+| the town gate, 3-20 s | 92.7% | 110.4% |
+| walking, 300-400 s | 114.6% | 134.0% |
+
+Frames identical in every pair (1,799, 1,197 and 23,846). Walking, whose blocks are optimised either way, gains as much as the fight: the layout was the cost everywhere, not the tier.
+
+*Checks.* The differentials pass with `--hints`, `--groups` and `--direct`
+in every combination with the existing flags, with five new hand-written
+cases (a stack frame's seven accesses, a load into the base register, a
+span over a granule edge that must fall back and bail, float members, a
+misaligned float member); the nightly now runs them with the dispatcher's
+defaults, `--warm --hints --groups` included. M3 passes on all four captures. A hint is layout
+only, so a wrong one costs speed and never correctness; V8 ignores a
+malformed section silently, which is why `jit-asm.mjs` under node with the
+flag is the check that the cold code moved; `harness/wasm-core/dumpblock.cpp` compiles a program natively and writes its module for that, or for `wasm2wat`.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

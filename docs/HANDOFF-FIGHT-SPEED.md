@@ -128,9 +128,13 @@ differentials (`run-jitdiff.sh`) and M3 (`harness/wasm-core/run-m3.sh`).
    compilation hints (check what Chrome 156 ships). Earlier finding to
    respect: the cost of TurboFan code was code size (inlined cold paths,
    `slowpaths.h`), PHASE3-FINDINGS.md.
-3. **Memory access hot path.** ~14 wasm instructions per guest access
-   with a dependent table load (PHASE3-WEBGPU.md, "Left"). A
-   fastmem-style direct mapping for the common BAT case.
+3. **Memory access hot path.** *Done: `docs/PHASE3-WEBGPU.md` "The memory
+   path: the cold code was the cost, and a hint moves it". The direct
+   mapping and shared translations measured nothing; the inline miss
+   paths' layout was the cost, and wasm branch hints (honoured by Chrome
+   156) move them out of line: fight 87 → 105%.* ~14 wasm instructions
+   per guest access with a dependent table load (PHASE3-WEBGPU.md,
+   "Left"). A fastmem-style direct mapping for the common BAT case.
 4. **Guest registers in wasm locals** across a block/region instead of
    loads and stores to `PowerPCState` per instruction.
 5. **Dispatcher** (6.5%): `_main_thread`, link table, budget exits.

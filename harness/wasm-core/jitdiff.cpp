@@ -225,9 +225,16 @@ int main(int argc, char** argv)
   // has it with --jit-warm: every block carries the negative-state test,
   // and the hand-written cases also call each block with a negative state
   // and expect nothing to have run.
+  // --direct: addresses translated arithmetically instead of through the
+  // region table (StateLayout::direct_base). --groups: accesses through
+  // one base register share a translation (StateLayout::mem_groups). Both
+  // exact, so every expectation holds with them on.
   bool want_compact = false, want_short_convert = false, want_simd = false, want_warm = false;
+  bool want_direct = false, want_groups = false, want_hints = false;
   for (int i = 1; i < argc; ++i)
   {
+    if (std::strcmp(argv[i], "--hints") == 0)
+      want_hints = true;  // StateLayout::branch_hints: layout only, so every expectation holds
     if (std::strcmp(argv[i], "--compact") == 0)
       want_compact = true;
     else if (std::strcmp(argv[i], "--short-convert") == 0)
@@ -236,10 +243,16 @@ int main(int argc, char** argv)
       want_simd = true;
     else if (std::strcmp(argv[i], "--warm") == 0)
       want_warm = true;
+    else if (std::strcmp(argv[i], "--direct") == 0)
+      want_direct = true;
+    else if (std::strcmp(argv[i], "--groups") == 0)
+      want_groups = true;
   }
-  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s%s\n\n",
+  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s%s%s%s%s\n\n",
               want_compact ? "  [compact]" : "", want_short_convert ? "  [short-convert]" : "",
-              want_simd ? "  [simd]" : "", want_warm ? "  [warm]" : "");
+              want_simd ? "  [simd]" : "", want_warm ? "  [warm]" : "",
+              want_direct ? "  [direct]" : "", want_groups ? "  [groups]" : "",
+              want_hints ? "  [hints]" : "");
 
   auto& system = Core::System::GetInstance();
   Config::Init();
@@ -388,6 +401,15 @@ int main(int argc, char** argv)
     region_table[0xD2000000u >> 25] = exram + 0x02000000u;
   }
   layout.region_table = static_cast<u32>(reinterpret_cast<uintptr_t>(region_table.data()));
+  if (want_direct)
+  {
+    layout.direct_base = static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetRAM()));
+    layout.direct_mem2_delta =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(memory.GetEXRAM())) - layout.direct_base;
+    layout.direct_mask = 0x301;
+  }
+  layout.mem_groups = want_groups;
+  layout.branch_hints = want_hints;
   // dcbz needs HID0[DCE]; the boot sets it and so does this.
   state.spr[SPR_HID0] |= 1u << 14;
   // Floating-point registers: seeded with a mix of ordinary doubles, bit
@@ -625,6 +647,42 @@ int main(int argc, char** argv)
       // through the region table.)
       {"an address outside RAM bails to the interpreter",
        {0x3C60'CC00, 0x3880'0001, 0x8083'0000}, 2},
+
+      // ── access groups (StateLayout::mem_groups) ──
+      // A function prologue and epilogue: seven accesses through r1, with
+      // the update form's and the addi's constants folded into the group.
+      // lis r1,0x8000 ; ori r1,r1,0x7800 ; li r4,0x1111 ; li r5,0x2222 ;
+      // stwu r1,-0x40(r1) ; stw r4,0x3c(r1) ; stw r5,0x38(r1) ;
+      // lwz r6,0x3c(r1) ; lwz r7,0x38(r1) ; lwz r8,0(r1) ; addi r1,r1,0x40 ;
+      // lwz r9,-0x40(r1)
+      {"a stack frame's stores and loads share one translation",
+       {0x3C20'8000, 0x6021'7800, 0x3880'1111, 0x38A0'2222, 0x9421'FFC0, 0x9081'003C,
+        0x90A1'0038, 0x80C1'003C, 0x80E1'0038, 0x8101'0000, 0x3821'0040, 0x8121'FFC0}},
+      // A load into the base register ends the group: the next access must
+      // translate the NEW pointer, not add to the old one.
+      // lis r3,0x8000 ; ori r3,r3,0x7000 ; addi r4,r3,0x100 ; stw r4,0(r3) ;
+      // li r5,0x77 ; stw r5,0x100(r3) ; lwz r3,0(r3) ; lwz r6,0(r3)
+      {"a load into the base register ends its group",
+       {0x3C60'8000, 0x6063'7000, 0x3883'0100, 0x9083'0000, 0x38A0'0077, 0x90A3'0100,
+        0x8063'0000, 0x80C3'0000}},
+      // A group whose span crosses out of MEM1's granule: the leader must
+      // not vouch for it, and the member past the edge bails as it always
+      // did. (The interpreter reads a mirror there; the block refuses.)
+      // lis r3,0x8200 ; addi r3,r3,-8 ; li r4,0x11 ; li r5,0x22 ;
+      // stw r4,0(r3) ; stw r5,4(r3) ; lwz r6,8(r3)
+      {"a group spanning a granule edge falls back and bails",
+       {0x3C60'8200, 0x3863'FFF8, 0x3880'0011, 0x38A0'0022, 0x9083'0000, 0x90A3'0004,
+        0x80C3'0008}, 6},
+      // Float members: a word stored, loaded as a single, stored back.
+      // lis r3,0x8000 ; ori r3,r3,0x7600 ; lis r4,0x3f80 ; stw r4,0(r3) ;
+      // lfs f1,0(r3) ; stfs f1,4(r3) ; lwz r5,4(r3)
+      {"float loads and stores join an integer group",
+       {0x3C60'8000, 0x6063'7600, 0x3C80'3F80, 0x9083'0000, 0xC023'0000, 0xD023'0004,
+        0x80A3'0004}},
+      // A misaligned float member still takes the alignment exception.
+      // lis r3,0x8000 ; ori r3,r3,0x7600 ; stw r4,0(r3) ; lfs f1,2(r3)
+      {"a misaligned float member bails",
+       {0x3C60'8000, 0x6063'7600, 0x9083'0000, 0xC023'0002}, 3},
   };
 
   for (const Case& c : cases)
@@ -641,9 +699,18 @@ int main(int argc, char** argv)
     for (int i = 0; i < 8; ++i)
       state.cr.fields[i] = 0;
     state.spr[SPR_LR] = 0;
+    state.msr.Hex = kPristineMsr;
     state.pc = state.npc = BASE;
+    // Up to an expected bail only: the instruction the block refuses may
+    // be one the interpreter takes an exception on (a misaligned float
+    // load, an address no BAT maps), and an exception masks MSR down for
+    // every case after this one.
     for (size_t i = 0; i < c.code.size(); ++i)
+    {
+      if (c.expect_bail_at >= 0 && i >= static_cast<size_t>(c.expect_bail_at))
+        break;
       ppc.SingleStep();
+    }
 
     u32 expect[32];
     std::memcpy(expect, state.gpr, sizeof(expect));
@@ -2395,8 +2462,9 @@ int main(int argc, char** argv)
       std::vector<int> index(nblocks, -1);
       std::vector<ppc2wasm::Bytes> bodies(nblocks);
       std::vector<u32> block_locals(nblocks, 0), block_locals_i64(nblocks, 0),
-          block_locals_v128(nblocks, 0);
+          block_locals_v128(nblocks, 0), block_locals_tail(nblocks, 0);
       std::vector<std::vector<ppc2wasm::DirectFixup>> block_fixups(nblocks);
+      std::vector<std::vector<ppc2wasm::BranchHint>> block_hints(nblocks);
       bool all_compiled = true;
       for (u32 i = 0; i < nblocks && all_compiled; ++i)
       {
@@ -2409,7 +2477,9 @@ int main(int argc, char** argv)
           block_locals[i] = rb.locals;
           block_locals_i64[i] = rb.locals_i64;
           block_locals_v128[i] = rb.locals_v128;
+          block_locals_tail[i] = rb.locals_tail;
           block_fixups[i] = std::move(rb.fixups);
+          block_hints[i] = std::move(rb.hints);
         }
       }
       if (!all_compiled)
@@ -2450,7 +2520,7 @@ int main(int argc, char** argv)
       {
         trial_direct += ppc2wasm::PatchDirectCalls(bodies[i], block_fixups[i], index_of);
         cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i], block_locals_i64[i],
-                        block_locals_v128[i]);
+                        block_locals_v128[i], block_locals_tail[i], block_hints[i]);
       }
       const auto chain_module = cmb.Build();
       const int base = InstallBatchAt(chain_module.data(), static_cast<int>(chain_module.size()),
