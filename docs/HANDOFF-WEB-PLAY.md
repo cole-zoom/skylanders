@@ -110,11 +110,64 @@ chunk size. The proxy stays for a browser that cannot (the bucket's
 CORS rule gone, say); the local server answers the probe with 416 and
 the page uses its range endpoint as before.
 
+## 2b. The chunks kept in the browser (#119)
+
+After #118 the player, on the hosted page: "still minor spikes", and
+lag "when putting in a new character, or doing something new in
+general". That is the first read of a file nobody had fetched: placing
+a figure opens four files (the item's .arc and .bld, the character's
+.arc of 4-7 MB and .bld of 0.7 MB), and each first chunk is a round
+trip on the CPU thread. The fight shows them at t=1.25, 1.38, 1.47 and
+2.17 s, 200-500 ms each.
+
+**Tried and dropped: longer requests.** From curl, one 6 MB range costs
+about what a 1 MB one does (0.43-0.65 s vs 0.39-0.65 s), which
+suggested reading ahead to a file's end in one request. Built
+(`--disc-span=N`: runs of chunks per request, to the end of the file a
+read lands in, from the file table; two helpers), measured on the fight
+in two alternating series of six: reads waited 3.5-3.9 s a run with
+span 1, 4.0-6.0 s with span 8. Chrome is not curl: in the browser a
+7 MB range took 0.7-2.9 s (5-10 MB/s), three parallel 1 MB ranges as
+long as one, and the emulator's own fetches issued together finished
+~220 ms apart. The browser's link to the store is bandwidth-bound once
+the first byte is in, so every extra byte fetched ahead delays the
+chunk the game is waiting for. The diff is not kept; this paragraph is
+the record. It also undercuts plan item 1 below: more helpers or deeper
+read-ahead cannot load a level faster than the link carries it.
+
+**Built: web/sw.js**, a service worker between the emulator's threads
+and the network. The page registers it (`sw.js?disc=<url>`) when the
+disc is on another origin; it answers chunk-aligned range requests for
+that URL from Cache Storage and keeps every chunk it fetches. The
+emulator's reads are synchronous XHRs from its pthread workers, which
+the worker controls like any fetch; no C++ changed. `?cache=0` turns
+it off and unregisters it. The page logs `disc cache: on (N ms)`.
+
+Measured with `web/smoke.mjs` against R2, headless Chrome:
+
+| run | profile | page to first frame | reads waited (stalls) |
+|---|---|---|---|
+| first visit | fresh | 12 s | 3,250 ms (11) |
+| second visit | the same | **2 s** | **38 ms** (8) |
+
+A first visit pays nothing for it: fresh profiles alternating off/on/on/off
+waited 2,816 / 2,593 / 1,924 / 1,441 ms and booted in 11-12 s alike;
+registering costs 26 ms the first time, 1 ms after. 90 seconds of
+boot and play kept 89 MB.
+
+What it does not do: anything new on a first visit still costs its
+round trips. A figure never placed on this browser, a level never
+loaded, still stalls once. Prefetching the likely set in the
+background (the 76 character files are 230 MB, the items 76 MB) would
+cover that at the cost of the link's bandwidth during play; not built.
+
 ## 3. The plan: what remains for play from a host
 
 In order. Each its own PR, measured, not merged until it is right.
 
-1. **Loading screens.** The boot and each level load read tens of
+1. **Loading screens.** Reconsidered (§2b): the browser's link to
+   the store is bandwidth-bound, so more helpers do not help; the
+   persistent cache makes a second load free. The plan as it was: The boot and each level load read tens of
    megabytes in order, in bursts; one helper fetching one chunk at a
    time caps that at a chunk per round trip (a megabyte per 300 ms,
    ~3 MB/s), and the game waits for the rest. Measure the time to the
@@ -123,7 +176,8 @@ In order. Each its own PR, measured, not merged until it is right.
    the readout log's first `readout` line) with read-ahead 2, 4 and
    two helpers fetching in parallel. Not measured yet: #118 was built
    and measured on the fight only.
-2. **A persistent cache.** A chunk fetched once should never be fetched
+2. **A persistent cache.** Done (#119, §2b); the text below is the
+   plan as it was. A chunk fetched once should never be fetched
    again on that browser: the Cache API or OPFS, written by the helper
    as chunks arrive, read before the network on a miss. The fight
    touched 16 MB, a 400-second walk 121 MB; the game's working set is
@@ -162,6 +216,17 @@ In order. Each its own PR, measured, not merged until it is right.
   blocks it), so a hosted test needs the store.
 
 ## 5. Landmines
+
+- web/sw.js keys chunks by the disc's URL. The store's object name
+  carries a hash of the image, so a new image is a new URL; replacing
+  the object at the same URL would serve the old chunks forever on every
+  browser that kept them. Change `STORE` in sw.js if that ever happens.
+- The worker serves the page's origin, so it outlives a deploy that
+  drops it: removing the cache means shipping a sw.js that unregisters,
+  or the page's `?cache=0` path, not deleting the file.
+- The page waits up to 5 s for the worker to take control on a first
+  visit; if it never does (a browser with service workers disabled),
+  the log says `not in control` and the disc reads go to the network.
 
 - The helper is a pthread: one of the pool's workers
   (`-sPTHREAD_POOL_SIZE=8`, link.sh), created when the disc is opened.

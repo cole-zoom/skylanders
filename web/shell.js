@@ -65,6 +65,38 @@ const named = await fetch('disc?url').then(r => (r.ok ? r.text() : null)).catch(
 const disc = params.get('disc') ??
              (/^https?:\/\/\S+$/.test((named ?? '').trim()) ? named.trim() : null) ??
              new URL('disc', location.href).href;
+// The disc's chunks kept in this browser (web/sw.js), when the disc is on
+// another origin: the second visit, a figure already seen and a level
+// already played read from the disk instead of crossing the internet.
+// ?cache=0 turns it off (and removes the worker, for the next visit too).
+const cacheDisc = params.get('cache') !== '0';
+if ('serviceWorker' in navigator) {
+  try {
+    if (cacheDisc && new URL(disc).origin !== location.origin) {
+      const t0 = performance.now();
+      // Hundreds of megabytes of chunks in this origin's storage: ask that
+      // it be kept, so the browser does not clear the origin -- the game's
+      // saves with it -- when the disk runs low. Chrome decides without
+      // asking the player; a refusal changes nothing else.
+      navigator.storage?.persist?.().catch(() => {});
+      const reg = await navigator.serviceWorker.register(`sw.js?disc=${encodeURIComponent(disc)}`);
+      // The emulator's threads are controlled only if the page is when they
+      // start: on a first visit, wait for the worker to take the page.
+      if (navigator.serviceWorker.controller?.scriptURL !== reg.active?.scriptURL ||
+          !navigator.serviceWorker.controller)
+        await new Promise(done => {
+          navigator.serviceWorker.addEventListener('controllerchange', done, { once: true });
+          setTimeout(done, 5000);
+        });
+      log(`disc cache: ${navigator.serviceWorker.controller ? 'on' : 'not in control'} ` +
+          `(${(performance.now() - t0).toFixed(0)} ms)`);
+    } else {
+      for (const reg of await navigator.serviceWorker.getRegistrations()) await reg.unregister();
+    }
+  } catch (e) {
+    log(`! disc cache unavailable: ${e.message}`);
+  }
+}
 const args = [disc, '1000000000000000000',
               '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
               ...(audio ? ['--audio'] : []),
