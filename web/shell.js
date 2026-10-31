@@ -80,9 +80,13 @@ const readStage = () => {
 let lastEmulated = 0, lastWall = 0, lastCompiles = 0, lastCompileMs = 0;
 // keepalive (a send that outlives the page) only when the page is going:
 // the browser refuses a keepalive body over 64 KB, and the boot's log is more.
+// A host without the endpoint (web/vercel.json) answers 404 once; after
+// that, nothing is sent and the console stays quiet.
+let readoutSink = true;
 const sendReadouts = (keepalive = false) => {
-  if (!readouts.length) return;
+  if (!readouts.length || !readoutSink) return;
   fetch('readout', { method: 'POST', body: readouts.join('\n') + '\n', keepalive })
+    .then(r => { if (r.status === 404 || r.status === 405) readoutSink = false; })
     .catch(() => {});
   readouts = [];
 };
