@@ -1282,6 +1282,45 @@ combination with the existing flags; the random blocks and chains mix
 hatched instructions with translated ones, which is where a stale local
 would show. `--jit-regs=off` is the old code.
 
+### The hatch's biggest customers, translated
+
+The sixth item of `docs/HANDOFF-FIGHT-SPEED.md` §4, a first batch. Of the
+27.7 million instructions the fight handed to the interpreter over
+twenty seconds, `cror` was 29%, `dcbz_l` 14%, `andi.` 3% (`ps_sum0` 11%
+and `psq_st` to the pipe 12% are left). Now translated
+(`StateLayout::extra_forms`, `--jit-extra`, the default):
+
+- The CR logical ops (`crand`, `cror`, `crxor`, `crnand`, `crnor`,
+  `creqv`, `crandc`, `crorc`) and `mcrf`: a bit is read by decoding its
+  field to PowerPC's four bits, as `mfcr` already did, and written by
+  decoding the destination field, replacing the bit and re-encoding
+  through `s_crTable`, as the interpreter's `SetBit` does.
+- `andi.` and `andis.`: the and, then CR0 from the result. Their Rc bit
+  is the immediate's low bit, which is why the generic Rc path never
+  served them.
+- `dcbz_l`: a program exception without HID2[LCE] and an alignment
+  exception without HID0[DCE], both still the interpreter's through the
+  hatch; then the line's address translated as any store, the locked
+  cache included, and 32 bytes zeroed, as `ClearDCacheLine` does. Only
+  without data cache emulation, like `dcbz`.
+
+| | interpreter | translated |
+|---|---|---|
+| fight, 3-20 s (off, on, on, off) | 95.6 / 96.2% | 96.8 / 96.9% |
+| the statistics build, two rounds | 86.4 / 89.0% | 91.1 / 88.5% |
+| instructions through the hatch, the run | 27.7M | 14.7M |
+
+A point, consistent in both orders, for half the hatch; the four runs
+shared the machine with a video call, which is why the level is 96 and
+not the 107 of the day's other series. Frames
+identical. M3 passes on all four captures. The differentials pass with three new hand-written
+cases (every CR op and `mcrf`, read back through `mfcr`; `andi.` and
+`andis.` with CR0; a locked-cache line stored, zeroed and read back) in
+every combination with the existing flags; the random blocks already
+mixed `cror`, `crxor` and `mcrf` in. What the hatch sees most now:
+`psq_st` to the pipe 23%, `stw` to the hardware registers 13%, `ps_sum0`
+10%, `mtspr` 7%.
+
 ## 6. Risks
 
 - **JSPI on a pthread** (§4) — the one that could reshape the design. S1.

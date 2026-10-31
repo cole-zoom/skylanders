@@ -1498,6 +1498,9 @@ int main(int argc, char** argv)
   // --jit-regs=on|off: guest registers kept in wasm locals across a block
   // (StateLayout::reg_cache).
   bool jit_reg_cache = true;
+  // --jit-extra=on|off: the CR logical ops, andi./andis. and dcbz_l
+  // translated instead of handed to the interpreter (StateLayout::extra_forms).
+  bool jit_extra_forms = true;
   bool want_jit_names = false;
   bool want_probe_pad = false;
   bool want_compact = true;
@@ -2006,6 +2009,8 @@ int main(int argc, char** argv)
       jit_block_imports = std::strcmp(argv[i] + 14, "off") != 0;
     else if (std::strncmp(argv[i], "--jit-regs=", 11) == 0)
       jit_reg_cache = std::strcmp(argv[i] + 11, "off") != 0;
+    else if (std::strncmp(argv[i], "--jit-extra=", 12) == 0)
+      jit_extra_forms = std::strcmp(argv[i] + 12, "off") != 0;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -3159,6 +3164,7 @@ int main(int argc, char** argv)
   jit_layout.mem_groups = jit_mem_groups;
   jit_layout.branch_hints = jit_branch_hints;
   jit_layout.reg_cache = jit_reg_cache;
+  jit_layout.extra_forms = jit_extra_forms;
 
   // ── the link table ──
   //
