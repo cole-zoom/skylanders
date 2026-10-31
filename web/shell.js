@@ -51,7 +51,11 @@ const speed = params.get('speed') ?? '1';
 const audio = params.get('audio') !== '0';
 const figure = params.get('figure');
 // The run never ends on its own; the step count is only a cap.
-const args = [new URL('disc', location.href).href, '1000000000000000000',
+// The disc: the server's range endpoint next to the page, or the URL
+// ?disc= names -- a Blob store on another origin, when the page is hosted
+// where no server serves ranges (web/vercel.json).
+const disc = params.get('disc') ?? new URL('disc', location.href).href;
+const args = [disc, '1000000000000000000',
               '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
               ...(audio ? ['--audio'] : []),
               // The NAND where web/saves.js restores the game's saves.

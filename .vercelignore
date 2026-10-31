@@ -1,0 +1,11 @@
+# A CLI deploy from the repo root uploads the page alone (a Git import clones
+# everything and serves web/ per vercel.json's outputDirectory either way).
+/*
+!/web
+!/vercel.json
+/web/serve.mjs
+/web/build.sh
+/web/smoke.mjs
+/web/make-uidcache.sh
+/web/extract-uidcache.mjs
+/web/.vercel
