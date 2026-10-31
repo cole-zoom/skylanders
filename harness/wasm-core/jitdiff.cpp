@@ -168,6 +168,30 @@ EM_JS(int, InstallBatchAt, (const uint8_t* ptr, int len, int nfuncs, int slot, i
   }
 });
 
+// The same, for a module whose exits to blocks installed earlier are bound
+// as imports (ModuleBuilder::ImportBlock): `imports` names `nimports` table
+// slots, bound as env.b0, env.b1, ... in order, as the dispatcher's
+// JitInstallBatch does. The slot must be given.
+EM_JS(int, InstallBatchImportsAt,
+      (const uint8_t* ptr, int len, int nfuncs, int slot, const int* imports, int nimports), {
+  try {
+    const bytes = HEAPU8.slice(ptr, ptr + len);
+    const mod = new WebAssembly.Module(bytes);
+    const env = Object.assign({}, Module.__jitImports.env);
+    for (let k = 0; k < nimports; k++)
+      env['b' + k] = wasmTable.get(HEAP32[(imports >> 2) + k]);
+    const inst = new WebAssembly.Instance(mod, { env });
+    for (let i = 0; i < nfuncs; i++)
+      wasmTable.set(slot + i, inst.exports['f' + i]);
+    Module.__installs = (Module.__installs | 0) + 1;
+    if (typeof gc === 'function' && (Module.__installs % 500) === 0) gc();
+    return slot;
+  } catch (e) {
+    out('  batch install with imports failed: ' + e);
+    return -1;
+  }
+});
+
 EM_JS(int, MemoryPages, (), { return wasmMemory.buffer.byteLength >>> 16; });
 
 using BlockFn = u32 (*)(u32);
@@ -2267,6 +2291,11 @@ int main(int argc, char** argv)
     int chain_slot_base = -1;
     u64 direct_calls_patched = 0;
     int direct_chains = 0, indirect_chains = 0;
+    // Chains split over two modules, the second's exits to the first bound
+    // as imports (the dispatcher's way to an earlier block), and the holes
+    // so bound.
+    int import_chains = 0;
+    u64 import_calls_patched = 0;
 
     for (int trial = 0; trial < 800 && fails < 4; ++trial)
     {
@@ -2488,49 +2517,101 @@ int main(int argc, char** argv)
       // Function index i is block i, so a hole naming block i's start PC
       // resolves to i. Targets outside the chain -- the address past the
       // end, an LR or CTR value -- stay nops and fall back to the table.
-      ppc2wasm::ModuleBuilder cmb;
-      cmb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
-      cmb.ImportTable();
-      cmb.ImportFunction("env", "ppc_interp_op", {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
-                         {ppc2wasm::kI32});
-      if (layout.hatch_exit_index)
-      {
-        cmb.ImportFunction("env", "ppc_hatch_exit",
-                           {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
-                           {ppc2wasm::kI32});
-        cmb.ImportFunction("env", "ppc_mem_slow",
-                           {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32,
-                            ppc2wasm::kI32},
-                           {ppc2wasm::kI32});
-      }
-      cmb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
-      // Function index i is block i plus the imports before it, so a hole
-      // naming block i's start PC resolves to i + ImportCount. Targets
-      // outside the chain -- the address past the end, an LR or CTR value
-      // -- stay nops and fall back to the table.
-      const int import_count = static_cast<int>(cmb.ImportCount());
-      auto index_of = [&](u32 target) -> int {
-        for (u32 i = 0; i < nblocks; ++i)
-          if (kChainBase + i * K * 4 == target)
-            return static_cast<int>(i) + import_count;
-        return -1;
+      // One module holding blocks [first, last), installed at table slot
+      // `slot`. A hole naming a sibling resolves to its function index
+      // (its position plus the imports before it); a hole naming a block
+      // of an EARLIER module -- one already installed, below `first` --
+      // is bound as an import of this module, as the dispatcher binds a
+      // region's exits to blocks compiled before it; anything else (the
+      // address past the end, an LR or CTR value) stays nops and falls
+      // back to the table.
+      u32 trial_direct = 0, trial_imports = 0;
+      auto build_and_install = [&](u32 first, u32 last, int slot) -> int {
+        ppc2wasm::ModuleBuilder cmb;
+        cmb.ImportMemory(layout.memory_pages, layout.memory_pages, layout.memory_shared);
+        cmb.ImportTable();
+        cmb.ImportFunction("env", "ppc_interp_op",
+                           {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32}, {ppc2wasm::kI32});
+        if (layout.hatch_exit_index)
+        {
+          cmb.ImportFunction("env", "ppc_hatch_exit",
+                             {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32},
+                             {ppc2wasm::kI32});
+          cmb.ImportFunction("env", "ppc_mem_slow",
+                             {ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32, ppc2wasm::kI32,
+                              ppc2wasm::kI32},
+                             {ppc2wasm::kI32});
+        }
+        cmb.SetSignature({ppc2wasm::kI32}, {ppc2wasm::kI32});
+        const int host_imports = static_cast<int>(cmb.ImportCount());
+        std::vector<u32> import_blocks;  // block number per import, in order
+        std::vector<int> import_slots;
+        for (u32 i = first; i < last; ++i)
+          for (const ppc2wasm::DirectFixup& f : block_fixups[i])
+            for (u32 j = 0; j < first; ++j)
+              if (kChainBase + j * K * 4 == f.target &&
+                  std::find(import_blocks.begin(), import_blocks.end(), j) == import_blocks.end())
+              {
+                import_blocks.push_back(j);
+                import_slots.push_back(index[j]);
+                cmb.ImportBlock("b" + std::to_string(import_blocks.size() - 1));
+              }
+        const int import_count = static_cast<int>(cmb.ImportCount());
+        auto index_of = [&](u32 target) -> int {
+          for (u32 i = first; i < last; ++i)
+            if (kChainBase + i * K * 4 == target)
+              return static_cast<int>(i - first) + import_count;
+          for (size_t k = 0; k < import_blocks.size(); ++k)
+            if (kChainBase + import_blocks[k] * K * 4 == target)
+            {
+              ++trial_imports;
+              return host_imports + static_cast<int>(k);
+            }
+          return -1;
+        };
+        for (u32 i = first; i < last; ++i)
+        {
+          trial_direct += ppc2wasm::PatchDirectCalls(bodies[i], block_fixups[i], index_of);
+          cmb.AddFunction(bodies[i], "f" + std::to_string(i - first), block_locals[i],
+                          block_locals_i64[i], block_locals_v128[i], block_locals_tail[i],
+                          block_hints[i]);
+        }
+        const auto module = cmb.Build();
+        if (import_blocks.empty())
+          return InstallBatchAt(module.data(), static_cast<int>(module.size()),
+                                static_cast<int>(last - first), slot, 6);
+        return InstallBatchImportsAt(module.data(), static_cast<int>(module.size()),
+                                     static_cast<int>(last - first), slot, import_slots.data(),
+                                     static_cast<int>(import_slots.size()));
       };
-      u32 trial_direct = 0;
-      for (u32 i = 0; i < nblocks; ++i)
+      // A third of the trials split the chain over two modules, once the
+      // slots exist, so the second's calls to the first go through imports.
+      const u32 split = (chain_slot_base >= 0 && nblocks >= 2 && (trial % 3) == 1) ? nblocks / 2 : 0;
+      int base = -1;
+      if (split == 0)
       {
-        trial_direct += ppc2wasm::PatchDirectCalls(bodies[i], block_fixups[i], index_of);
-        cmb.AddFunction(bodies[i], "f" + std::to_string(i), block_locals[i], block_locals_i64[i],
-                        block_locals_v128[i], block_locals_tail[i], block_hints[i]);
+        base = build_and_install(0, nblocks, chain_slot_base);
       }
-      const auto chain_module = cmb.Build();
-      const int base = InstallBatchAt(chain_module.data(), static_cast<int>(chain_module.size()),
-                                      static_cast<int>(nblocks), chain_slot_base, 6);
+      else
+      {
+        base = build_and_install(0, split, chain_slot_base);
+        if (base >= 0)
+        {
+          for (u32 i = 0; i < split; ++i)
+            index[i] = base + static_cast<int>(i);
+          if (build_and_install(split, nblocks, base + static_cast<int>(split)) < 0)
+            base = -1;
+        }
+      }
       if (base < 0)
         continue;
       chain_slot_base = base;
       for (u32 i = 0; i < nblocks; ++i)
         index[i] = base + static_cast<int>(i);
-      direct_calls_patched += trial_direct;
+      direct_calls_patched += trial_direct - trial_imports;
+      import_calls_patched += trial_imports;
+      if (split)
+        ++import_chains;
       if (direct_trial)
         ++direct_chains;
       else
@@ -2727,6 +2808,14 @@ int main(int argc, char** argv)
     // one compiled without them, and every comparison here would stay
     // green while the mechanism this section exists to cover never ran.
     check(direct_calls_patched > 0, "chains made direct same-module calls");
+    {
+      char lbl[128];
+      std::snprintf(lbl, sizeof(lbl),
+                    "chains split over two modules called the first through imports (%d chains, "
+                    "%llu calls)",
+                    import_chains, static_cast<unsigned long long>(import_calls_patched));
+      check(import_chains > 0 && import_calls_patched > 0, lbl);
+    }
     check(direct_chains > 0 && indirect_chains > 0,
           "both the direct and the table-lookup paths were compiled");
     std::printf("    %d of %d chains linked   tail calls %llu\n", chains_linked, chains_run,

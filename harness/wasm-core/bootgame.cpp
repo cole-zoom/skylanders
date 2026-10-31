@@ -238,11 +238,22 @@ EM_JS(int, JitInstall, (const uint8_t* ptr, int len), {
 // it (harness/wasm-core/jitbatch.cpp measures 13.7 us for one block and
 // 1.44 us per block at sixteen), so this is where the price of compiling
 // drops by an order of magnitude.
-EM_JS(int, JitInstallBatch, (const uint8_t* ptr, int len, int nfuncs), {
+//
+// `imports` names `nimports` table indices of blocks installed earlier,
+// bound as env.b0, env.b1, ... in that order: the module's exits to them
+// are direct tail calls of these imports (compile_region).
+EM_JS(int, JitInstallBatch, (const uint8_t* ptr, int len, int nfuncs, const int* imports, int nimports), {
   try {
     const bytes = HEAPU8.slice(ptr, ptr + len);
     const mod = new WebAssembly.Module(bytes);
-    const inst = new WebAssembly.Instance(mod, Module.__jitImports);
+    let importObject = Module.__jitImports;
+    if (nimports > 0) {
+      const env = Object.assign({}, Module.__jitImports.env);
+      for (let k = 0; k < nimports; k++)
+        env['b' + k] = wasmTable.get(HEAP32[(imports >> 2) + k]);
+      importObject = { env };
+    }
+    const inst = new WebAssembly.Instance(mod, importObject);
     const base = wasmTable.length;
     wasmTable.grow(nfuncs);
     for (let i = 0; i < nfuncs; i++)
@@ -1480,6 +1491,10 @@ int main(int argc, char** argv)
   bool jit_mem_groups = true;
   // --jit-hints=on|off: the cold branches hinted (StateLayout::branch_hints).
   bool jit_branch_hints = true;
+  // --jit-imports=on|off: a region's exits to blocks compiled earlier, in
+  // other modules, bound as imports at instantiation so they are direct
+  // tail calls rather than lookups in the link table (compile_region).
+  bool jit_block_imports = true;
   bool want_jit_names = false;
   bool want_probe_pad = false;
   bool want_compact = true;
@@ -1984,6 +1999,8 @@ int main(int argc, char** argv)
       jit_mem_groups = std::strcmp(argv[i] + 13, "off") != 0;
     else if (std::strncmp(argv[i], "--jit-hints=", 12) == 0)
       jit_branch_hints = std::strcmp(argv[i] + 12, "off") != 0;
+    else if (std::strncmp(argv[i], "--jit-imports=", 14) == 0)
+      jit_block_imports = std::strcmp(argv[i] + 14, "off") != 0;
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -2992,6 +3009,9 @@ int main(int argc, char** argv)
   u64 succ_edges = 0, succ_sibling = 0;
   // Direct-call holes reserved, and how many were filled with a sibling.
   u64 jit_direct_holes = 0, jit_direct_patched = 0;
+  // Holes bound to a block compiled earlier, through an import, and the
+  // imports it took (one per distinct target per module).
+  u64 jit_import_holes = 0, jit_import_funcs = 0;
   // A sink the optimiser cannot see through, for probes whose result is
   // otherwise unused.
   volatile u64 jit_probe_sink = 0;
@@ -3639,13 +3659,56 @@ int main(int argc, char** argv)
     //
     // Linear search over at most kRegion entries, which beats building a
     // map for sixteen items.
+    // ── bind the exits to blocks compiled earlier ──
+    //
+    // A hole whose target is not in this region but is already compiled
+    // (in some earlier module) is bound to that block as an IMPORT of this
+    // module: the hole becomes a `return_call` of the import, which V8
+    // compiles as a load of the callee's entry and a jump, instead of the
+    // link-table lookup and the function table's bounds and signature
+    // checks that a `return_call_indirect` costs -- some thirty host
+    // instructions a transition, on most transitions once the game is
+    // warm. The imports take the function indices after the host ones;
+    // the instantiation binds each to the earlier block's exported
+    // function (JitInstallBatch).
+    const int host_imports = static_cast<int>(mb.ImportCount());
+    std::vector<u32> import_targets;  // guest PC per import, in order
+    std::vector<int> import_indices;  // the target's table index
+    if (jit_block_imports)
+    {
+      for (const Pending& p : pending)
+        for (const ppc2wasm::DirectFixup& f : p.fixups)
+        {
+          bool sibling = false;
+          for (const Pending& q : pending)
+            sibling |= q.pc == f.target;
+          if (sibling)
+            continue;
+          if (std::find(import_targets.begin(), import_targets.end(), f.target) !=
+              import_targets.end())
+            continue;
+          auto it = jit_cache.find(f.target);
+          if (it == jit_cache.end() || it->second.index < 0 || it->second.retired)
+            continue;
+          import_targets.push_back(f.target);
+          import_indices.push_back(it->second.index);
+          mb.ImportBlock("b" + std::to_string(import_targets.size() - 1));
+        }
+      jit_import_funcs += import_targets.size();
+    }
     // Imported functions take the low indices, so a sibling's function
     // index is its position in `pending` plus the import count.
     const int import_count = static_cast<int>(mb.ImportCount());
-    auto index_of = [&pending, import_count](u32 target) -> int {
+    auto index_of = [&pending, &import_targets, import_count, host_imports, this_is_stats = &jit_import_holes](u32 target) -> int {
       for (size_t k = 0; k < pending.size(); ++k)
         if (pending[k].pc == target)
           return static_cast<int>(k) + import_count;
+      for (size_t k = 0; k < import_targets.size(); ++k)
+        if (import_targets[k] == target)
+        {
+          ++*this_is_stats;
+          return host_imports + static_cast<int>(k);
+        }
       return -1;
     };
     for (size_t k = 0; k < pending.size(); ++k)
@@ -3673,9 +3736,9 @@ int main(int argc, char** argv)
         std::printf("JITMOD %08x f%zu %zu\n", pending[k].pc, k, bytes.size());
         EmitBase64(bytes);
       }
-    const int base =
-        JitInstallBatch(bytes.data(), static_cast<int>(bytes.size()),
-                        static_cast<int>(pending.size()));
+    const int base = JitInstallBatch(bytes.data(), static_cast<int>(bytes.size()),
+                                     static_cast<int>(pending.size()), import_indices.data(),
+                                     static_cast<int>(import_indices.size()));
     if (want_jit_stats)
       jit_t_install += JitNow() - t_install0;
     if (base >= 0)
@@ -4852,6 +4915,9 @@ int main(int argc, char** argv)
       {
         std::printf("  jit       exits: uncond-b %u  bl %u  cond-taken %u  fallthrough %u\n",
                     link_stats[4], link_stats[5], link_stats[6], link_stats[7]);
+        std::printf("  jit       %llu exits bound to earlier blocks through %llu imports\n",
+                    static_cast<unsigned long long>(jit_import_holes),
+                    static_cast<unsigned long long>(jit_import_funcs));
         std::printf("  jit       %llu direct-call holes, %llu filled with a sibling (%.1f%%)\n",
                     static_cast<unsigned long long>(jit_direct_holes),
                     static_cast<unsigned long long>(jit_direct_patched),
