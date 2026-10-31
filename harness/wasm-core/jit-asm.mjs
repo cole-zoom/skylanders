@@ -9,7 +9,9 @@
 // TurboFan when the module is created -- no instantiation, so the imports
 // (the game's memory, table and hatch) need not exist -- and keeps only the
 // listing of the block asked for. Node's V8 is older than Chrome's, so read
-// it for the shape of the code, not for exact instruction counts.
+// it for the shape of the code, not for exact instruction counts. Node
+// needs the branch-hinting flag for the hints (StateLayout::branch_hints) to
+// place the cold code as Chrome does.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -48,7 +50,7 @@ for (const m of mods) {
   const file = join(outDir, `${m.pc}.wasm`);
   writeFileSync(file, bytes);
   const out = execFileSync(process.execPath,
-    ['--no-liftoff', '--no-wasm-lazy-compilation', '--print-wasm-code', self, '--compile', file],
+    ['--no-liftoff', '--no-wasm-lazy-compilation', '--experimental-wasm-branch-hinting', '--print-wasm-code', self, '--compile', file],
     { encoding: 'utf8', maxBuffer: 1 << 28 });
   // Function k of the module follows the imports; its listing is the one
   // named wasm-function[k + imports] (or b_<pc> with --jit-names).

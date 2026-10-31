@@ -1232,6 +1232,55 @@ The walking pairs are off, on, on, off in one sitting: a single pair on
 this scene moved 6-9 points with the run order alone (the second of two
 long runs slower, the battery charging), and two pairs in opposite orders
 said -9 and +6; four runs in a row say +5 twice, with the two offs equal.
+### Guest registers in locals
+
+The fourth item of `docs/HANDOFF-FIGHT-SPEED.md` §4. Every guest register
+lived in `PowerPCState`: an instruction loaded its operands from memory
+and stored its result there, so a dependent chain of guest instructions
+paid a store-to-load forward at every link, and a block's hot path was
+two loads and a store per instruction before it computed anything.
+
+*What changes* (`StateLayout::reg_cache`, `--jit-regs`): a block keeps
+the general-purpose registers in wasm locals, one per register after the
+vector locals, and reads them from there. Writes are write-through -- the
+value goes into the local AND into memory -- so memory is always current
+and no exit has anything to flush: a bail, a tail call to the next block,
+the link epilogue all leave as before. The registers an instruction
+reads are brought into their locals at the top level before it
+(`GprReads`, `PrefetchGpr`), once per block, so a read inside any depth of
+control flow finds the local current; a read of a register not in its
+local goes to memory, which is always right. Where the interpreter runs an
+instruction in the middle of a block -- a hatch, the memory helper -- the
+registers it may have written (`GprWrites`) are reloaded on that path,
+and an instruction whose writes it cannot name leaves every local
+untrusted for the rest of the block. TurboFan turns the locals into
+SSA values and so into machine registers, spilling what does not fit.
+
+*Measured.* Fight state, window 3-20 s, each pair alternated, two
+rounds:
+
+| | off | registers in locals |
+|---|---|---|
+| fight, 3-20 s | 104.9 / 104.9% | 106.4 / 106.0% |
+| median second | 107% | 108% |
+| whole run | 91.5 / 91.4% | 91.9 / 91.4% |
+
+| scene | off | on |
+|---|---|---|
+| the vortex, 3-30 s | 127.5% | 129.8% |
+| the town gate, 3-20 s | 108.5% | 111.6% |
+| walking, 300-400 s (off, on, on, off) | 132.7 / 132.2% | 138.0 / 138.3% |
+
+Frames identical in every pair. The walking runs are off, on, on, off in
+one sitting, because a single pair on this scene moves several points
+with the run order alone (the second long run slower). From the machine
+code of a hot fight block: the hot path loses half its loads from the
+register file (80 to 39) and a tenth of its length; TurboFan's compile
+takes 6-8% longer; the cold reloads after a hatch add to the code that
+never runs. M3 passes on all four captures. The differentials pass with `--regs` in every
+combination with the existing flags; the random blocks and chains mix
+hatched instructions with translated ones, which is where a stale local
+would show. `--jit-regs=off` is the old code.
 
 ## 6. Risks
 

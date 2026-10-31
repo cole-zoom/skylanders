@@ -67,10 +67,12 @@ struct BlockResult
   uint32_t end_pc;        // where the interpreter should resume
   const char* stopped_on; // why the block ended, for diagnostics
 
-  // i32 locals declared after the v128 ones, one per access group
+  // i32 locals declared after the v128 ones: the register locals
+  // (StateLayout::reg_cache, 32 of them) and then one per access group
   // (StateLayout::mem_groups); their indices start at 1 + locals +
-  // locals_i64 + locals_v128.
+  // locals_i64 + locals_v128. `groups` is how many of them are groups.
   uint32_t locals_tail = 0;
+  uint32_t groups = 0;
   // Branch hints for `body` (StateLayout::branch_hints): every bail,
   // miss and hatch branch marked unlikely, for ModuleBuilder::AddFunction.
   std::vector<BranchHint> hints;
@@ -227,6 +229,19 @@ struct StateLayout
   // miss path to every access (probe_cold_pad) costs a seventh of the
   // speed, which is what this is for.
   bool branch_hints = false;
+  // ── guest registers in locals ──
+  //
+  // When set, a block keeps the general-purpose registers it touches in
+  // wasm locals -- one per register, after the vector locals -- and reads
+  // them from there instead of from PowerPCState. Writes go to BOTH the
+  // local and memory (write-through), so memory is always current and no
+  // exit has anything to flush; a read of a register not yet in its local
+  // loads it once. Where the interpreter runs an instruction in the middle
+  // of a block (a hatch), the registers it may have written are reloaded on
+  // that path. Every guest write still costs a store; what goes is the
+  // load before every use, and with it the store-to-load forwarding a
+  // dependent chain of guest instructions paid at every link.
+  bool reg_cache = false;
   uint32_t xer_ca_offset = 0;    // offsetof(PowerPCState, xer_ca)
   uint32_t xer_stringctrl_offset = 0;  // offsetof(PowerPCState, xer_stringctrl)
   // Floating point. ps[] is 32 PairedSingle of two u64 each (ps0 at +0,
@@ -575,14 +590,66 @@ inline uint32_t Mask(uint32_t mb, uint32_t me)
   return m;
 }
 
-// Push gpr[n] onto the wasm stack. `state` is local 0.
+// ── guest registers in locals (StateLayout::reg_cache) ──
+//
+// The compile-time state of the register locals, installed for one compile
+// like the hint sink. `loaded` names the registers whose local is known to
+// hold the register's value on every path to the current instruction;
+// `stored` the ones the instruction being emitted has written through
+// EndStoreGpr, which CompileBlockFetch adds to `loaded` once the
+// instruction is complete -- the write is the last thing an instruction
+// does on its normal path, and a hatch that skips it reloads instead.
+struct RegCache
+{
+  uint32_t base = 0;    // the local holding r0; r1 is base + 1, and so on
+  uint32_t loaded = 0;  // bit n: local base + n holds rN
+  uint32_t stored = 0;  // bit n: this instruction wrote rN through its local
+  bool invalidate_all = false;  // an interpreter call whose writes are unknown
+};
+inline thread_local RegCache* g_regs = nullptr;
+
+struct RegCacheScope
+{
+  RegCache* prev;
+  explicit RegCacheScope(RegCache* c) : prev(g_regs) { g_regs = c; }
+  ~RegCacheScope() { g_regs = prev; }
+};
+
+inline bool GprWrites(uint32_t ins, uint32_t* out);
+
+// Push gpr[n] onto the wasm stack. `state` is local 0. From the register's
+// local when the block keeps it there (StateLayout::reg_cache) and it is
+// known to be current; from memory otherwise -- a load from memory is
+// always right, since every write reaches memory.
 inline void LoadGpr(Bytes& b, const StateLayout& l, uint32_t n)
 {
+  if (g_regs && (g_regs->loaded & (1u << n)))
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, g_regs->base + n);
+    return;
+  }
   b.push_back(kLocalGet);
   PutU32(b, 0);
   b.push_back(kI32Load);
   PutU32(b, 2);  // alignment 2^2
   PutU32(b, l.gpr_offset + n * 4);
+}
+
+// Load gpr[n] from memory into its local, at the top level of the block:
+// CompileBlockFetch does this for the registers an instruction reads
+// before emitting it, so that the instruction's own reads, at whatever
+// depth of control flow, find the local current.
+inline void PrefetchGpr(Bytes& b, const StateLayout& l, uint32_t n)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI32Load);
+  PutU32(b, 2);
+  PutU32(b, l.gpr_offset + n * 4);
+  b.push_back(kLocalSet);
+  PutU32(b, g_regs->base + n);
+  g_regs->loaded |= 1u << n;
 }
 
 // In several instructions the rA field means LITERAL ZERO rather than r0.
@@ -609,9 +676,44 @@ inline void BeginStoreGpr(Bytes& b)
 
 inline void EndStoreGpr(Bytes& b, const StateLayout& l, uint32_t n)
 {
+  if (g_regs)
+  {
+    // Write-through: the value into the local as well as into memory.
+    b.push_back(kLocalTee);
+    PutU32(b, g_regs->base + n);
+    g_regs->stored |= 1u << n;
+  }
   b.push_back(kI32Store);
   PutU32(b, 2);
   PutU32(b, l.gpr_offset + n * 4);
+}
+
+// After the interpreter has run `ins` inside a block and the block goes
+// on: bring the registers it may have written back into their locals, on
+// this path. Unknown writes leave the locals untrusted for the rest of the
+// block instead (CompileBlockFetch clears `loaded` after the instruction).
+inline void EmitReloadAfterInterpreter(Bytes& b, const StateLayout& l, uint32_t ins)
+{
+  if (!g_regs)
+    return;
+  uint32_t w = 0;
+  if (!GprWrites(ins, &w))
+  {
+    g_regs->invalidate_all = true;
+    return;
+  }
+  for (uint32_t r = 0; r < 32; ++r)
+  {
+    if (!(w & (1u << r)))
+      continue;
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.gpr_offset + r * 4);
+    b.push_back(kLocalSet);
+    PutU32(b, g_regs->base + r);
+  }
 }
 
 // ── branch hints (StateLayout::branch_hints) ──
@@ -801,6 +903,7 @@ inline void EmitHatchCall(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t
     b.push_back(kCall);
     PutU32(b, l.hatch_exit_index);
     EmitSlowExit(b, l);
+    EmitReloadAfterInterpreter(b, l, ins);
     return;
   }
   b.push_back(kLocalGet);
@@ -837,6 +940,7 @@ inline void EmitHatchCall(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t
   PutU32(b, l.pc_offset);
   b.push_back(kReturn);
   b.push_back(kEnd);
+  EmitReloadAfterInterpreter(b, l, ins);
 }
 
 // Whether a store based on `ra` is worth the inline gather-pipe path. Under
@@ -1003,6 +1107,7 @@ inline void EmitTranslate(Bytes& b, const StateLayout& l, uint32_t ea_local,
     b.push_back(kCall);
     PutU32(b, l.mem_slow_index);
     EmitSlowExit(b, l);
+    EmitReloadAfterInterpreter(b, l, ins);
     b.push_back(kBr);
     PutU32(b, skip_depth + 1);  // out of the miss branch and the caller's block
     return;
@@ -4671,6 +4776,114 @@ inline bool GprWrites(uint32_t ins, uint32_t* out)
   }
 }
 
+// Which general-purpose registers an instruction reads, as a bitmask, for
+// the register locals: CompileBlockFetch loads these into their locals
+// before the instruction. Over-approximation costs a load; a register
+// missed here is read from memory by LoadGpr, which is always right. An rA
+// of zero that means literal zero is not a read.
+inline bool GprReads(uint32_t ins, uint32_t* out)
+{
+  *out = 0;
+  const auto reg = [](uint32_t r) { return 1u << r; };
+  const uint32_t op = Opcode(ins);
+  const uint32_t ra_or_zero = RA(ins) ? reg(RA(ins)) : 0;
+  switch (op)
+  {
+  case 16: case 17: case 18: case 19:  // branches, sc, the CR ops and returns
+    return true;
+  case 3: case 7: case 8: case 10: case 11: case 12: case 13:  // twi, mulli, subfic, cmpli, cmpi, addic, addic.
+    *out = reg(RA(ins));
+    return true;
+  case 14: case 15:  // addi, addis
+    *out = ra_or_zero;
+    return true;
+  case 20:  // rlwimi reads the destination too
+    *out = reg(RS(ins)) | reg(RA(ins));
+    return true;
+  case 21: case 24: case 25: case 26: case 27: case 28: case 29:  // rlwinm, ori, oris, xori, xoris, andi., andis.
+    *out = reg(RS(ins));
+    return true;
+  case 23:  // rlwnm
+    *out = reg(RS(ins)) | reg(RB(ins));
+    return true;
+  case 32: case 33: case 34: case 35: case 40: case 41: case 42: case 43:  // loads
+  case 46:                                                                // lmw
+  case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55:  // float loads and stores
+  case 56: case 57: case 60: case 61:                                      // psq_l, psq_st
+    *out = ra_or_zero;
+    return true;
+  case 36: case 37: case 38: case 39: case 44: case 45:  // stores
+    *out = ra_or_zero | reg(RS(ins));
+    return true;
+  case 47:  // stmw: rS through r31
+    *out = ra_or_zero | (~0u << RS(ins));
+    return true;
+  case 59: case 63:  // floating point
+    return true;
+  case 4:
+  {
+    const uint32_t sub = (ins >> 1) & 0x3F;
+    if (sub == 6 || sub == 7 || sub == 38 || sub == 39)  // psq_lx, psq_stx, psq_lux, psq_stux
+      *out = ra_or_zero | reg(RB(ins));
+    return true;
+  }
+  case 31:
+  {
+    const uint32_t xo = XO(ins);
+    switch (xo & 0x1FF)
+    {
+    case 266: case 10: case 138: case 40: case 8: case 136:  // add, addc, adde, subf, subfc, subfe
+    case 235: case 75: case 11: case 491: case 459:          // mullw, mulhw, mulhwu, divw, divwu
+      *out = reg(RA(ins)) | reg(RB(ins));
+      return true;
+    case 234: case 202: case 232: case 200: case 104:  // addme, addze, subfme, subfze, neg
+      *out = reg(RA(ins));
+      return true;
+    default:
+      break;
+    }
+    switch (xo)
+    {
+    case 23: case 87: case 279: case 343: case 534: case 790: case 20:  // loads, x-form; lwarx
+    case 55: case 119: case 311: case 375:                             // ... update forms
+    case 535: case 599: case 567: case 631:                            // float loads
+    case 0: case 32: case 4:                                           // cmp, cmpl, tw
+    case 54: case 86: case 278: case 246: case 470: case 1014: case 982:  // the cache ops
+      *out = ra_or_zero | reg(RB(ins));
+      return true;
+    case 151: case 215: case 407: case 662: case 918: case 150:  // stores, x-form; stwcx.
+    case 183: case 247: case 439:                                // ... update forms
+      *out = ra_or_zero | reg(RB(ins)) | reg(RS(ins));
+      return true;
+    case 663: case 727: case 983: case 695: case 759:  // float stores
+      *out = ra_or_zero | reg(RB(ins));
+      return true;
+    case 28: case 60: case 444: case 412: case 316: case 476: case 124: case 284:  // and .. eqv
+    case 24: case 536: case 792:                                                   // slw, srw, sraw
+      *out = reg(RS(ins)) | reg(RB(ins));
+      return true;
+    case 824: case 26: case 954: case 922:  // srawi, cntlzw, extsb, extsh
+    case 467: case 144: case 146: case 210:  // mtspr, mtcrf, mtmsr, mtsr
+      *out = reg(RS(ins));
+      return true;
+    case 242:  // mtsrin
+      *out = reg(RS(ins)) | reg(RB(ins));
+      return true;
+    case 339: case 371: case 19: case 83: case 595:  // mfspr, mftb, mfcr, mfmsr, mfsr
+    case 598: case 854: case 566: case 512:          // sync, eieio, tlbsync, mcrxr
+      return true;
+    case 659: case 306:  // mfsrin, tlbie
+      *out = reg(RB(ins));
+      return true;
+    default:
+      return false;
+    }
+  }
+  default:
+    return false;
+  }
+}
+
 // The most groups a block carries; each costs a local.
 constexpr uint32_t kMaxMemGroups = 4;
 
@@ -4681,7 +4894,7 @@ constexpr uint32_t kMaxMemGroups = 4;
 // whose constant every later member's displacement absorbs. Groups of one
 // are not groups. The result's roles are indexed like `scan`.
 inline MemPlan BuildMemPlan(const std::vector<MemScanEntry>& scan, uint32_t locals,
-                            uint32_t locals_i64, uint32_t locals_v128)
+                            uint32_t locals_i64, uint32_t locals_v128, uint32_t first_local)
 {
   MemPlan plan;
   plan.locals = locals;
@@ -4751,7 +4964,6 @@ inline MemPlan BuildMemPlan(const std::vector<MemScanEntry>& scan, uint32_t loca
   if (groups.size() > kMaxMemGroups)
     groups.resize(kMaxMemGroups);
   plan.roles.assign(scan.size(), MemRole{});
-  const uint32_t first_local = 1 + locals + locals_i64 + locals_v128;
   for (uint32_t g = 0; g < groups.size(); ++g)
   {
     int32_t lo = groups[g][0].second, hi = lo;
@@ -4805,6 +5017,12 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
   // Branch hints, collected as the emitters mark them (HintUnlikely).
   std::vector<BranchHint> hints;
   HintScope hint_scope(layout.branch_hints ? &hints : nullptr, &body);
+  // The register locals, at a fixed place: with them on, every i32 and
+  // i64 local is declared (and the vector ones under simd_ps), so r0's
+  // local is the same index whatever the block uses.
+  RegCache regs;
+  regs.base = 1 + 8 + 6 + (layout.simd_ps ? kV128Locals : 0);
+  RegCacheScope reg_scope(layout.reg_cache ? &regs : nullptr);
   // Scratch locals above the state parameter: 1 = effective/host address,
   // 2 = the value being stored. Declared only if used, so a block of pure
   // register arithmetic still emits none.
@@ -4917,6 +5135,19 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     bool followed = false;
     const uint32_t op = Opcode(ins);
     bool handled = false;
+    // The register locals: what this instruction reads comes into its
+    // locals here, at the top level, so that every read inside the
+    // handler -- at whatever depth of control flow -- finds it current.
+    if (g_regs)
+    {
+      g_regs->stored = 0;
+      g_regs->invalidate_all = false;
+      uint32_t reads = 0;
+      if (GprReads(ins, &reads))
+        for (uint32_t r = 0; r < 32; ++r)
+          if ((reads & ~g_regs->loaded) & (1u << r))
+            PrefetchGpr(body, layout, r);
+    }
     // A branch is translated and then TERMINATES the block: control leaves
     // here, so anything after it in the instruction stream belongs to a
     // different block.
@@ -7042,6 +7273,15 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       stopped = "unsupported instruction";
       break;
     }
+    // The instruction is complete: what it wrote through its locals is
+    // current on every path out of it (a hatch that skipped the write
+    // reloaded), unless the interpreter may have written anything.
+    if (g_regs)
+    {
+      g_regs->loaded |= g_regs->stored;
+      if (g_regs->invalidate_all)
+        g_regs->loaded = 0;
+    }
     if (followed)
       continue;
     prev2_ins = prev_ins;
@@ -7225,22 +7465,34 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
     used_i64 = 6;
     used_v128 = kV128Locals;
   }
+  if (layout.reg_cache)
+  {
+    // Every fixed local declared, so the register locals start where
+    // RegCache::base says.
+    used_locals = 8;
+    used_i64 = 6;
+    used_v128 = layout.simd_ps ? kV128Locals : 0;
+  }
+  const uint32_t reg_locals = layout.reg_cache ? 32 : 0;
   if (scanning)
   {
     // The first pass is done: if any two accesses can share a translation,
     // compile again with the roles. The locals are the same both times
     // (a member uses what its instruction already used), so the first
-    // pass's counts place the group locals.
-    const MemPlan p = BuildMemPlan(scan, used_locals, used_i64, used_v128);
+    // pass's counts place the group locals, after the register locals.
+    const MemPlan p = BuildMemPlan(scan, used_locals, used_i64, used_v128,
+                                   1 + used_locals + used_i64 + used_v128 + reg_locals);
     if (p.groups)
       return CompileBlockFetch(fetch, start_pc, max_insts, layout, emit_module, &p);
   }
+  r.locals_tail = reg_locals;
   if (plan)
   {
     used_locals = plan->locals;
     used_i64 = plan->locals_i64;
     used_v128 = plan->locals_v128;
-    r.locals_tail = plan->groups;
+    r.locals_tail += plan->groups;
+    r.groups = plan->groups;
   }
   r.locals = used_locals;
   r.locals_i64 = used_i64;

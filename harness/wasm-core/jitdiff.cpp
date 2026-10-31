@@ -254,11 +254,13 @@ int main(int argc, char** argv)
   // one base register share a translation (StateLayout::mem_groups). Both
   // exact, so every expectation holds with them on.
   bool want_compact = false, want_short_convert = false, want_simd = false, want_warm = false;
-  bool want_direct = false, want_groups = false, want_hints = false;
+  bool want_direct = false, want_groups = false, want_hints = false, want_regs = false;
   for (int i = 1; i < argc; ++i)
   {
     if (std::strcmp(argv[i], "--hints") == 0)
       want_hints = true;  // StateLayout::branch_hints: layout only, so every expectation holds
+    else if (std::strcmp(argv[i], "--regs") == 0)
+      want_regs = true;  // StateLayout::reg_cache: registers in locals, write-through
     if (std::strcmp(argv[i], "--compact") == 0)
       want_compact = true;
     else if (std::strcmp(argv[i], "--short-convert") == 0)
@@ -272,11 +274,11 @@ int main(int argc, char** argv)
     else if (std::strcmp(argv[i], "--groups") == 0)
       want_groups = true;
   }
-  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s%s%s%s%s\n\n",
+  std::printf("target: wasm32  recompiled blocks vs the interpreter%s%s%s%s%s%s%s%s\n\n",
               want_compact ? "  [compact]" : "", want_short_convert ? "  [short-convert]" : "",
               want_simd ? "  [simd]" : "", want_warm ? "  [warm]" : "",
               want_direct ? "  [direct]" : "", want_groups ? "  [groups]" : "",
-              want_hints ? "  [hints]" : "");
+              want_hints ? "  [hints]" : "", want_regs ? "  [regs]" : "");
 
   auto& system = Core::System::GetInstance();
   Config::Init();
@@ -434,6 +436,7 @@ int main(int argc, char** argv)
   }
   layout.mem_groups = want_groups;
   layout.branch_hints = want_hints;
+  layout.reg_cache = want_regs;
   // dcbz needs HID0[DCE]; the boot sets it and so does this.
   state.spr[SPR_HID0] |= 1u << 14;
   // Floating-point registers: seeded with a mix of ordinary doubles, bit
