@@ -3,6 +3,7 @@
 /*
 !/web
 !/vercel.json
+!/api
 /web/serve.mjs
 /web/build.sh
 /web/smoke.mjs
