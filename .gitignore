@@ -43,6 +43,9 @@ build-*/
 cmake-build-*/
 target/
 dist/
+# ... except the page's build, which a Git import of the repo deploys as is
+# (vercel.json); web/build.sh refreshes it and the commit carries it.
+!web/dist/
 out/
 node_modules/
 .emscripten_cache/
@@ -70,3 +73,4 @@ harness/reference/*.png
 spikes/webgpu/replay.html
 __pycache__/
 *.pyc
+.vercel

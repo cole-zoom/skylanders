@@ -37,8 +37,25 @@ const ISOLATED = {
   'Cross-Origin-Embedder-Policy': 'require-corp',
 };
 
+// The disc is readable from another origin too -- a page hosted elsewhere
+// (web/vercel.json) pointed at this server with ?disc=. A range request
+// needs no preflight (Range is a CORS-safelisted header), only the allow
+// and the exposed length and range.
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
+};
+
 function serveDisc(req, res) {
-  const headers = { ...ISOLATED, 'Accept-Ranges': 'bytes' };
+  const headers = { ...ISOLATED, ...CORS, 'Accept-Ranges': 'bytes' };
+  if (req.method === 'OPTIONS') {  // a preflight, should the browser send one
+    res.writeHead(204, { ...headers, 'Access-Control-Allow-Methods': 'GET, HEAD',
+                         'Access-Control-Allow-Headers': 'Range', 'Access-Control-Max-Age': '86400',
+                         // Chrome asks this of a public page reaching a local server.
+                         'Access-Control-Allow-Private-Network': 'true' })
+       .end();
+    return;
+  }
   const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
   if (!m) {
     res.writeHead(416, { ...headers, 'Content-Range': `bytes */${size}` })
