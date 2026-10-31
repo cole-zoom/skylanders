@@ -51,13 +51,20 @@ const speed = params.get('speed') ?? '1';
 // ?chunk=KB: the disc is fetched and cached in pieces of this size (0: each
 // read as asked); the default suits a disc across the internet.
 const chunk = params.get('chunk');
+// ?ahead=N: chunks fetched before the game asks for them, by a thread of
+// their own (0: none; the default suits a disc across the internet).
+const ahead = params.get('ahead');
 const audio = params.get('audio') !== '0';
 const figure = params.get('figure');
 // The run never ends on its own; the step count is only a cap.
-// The disc: the server's range endpoint next to the page, or the URL
-// ?disc= names -- a Blob store on another origin, when the page is hosted
-// where no server serves ranges (web/vercel.json).
-const disc = params.get('disc') ?? new URL('disc', location.href).href;
+// The disc: the URL ?disc= names; else the one the host names (GET disc?url,
+// api/disc.js -- an object store on another origin, which the browser reads
+// itself rather than through the host, one hop fewer a chunk); else the
+// range endpoint next to the page (web/serve.mjs, or the host's proxy).
+const named = await fetch('disc?url').then(r => (r.ok ? r.text() : null)).catch(() => null);
+const disc = params.get('disc') ??
+             (/^https?:\/\/\S+$/.test((named ?? '').trim()) ? named.trim() : null) ??
+             new URL('disc', location.href).href;
 const args = [disc, '1000000000000000000',
               '--jit', '--dual-core', '--webgpu', '--no-osd', '--live-input',
               ...(audio ? ['--audio'] : []),
@@ -65,6 +72,7 @@ const args = [disc, '1000000000000000000',
               '--keep-nand',
               `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander',
               ...(chunk ? [`--disc-chunk=${chunk}`] : []),
+              ...(ahead ? [`--disc-ahead=${ahead}`] : []),
               // The game's pipelines, compiled at boot rather than the first
               // time each is drawn (web/make-uidcache.sh). Absent, the game
               // still runs, with a stall at each new pipeline.
@@ -82,6 +90,7 @@ const readStage = () => {
 // Every reading is also sent to the server (web/serve.mjs writes them to a
 // file), so a play session leaves a record of where it was slow.
 let lastEmulated = 0, lastWall = 0, lastCompiles = 0, lastCompileMs = 0;
+let lastStalls = 0, lastDiscMs = 0;
 // keepalive (a send that outlives the page) only when the page is going:
 // the browser refuses a keepalive body over 64 KB, and the boot's log is more.
 // A host without the endpoint (web/vercel.json) answers 404 once; after
@@ -110,16 +119,23 @@ const hud = () => {
     // is a stall, not the emulator running slowly.
     const compiles = Module._harness_compiles?.() ?? 0;
     const compileMs = Module._harness_compile_ms?.() ?? 0;
+    // And the disc reads that waited for the network, and how long: a
+    // slow second can be the CPU thread waiting out a fetch.
+    const stalls = Module._harness_disc_stalls?.() ?? 0;
+    const discMs = Module._harness_disc_wait_ms?.() ?? 0;
     if (lastWall && pct >= 0 && pct < 1000) {
       $('speed').textContent = `${pct.toFixed(0)}%`;
       readouts.push(`${new Date().toISOString()} emulated ${emulated.toFixed(1)} s ` +
                     `readout ${pct.toFixed(0)}% compiled ${compiles - lastCompiles} ` +
-                    `in ${(compileMs - lastCompileMs).toFixed(0)} ms`);
+                    `in ${(compileMs - lastCompileMs).toFixed(0)} ms ` +
+                    `disc ${stalls - lastStalls} in ${(discMs - lastDiscMs).toFixed(0)} ms`);
     }
     lastEmulated = emulated;
     lastWall = wall;
     lastCompiles = compiles;
     lastCompileMs = compileMs;
+    lastStalls = stalls;
+    lastDiscMs = discMs;
   }
 };
 

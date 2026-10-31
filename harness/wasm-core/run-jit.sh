@@ -10,6 +10,10 @@
 # wasm.
 #
 # Needs the disc at /tmp/ssa.iso, which run-boot-browser.mjs serves on :8101.
+# DISC=<url> reads the disc from there instead -- the object store the hosted
+# page reads from, to measure what the internet does to a scene (the
+# `disc window` line: how long the game's reads waited). Keep that URL out of
+# the repository; it is the game.
 #
 # Measure at several step counts before believing any single number. Module
 # installation is a ONE-OFF cost of about 22 us per block, so a short run
@@ -45,7 +49,7 @@ const tail = () => {
 };
 var Module = {
   canvas: document.getElementById('canvas'),
-  arguments: ['http://127.0.0.1:8101/', '$STEPS'$ARGS],
+  arguments: ['${DISC:-http://127.0.0.1:8101/}', '$STEPS'$ARGS],
   print:    (t) => { window.__lines.push(t); if (window.__lines.length % 500 === 0) tail(); },
   printErr: (t) => { window.__lines.push('! ' + t); },
   onExit:   (c) => { window.__lines.push('EXIT ' + c); window.__done = true; tail(); },

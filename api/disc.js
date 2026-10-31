@@ -17,6 +17,16 @@ export default async function handler(req, res) {
     res.status(405).end();
     return;
   }
+  // GET /disc?url: where the disc is, for a page that will read it there
+  // itself -- one hop fewer a chunk than through this function, and no
+  // function running for every one. The proxy below stays for a browser
+  // that cannot read the store directly.
+  if (new URL(req.url, 'http://host').searchParams.has('url')) {
+    res.setHeader('content-type', 'text/plain');
+    res.setHeader('cache-control', 'no-store');
+    res.status(200).send(url);
+    return;
+  }
   const range = req.headers.range;
   if (!/^bytes=\d+-\d*$/.test(range ?? '')) {
     res.status(416).send('this endpoint serves ranges only');
