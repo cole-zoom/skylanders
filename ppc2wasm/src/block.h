@@ -242,6 +242,12 @@ struct StateLayout
   // load before every use, and with it the store-to-load forwarding a
   // dependent chain of guest instructions paid at every link.
   bool reg_cache = false;
+  // ── the hatch's biggest customers, translated ──
+  //
+  // The CR logical ops and mcrf (EmitCrLogical, EmitMcrf), andi. and
+  // andis., and dcbz_l (EmitDcbzL). Off, they go to the interpreter
+  // through the hatch as before.
+  bool extra_forms = true;
   uint32_t xer_ca_offset = 0;    // offsetof(PowerPCState, xer_ca)
   uint32_t xer_stringctrl_offset = 0;  // offsetof(PowerPCState, xer_stringctrl)
   // Floating point. ps[] is 32 PairedSingle of two u64 each (ps0 at +0,
@@ -3557,6 +3563,147 @@ inline void EmitMtcrf(Bytes& b, const StateLayout& l, uint32_t rs, uint32_t crm)
 // both engines handle that in the interpreter, through the hatch, so the
 // inline path is the ordered three-way result and nothing else.
 // Locals: 2 scratch, 9 and 10 the operands.
+// The condition register's own logic: crand, cror, crxor, crnand, crnor,
+// creqv, crandc, crorc (op 19), as Interpreter_SystemRegisters.cpp has
+// them -- GetBit on two fields, SetBit on a third. A bit is read by
+// decoding its field to PowerPC's four bits (EmitCrFieldDecode) and
+// picking one; it is written by decoding the destination field, replacing
+// the bit, and re-encoding through s_crTable, as SetBit does. cror alone
+// was 29% of what the fight handed to the interpreter.
+inline void EmitCrLogical(Bytes& b, const StateLayout& l, uint32_t xo, uint32_t crbd,
+                          uint32_t crba, uint32_t crbb)
+{
+  auto push_bit = [&](uint32_t crb) {
+    EmitCrFieldDecode(b, l, crb >> 2);
+    if (3 - (crb & 3))
+    {
+      b.push_back(kI32Const);
+      PutI32(b, static_cast<int32_t>(3 - (crb & 3)));
+      b.push_back(kI32ShrU);
+    }
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32And);
+  };
+  auto push_not = [&]() {
+    b.push_back(kI32Const);
+    PutI32(b, 1);
+    b.push_back(kI32Xor);
+  };
+  push_bit(crba);
+  push_bit(crbb);
+  switch (xo)
+  {
+  case 257: b.push_back(kI32And); break;               // crand
+  case 449: b.push_back(kI32Or); break;                // cror
+  case 193: b.push_back(kI32Xor); break;               // crxor
+  case 225: b.push_back(kI32And); push_not(); break;   // crnand
+  case 33:  b.push_back(kI32Or); push_not(); break;    // crnor
+  case 289: b.push_back(kI32Xor); push_not(); break;   // creqv
+  case 129: push_not(); b.push_back(kI32And); break;   // crandc: a & ~b
+  case 417: push_not(); b.push_back(kI32Or); break;    // crorc: a | ~b
+  default: break;
+  }
+  b.push_back(kLocalSet);
+  PutU32(b, 2);
+  // fields[d] = s_crTable[(decode(d) & ~(8 >> bit)) | (value << (3 - bit))]
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  EmitCrFieldDecode(b, l, crbd >> 2);
+  b.push_back(kI32Const);
+  PutI32(b, ~static_cast<int32_t>(8u >> (crbd & 3)));
+  b.push_back(kI32And);
+  b.push_back(kLocalGet);
+  PutU32(b, 2);
+  if (3 - (crbd & 3))
+  {
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(3 - (crbd & 3)));
+    b.push_back(kI32Shl);
+  }
+  b.push_back(kI32Or);
+  b.push_back(kI32Const);
+  PutI32(b, 3);
+  b.push_back(kI32Shl);
+  b.push_back(kI32Const);
+  PutI32(b, static_cast<int32_t>(l.cr_table_base));
+  b.push_back(kI32Add);
+  b.push_back(kI64Load);
+  PutU32(b, 3);
+  PutU32(b, 0);
+  b.push_back(kI64Store);
+  PutU32(b, 3);
+  PutU32(b, l.cr_offset + 8 * (crbd >> 2));
+}
+
+// mcrf crfD, crfS: one field copied to another, in the internal encoding.
+inline void EmitMcrf(Bytes& b, const StateLayout& l, uint32_t crfd, uint32_t crfs)
+{
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kLocalGet);
+  PutU32(b, 0);
+  b.push_back(kI64Load);
+  PutU32(b, 3);
+  PutU32(b, l.cr_offset + 8 * crfs);
+  b.push_back(kI64Store);
+  PutU32(b, 3);
+  PutU32(b, l.cr_offset + 8 * crfd);
+}
+
+// dcbz_l rA, rB: 32 bytes zeroed at the locked-cache line, as
+// Interpreter_LoadStore.cpp has it -- a program exception without
+// HID2[LCE], an alignment exception without HID0[DCE], both left to the
+// interpreter through the hatch; then the address translated as any store
+// (the locked cache included) and the line zeroed. Only without data
+// cache emulation, which the caller decides (StateLayout::dcache_enabled).
+inline void EmitDcbzL(Bytes& b, const StateLayout& l, uint32_t pc, uint32_t n, uint32_t ra,
+                      uint32_t rb, uint32_t ins)
+{
+  b.push_back(kBlock);
+  b.push_back(kVoid);
+  auto require_spr_bit = [&](uint32_t spr, uint32_t bit) {
+    b.push_back(kLocalGet);
+    PutU32(b, 0);
+    b.push_back(kI32Load);
+    PutU32(b, 2);
+    PutU32(b, l.spr_offset + spr * 4);
+    b.push_back(kI32Const);
+    PutI32(b, static_cast<int32_t>(bit));
+    b.push_back(kI32And);
+    b.push_back(kI32Eqz);
+    HintUnlikely(b);
+    b.push_back(kIf);
+    b.push_back(kVoid);
+    EmitHatchCall(b, l, ins, pc, n);
+    b.push_back(kBr);
+    PutU32(b, 1);
+    b.push_back(kEnd);
+  };
+  require_spr_bit(920, 1u << 28);   // HID2[LCE]
+  require_spr_bit(1008, 1u << 14);  // HID0[DCE]
+  LoadGprOrZero(b, l, ra);
+  LoadGpr(b, l, rb);
+  b.push_back(kI32Add);
+  b.push_back(kI32Const);
+  PutI32(b, -32);
+  b.push_back(kI32And);
+  b.push_back(kLocalSet);
+  PutU32(b, 1);
+  EmitTranslate(b, l, 1, 2, pc, n, ins, 0);
+  for (uint32_t off = 0; off < 32; off += 8)
+  {
+    b.push_back(kLocalGet);
+    PutU32(b, 1);
+    b.push_back(kI64Const);
+    PutI64(b, 0);
+    b.push_back(kI64Store);
+    PutU32(b, 0);
+    PutU32(b, off);
+  }
+  b.push_back(kEnd);
+}
+
 inline void EmitFcmp(Bytes& b, const StateLayout& l, uint32_t ins, uint32_t pc,
                      uint32_t insts_before)
 {
@@ -4825,6 +4972,8 @@ inline bool GprReads(uint32_t ins, uint32_t* out)
     const uint32_t sub = (ins >> 1) & 0x3F;
     if (sub == 6 || sub == 7 || sub == 38 || sub == 39)  // psq_lx, psq_stx, psq_lux, psq_stux
       *out = ra_or_zero | reg(RB(ins));
+    else if (XO(ins) == 1014)  // dcbz_l
+      *out = ra_or_zero | reg(RB(ins));
     return true;
   }
   case 31:
@@ -5192,6 +5341,22 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       break;
     }
 
+    case 28:  // andi. rA, rS, UIMM -- always sets CR0 (its Rc bit is UIMM's)
+    case 29:  // andis.
+    {
+      if (!layout.cr_offset || !layout.extra_forms)
+        break;
+      BeginStoreGpr(body);
+      LoadGpr(body, layout, RS(ins));
+      body.push_back(kI32Const);
+      PutI32(body, static_cast<int32_t>(op == 29 ? (UIMM(ins) << 16) : UIMM(ins)));
+      body.push_back(kI32And);
+      EndStoreGpr(body, layout, RA(ins));
+      EmitUpdateCR0(body, layout, RA(ins));
+      handled = true;
+      break;
+    }
+
     case 21:  // rlwinm rA, rS, SH, MB, ME -- rotate left then mask
     {
       BeginStoreGpr(body);
@@ -5434,6 +5599,15 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
         break;
       const uint32_t xo = XO(ins);
       const bool paired = (op == 4);
+      if (paired && xo == 1014 && layout.extra_forms && !layout.dcache_enabled && layout.interp_hatch &&
+          (layout.region_table || layout.direct_base))
+      {
+        EmitDcbzL(body, layout, this_pc, n, RA(ins), RB(ins), ins);
+        touches_memory = true;
+        used_locals = used_locals < 3 ? 3 : used_locals;
+        handled = true;
+        break;
+      }
       // psq_lx, psq_stx, psq_lux, psq_stux: the X-forms, with the GQR and
       // W in the low bits of the ten-bit field. No other opcode-4 form
       // has 6, 7, 38 or 39 in its low six bits.
@@ -7125,6 +7299,25 @@ inline BlockResult CompileBlockFetch(Fetch fetch, uint32_t start_pc, uint32_t ma
       {
         handled = true;
         break;
+      }
+      if (layout.extra_forms && layout.cr_offset && layout.cr_table_base)
+      {
+        const uint32_t xo19 = XO(ins);
+        if (xo19 == 257 || xo19 == 449 || xo19 == 193 || xo19 == 225 || xo19 == 33 ||
+            xo19 == 289 || xo19 == 129 || xo19 == 417)
+        {
+          EmitCrLogical(body, layout, xo19, RS(ins), RA(ins), RB(ins));
+          used_locals = used_locals < 3 ? 3 : used_locals;
+          used_i64 = used_i64 < 2 ? 2 : used_i64;
+          handled = true;
+          break;
+        }
+        if (xo19 == 0)  // mcrf
+        {
+          EmitMcrf(body, layout, (ins >> 23) & 7, (ins >> 18) & 7);
+          handled = true;
+          break;
+        }
       }
       const bool via_ctr = (XO(ins) == 528);
       if (XO(ins) != 16 && !via_ctr)

@@ -330,6 +330,7 @@ int main(int argc, char** argv)
   // both engines agreeing on that would test nothing.
   state.msr.FP = 1;
   state.spr[SPR_HID2] |= (1u << 29) | (1u << 31);  // PSE, LSQE
+  state.spr[SPR_HID2] |= 1u << 28;                 // LCE, for dcbz_l
   // GQR0 is plain floats, as the ABI requires; GQR1 to GQR4 cover the four
   // integer types with scales positive, zero and negative (a six-bit
   // scale of 60 or 61 is -4 or -3). psq_l/psq_st draw their GQR from
@@ -710,6 +711,24 @@ int main(int argc, char** argv)
       // lis r3,0x8000 ; ori r3,r3,0x7600 ; stw r4,0(r3) ; lfs f1,2(r3)
       {"a misaligned float member bails",
        {0x3C60'8000, 0x6063'7600, 0x9083'0000, 0xC023'0002}, 3},
+
+      // ── the condition register's own ops ──
+      // li r3,5 ; cmpwi r3,5 (cr0: EQ) ; li r4,9 ; cmpwi cr1,r4,5 (cr1: GT) ;
+      // cror 8,2,5 ; crxor 9,2,5 ; crandc 10,2,5 ; crnor 11,2,6 ; crand 12,2,5 ;
+      // crnand 13,2,5 ; creqv 14,2,6 ; crorc 15,6,5 ; mcrf cr4,cr2 ; mfcr r5
+      {"the CR logical ops and mcrf",
+       {0x3860'0005, 0x2C03'0005, 0x3880'0009, 0x2C84'0005, 0x4D02'2B82, 0x4D22'2982,
+        0x4D42'2902, 0x4D62'3042, 0x4D82'2A02, 0x4DA2'29C2, 0x4DC2'3242, 0x4DE6'2B42,
+        0x4E08'0000, 0x7CA0'0026}},
+      // andi. and andis. set CR0 whatever their low bit says.
+      // li r3,0xff0 ; andi. r4,r3,0xf0 ; andis. r5,r3,0x8000
+      {"andi. and andis. set CR0", {0x3860'0FF0, 0x7064'00F0, 0x7465'8000}},
+      // dcbz_l zeroes a line of the locked cache (HID2[LCE] is set below).
+      // lis r3,0xe000 ; ori r3,r3,0x1000 ; li r4,0x1234 ; stw r4,0(r3) ;
+      // stw r4,28(r3) ; dcbz_l 0,r3 ; lwz r5,0(r3) ; lwz r6,28(r3)
+      {"dcbz_l zeroes a locked-cache line",
+       {0x3C60'E000, 0x6063'1000, 0x3880'1234, 0x9083'0000, 0x9083'001C, 0x1000'1FEC,
+        0x80A3'0000, 0x80C3'001C}},
   };
 
   for (const Case& c : cases)

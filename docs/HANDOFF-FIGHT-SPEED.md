@@ -193,7 +193,9 @@ differentials (`run-jitdiff.sh`) and M3 (`harness/wasm-core/run-m3.sh`).
    imports" -- the cost was the block-to-block transition through the link
    table and `return_call_indirect`, charged to the blocks; exits to blocks
    compiled earlier are now imports of the module: fight +2, walking +5.*
-6. Small: hatch instructions (`cror`, `ps_sum0`, hardware stores; ~2%),
+6. Small: *First batch done: `docs/PHASE3-WEBGPU.md` "The hatch's biggest
+   customers, translated" -- the CR ops, `andi.`, `dcbz_l`; the hatch
+   halved, +1.* hatch instructions (`cror`, `ps_sum0`, hardware stores; ~2%),
    `GPFifo::UpdateGatherPipe` (1.2%), DSP HLE on the CPU thread.
 
 ## 5. Landmines (short; the full list is PHASE3-HANDOFF.md §5)
