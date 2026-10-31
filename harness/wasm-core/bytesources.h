@@ -18,14 +18,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <functional>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -40,15 +44,18 @@
 namespace Harness
 {
 // Shared counters. A ByteSource is copied into every reader DiscIO clones, so
-// the statistics have to outlive any one copy.
+// the statistics have to outlive any one copy. Atomic throughout: the HTTP
+// source's read-ahead thread counts its fetches beside the reading thread's,
+// and --frame-times reads the waits from the CPU thread while DiscIO's reader
+// may be another.
 struct SourceStats
 {
-  u64 requests = 0;
-  u64 bytes = 0;
-  // Time spent in reads, in microseconds; the HTTP source's synchronous
-  // fetches are what can stall the thread that reads. Atomic because
-  // --frame-times reads it from the CPU thread while DiscIO's reader may
-  // be another.
+  std::atomic<u64> requests{0};  // fetches (or file reads), by any thread
+  std::atomic<u64> bytes{0};
+  std::atomic<u64> ahead{0};   // of the requests, chunks fetched before any read asked
+  std::atomic<u64> stalls{0};  // reads that waited for a fetch
+  // Time the game's reads waited for the transport, in microseconds. The HTTP
+  // source's synchronous fetches are what stall the thread that reads.
   std::atomic<u64> us{0};
   // Called with every read's raw disc offset and length, when set. The
   // harness uses it to name the file a read lands in, which is the only
@@ -98,8 +105,17 @@ inline ByteSource FileByteSource(const std::string& path, std::shared_ptr<Source
 // is 40-80 ms a piece and thousands of them at every load, where the local
 // server answered in a fraction of a millisecond. One request a megabyte
 // turns that into dozens. Zero keeps one request per read.
+//
+// `ahead`, when non-zero, is how many chunks past a read's last one a helper
+// thread fetches before the game asks for them. A chunk still costs a round
+// trip -- an object store answers a range in 200-500 ms whatever its size --
+// and the game streams its level and its music in order, so without this it
+// crosses into a chunk nobody has every ten or twenty seconds and the CPU
+// thread waits out that round trip: a half-second stall, the lag spike the
+// player saw as 50% on the readout. The helper waits instead, on its own
+// worker, where nobody notices.
 inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceStats> stats,
-                                 u64 chunk = 0)
+                                 u64 chunk = 0, unsigned ahead = 0)
 {
   // One fetch of [offset, offset + size). `exact` demands the whole range
   // back (a read the game asked for); a chunk may end short at the disc's
@@ -116,10 +132,7 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
     const char* headers[] = {"Range", range.c_str(), nullptr};
     attr.requestHeaders = headers;
 
-    const double t0 = emscripten_get_now();
     emscripten_fetch_t* fetch = emscripten_fetch(&attr, url.c_str());
-    stats->us.fetch_add(static_cast<u64>((emscripten_get_now() - t0) * 1000.0),
-                        std::memory_order_relaxed);
     std::vector<u8> out;
     // 206 Partial Content is the expected answer. 200 means the server ignored
     // the Range header and sent everything, which is a server bug rather than
@@ -130,10 +143,8 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
     if (whole)
     {
       out.assign(fetch->data, fetch->data + fetch->numBytes);
-      stats->requests++;
-      stats->bytes += out.size();
-      if (exact && stats->on_read)
-        stats->on_read(offset, out.size());
+      stats->requests.fetch_add(1, std::memory_order_relaxed);
+      stats->bytes.fetch_add(out.size(), std::memory_order_relaxed);
     }
     else if (fetch)
     {
@@ -146,42 +157,99 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
     return out;
   };
   if (!chunk)
-    return [fetch_range](u64 offset, u64 size) { return fetch_range(offset, size, true); };
+  {
+    return [fetch_range, stats](u64 offset, u64 size) -> std::vector<u8> {
+      const double t0 = emscripten_get_now();
+      std::vector<u8> out = fetch_range(offset, size, true);
+      stats->us.fetch_add(static_cast<u64>((emscripten_get_now() - t0) * 1000.0),
+                          std::memory_order_relaxed);
+      stats->stalls.fetch_add(1, std::memory_order_relaxed);
+      if (!out.empty() && stats->on_read)
+        stats->on_read(offset, out.size());
+      return out;
+    };
+  }
 
   // The chunk cache, shared by every copy of the source (DiscIO clones its
-  // readers; several threads may read), so one lock around it. The lock is
-  // held across a fetch: a second reader wanting another chunk waits, and
-  // would have waited on the network anyway.
+  // readers; several threads may read) and by the helper, so one lock around
+  // it. Nobody holds the lock across a fetch: a chunk being fetched is in
+  // `fetching`, and a reader that needs it waits for that fetch to end
+  // instead of starting another.
   struct Cache
   {
     std::mutex lock;
-    std::list<u64> order;  // most recently used first
+    std::condition_variable changed;  // a fetch ended, or the helper has work
+    std::list<u64> order;             // most recently used first
     std::unordered_map<u64, std::pair<std::vector<u8>, std::list<u64>::iterator>> chunks;
+    std::unordered_set<u64> fetching;
+    std::deque<u64> wanted;  // the helper's queue, nearest first
   };
   auto cache = std::make_shared<Cache>();
   const size_t max_chunks = static_cast<size_t>(std::max<u64>(1, (u64{32} << 20) / chunk));
-  return [fetch_range, stats, cache, chunk, max_chunks](u64 offset, u64 size) -> std::vector<u8> {
+
+  // Fetches one chunk into the cache. Entered with the lock held, which it
+  // gives up for the fetch; on return the lock is held again and the chunk
+  // is in the cache, unless the fetch failed.
+  auto fetch_chunk = [fetch_range, cache, chunk, max_chunks](
+                         u64 index, std::unique_lock<std::mutex>& guard) {
+    cache->fetching.insert(index);
+    guard.unlock();
+    std::vector<u8> data = fetch_range(index * chunk, chunk, false);
+    guard.lock();
+    cache->fetching.erase(index);
+    if (!data.empty())
+    {
+      cache->order.push_front(index);
+      cache->chunks[index] = std::make_pair(std::move(data), cache->order.begin());
+      while (cache->chunks.size() > max_chunks)
+      {
+        cache->chunks.erase(cache->order.back());
+        cache->order.pop_back();
+      }
+    }
+    cache->changed.notify_all();
+  };
+
+  if (ahead)
+  {
+    // The helper: fetches what the readers queue, for as long as the program
+    // runs. Detached, holding its own share of the cache.
+    std::thread([fetch_chunk, cache, stats] {
+      std::unique_lock<std::mutex> guard(cache->lock);
+      for (;;)
+      {
+        cache->changed.wait(guard, [&] { return !cache->wanted.empty(); });
+        const u64 index = cache->wanted.front();
+        cache->wanted.pop_front();
+        if (cache->chunks.count(index) || cache->fetching.count(index))
+          continue;
+        stats->ahead.fetch_add(1, std::memory_order_relaxed);
+        fetch_chunk(index, guard);
+      }
+    }).detach();
+  }
+
+  return [fetch_chunk, stats, cache, chunk, ahead](u64 offset, u64 size) -> std::vector<u8> {
     std::vector<u8> out;
     out.reserve(static_cast<size_t>(size));
-    std::lock_guard<std::mutex> guard(cache->lock);
-    u64 pos = offset;
+    const double t0 = emscripten_get_now();
+    bool waited = false;
+    std::unique_lock<std::mutex> guard(cache->lock);
+    u64 pos = offset, last = offset / chunk;
     while (pos < offset + size)
     {
       const u64 index = pos / chunk;
       auto it = cache->chunks.find(index);
       if (it == cache->chunks.end())
       {
-        std::vector<u8> data = fetch_range(index * chunk, chunk, false);
-        if (data.empty())
-          break;
-        cache->order.push_front(index);
-        it = cache->chunks.emplace(index, std::make_pair(std::move(data), cache->order.begin()))
-                 .first;
-        while (cache->chunks.size() > max_chunks)
-        {
-          cache->chunks.erase(cache->order.back());
-          cache->order.pop_back();
-        }
+        waited = true;
+        if (cache->fetching.count(index))
+          cache->changed.wait(guard, [&] { return !cache->fetching.count(index); });
+        else
+          fetch_chunk(index, guard);
+        it = cache->chunks.find(index);
+        if (it == cache->chunks.end())
+          break;  // the fetch failed
       }
       else if (it->second.second != cache->order.begin())
       {
@@ -197,8 +265,27 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
       out.insert(out.end(), data.begin() + static_cast<size_t>(in),
                  data.begin() + static_cast<size_t>(in + n));
       pos += n;
+      last = index;
       if (data.size() < chunk && in + n == data.size())
         break;  // a short last chunk: the disc ended inside it
+    }
+    if (ahead)
+    {
+      // The chunks after this read's last one, replacing whatever was queued:
+      // the newest read is the best guess of where the game goes next.
+      cache->wanted.clear();
+      for (unsigned k = 1; k <= ahead; ++k)
+        if (!cache->chunks.count(last + k) && !cache->fetching.count(last + k))
+          cache->wanted.push_back(last + k);
+      if (!cache->wanted.empty())
+        cache->changed.notify_all();
+    }
+    guard.unlock();
+    if (waited)
+    {
+      stats->stalls.fetch_add(1, std::memory_order_relaxed);
+      stats->us.fetch_add(static_cast<u64>((emscripten_get_now() - t0) * 1000.0),
+                          std::memory_order_relaxed);
     }
     if (stats->on_read)
       stats->on_read(offset, out.size());

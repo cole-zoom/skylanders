@@ -153,6 +153,11 @@ static PowerPC::PowerPCState* g_hatch_state = nullptr;
 // --disc-chunk=KB: the unit the HTTP disc source fetches and caches
 // (Harness::HttpByteSource); 0 fetches each read as asked.
 static u64 g_disc_chunk_kb = 1024;
+// --disc-ahead=N: chunks past each read's that a helper thread fetches before
+// the game asks (Harness::HttpByteSource); 0 fetches only on demand.
+static unsigned g_disc_ahead = 2;
+// The disc source's counters, for the page's readout.
+static std::shared_ptr<Harness::SourceStats> g_disc_stats;
 static bool g_hatch_stats = false;
 static u64 g_hatch_calls = 0;
 static std::map<u32, u64> g_hatch_hist;
@@ -453,6 +458,18 @@ EMSCRIPTEN_KEEPALIVE volatile double* harness_emulated_seconds() { return &g_har
 #if defined(__EMSCRIPTEN__) && defined(HARNESS_WEBGPU)
 EMSCRIPTEN_KEEPALIVE double harness_compiles() { return WebGPU::g_compiles.load(); }
 EMSCRIPTEN_KEEPALIVE double harness_compile_ms() { return WebGPU::g_compile_us.load() / 1000.0; }
+#endif
+// Disc reads that waited for the transport, and how long they waited, so the
+// readout can say when a slow second was a second spent fetching the disc.
+#if defined(__EMSCRIPTEN__)
+EMSCRIPTEN_KEEPALIVE double harness_disc_stalls()
+{
+  return g_disc_stats ? static_cast<double>(g_disc_stats->stalls.load()) : 0.0;
+}
+EMSCRIPTEN_KEEPALIVE double harness_disc_wait_ms()
+{
+  return g_disc_stats ? g_disc_stats->us.load() / 1000.0 : 0.0;
+}
 #endif
 }
 
@@ -2016,6 +2033,8 @@ int main(int argc, char** argv)
       jit_extra_forms = std::strcmp(argv[i] + 12, "off") != 0;
     else if (std::strncmp(argv[i], "--disc-chunk=", 13) == 0)
       g_disc_chunk_kb = std::strtoull(argv[i] + 13, nullptr, 0);
+    else if (std::strncmp(argv[i], "--disc-ahead=", 13) == 0)
+      g_disc_ahead = static_cast<unsigned>(std::strtoul(argv[i] + 13, nullptr, 0));
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -2480,11 +2499,13 @@ int main(int argc, char** argv)
 
   // ── the disc ──
   auto stats = std::make_shared<Harness::SourceStats>();
+  g_disc_stats = stats;
   Harness::ByteSource source;
   u64 disc_size = 0;
 #if defined(__EMSCRIPTEN__)
   disc_size = 4699979776ull;
-  source = Harness::HttpByteSource(location, stats, g_disc_chunk_kb * 1024);
+  source = Harness::HttpByteSource(location, stats, g_disc_chunk_kb * 1024,
+                                   g_disc_chunk_kb ? g_disc_ahead : 0);
 #else
   {
     std::FILE* f = std::fopen(location.c_str(), "rb");
@@ -4251,6 +4272,7 @@ int main(int argc, char** argv)
   bool window_open = false;
   u64 window_idle_n0 = 0, window_idle_bucket0[5] = {}, window_fifo0[4] = {};
   double window_idle_ms0 = 0;
+  u64 window_disc0[4] = {};  // requests, read ahead, stalls, us waited
   double window_t0 = 0.0;
   u64 window_exec0 = 0;
   s64 window_ticks0 = 0;
@@ -4606,6 +4628,10 @@ int main(int argc, char** argv)
         window_ticks0 = system.GetCoreTiming().GetTicks();
         window_idle_n0 = g_idle_n;
         window_idle_ms0 = g_idle_ms;
+        window_disc0[0] = stats->requests.load();
+        window_disc0[1] = stats->ahead.load();
+        window_disc0[2] = stats->stalls.load();
+        window_disc0[3] = stats->us.load();
         g_idle_long_n = g_idle_long_backlog = g_idle_long_backlog_max = 0;
         std::copy(std::begin(g_idle_bucket), std::end(g_idle_bucket), window_idle_bucket0);
         g_idle_longest_ms = 0;
@@ -4747,6 +4773,16 @@ int main(int argc, char** argv)
                   100.0 * wemu / (wms / 1000.0), wemu > 0 ? (frames - window_frames0) / wemu : 0.0);
       const u64 idle_n = g_idle_n - window_idle_n0;
       const double idle_ms = g_idle_ms - window_idle_ms0;
+      // The disc in the window: what was fetched, and how long the game's
+      // reads waited for it -- the stalls a remote disc puts on the CPU
+      // thread, which the read-ahead exists to take off it.
+      std::printf("  disc      window: %llu requests (%llu read ahead); reads waited %.0f ms "
+                  "(%.1f%% of the window) in %llu stalls\n",
+                  static_cast<unsigned long long>(stats->requests.load() - window_disc0[0]),
+                  static_cast<unsigned long long>(stats->ahead.load() - window_disc0[1]),
+                  (stats->us.load() - window_disc0[3]) / 1000.0,
+                  100.0 * ((stats->us.load() - window_disc0[3]) / 1000.0) / wms,
+                  static_cast<unsigned long long>(stats->stalls.load() - window_disc0[2]));
       if (g_idle_stats)
       std::printf("  idle      %llu idle syncs, waited %.0f ms (%.1f%% of the window), longest "
                   "%.2f ms; <=5us %llu, <=50us %llu, <=500us %llu, <=2ms %llu, more %llu\n",
@@ -5043,9 +5079,12 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(jit_blocks));
   }
 #endif
-  std::printf("  disc      %llu requests, %.2f MB fetched\n",
-              static_cast<unsigned long long>(stats->requests),
-              stats->bytes / (1024.0 * 1024.0));
+  std::printf("  disc      %llu requests (%llu read ahead), %.2f MB fetched; reads waited "
+              "%.0f ms in %llu stalls\n",
+              static_cast<unsigned long long>(stats->requests.load()),
+              static_cast<unsigned long long>(stats->ahead.load()),
+              stats->bytes.load() / (1024.0 * 1024.0), stats->us.load() / 1000.0,
+              static_cast<unsigned long long>(stats->stalls.load()));
 
   // Printed in a fixed format on both targets so a mismatch is visible without
   // reading the trace.
