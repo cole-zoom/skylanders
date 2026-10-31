@@ -27,14 +27,57 @@ const say = (text, failed = false) => {
   status.hidden = !text;
   status.classList.toggle('failed', failed);
 };
-const log = text => {
-  readouts.push(`${new Date().toISOString()} log ${text}`);
+// The slow seconds (the speed readout below), kept apart: the game's own
+// messages roll through the tail at dozens a second and would push them out.
+const slow = [];
+// Drawn at most four times a second: the game logs ~50 lines a second
+// (IOS's /dev/net/ip/top), and redrawing the whole log for each one cost
+// the emulator a third of its speed (a fight at 63-65% with ?log=1, 100%
+// without).
+let drawPending = false;
+const show = () => {
+  if (logEl.hidden || drawPending) return;
+  drawPending = true;
+  setTimeout(() => {
+    drawPending = false;
+    logEl.textContent = [...head, '…', ...(slow.length ? ['slow seconds:', ...slow, '…'] : []),
+                         ...lines].join('\n');
+  }, 250);
+};
+const logLine = text => {
   if (head.length < 200) head.push(text);
   else lines.push(text);
   if (lines.length > 400) lines.splice(0, lines.length - 400);
-  if (!logEl.hidden) logEl.textContent = [...head, '…', ...lines].join('\n');
+  show();
+};
+const log = text => {
+  readouts.push(`${new Date().toISOString()} log ${text}`);
+  logLine(text);
 };
 logEl.hidden = params.get('log') !== '1';
+// Copy log: the log is rewritten with every line, dozens a second, which
+// clears any selection in it, so it cannot be copied by hand. The slow
+// seconds first, then the boot's lines and the tail. If the clipboard
+// refuses, the same text as a file.
+$('copy-log').hidden = logEl.hidden;
+$('copy-log').addEventListener('click', async () => {
+  const text = [`${location.origin}${location.pathname}`, '', 'slow seconds:', ...slow, '', ...head, '…', ...lines]
+    .join('\n');
+  const button = $('copy-log');
+  try {
+    await navigator.clipboard.writeText(text);
+    button.textContent = 'Copied';
+  } catch {
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(new Blob([text], { type: 'text/plain' })),
+      download: `skylanders-log-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`,
+    });
+    a.click();
+    URL.revokeObjectURL(a.href);
+    button.textContent = 'Saved as a file';
+  }
+  setTimeout(() => (button.textContent = 'Copy log'), 2000);
+});
 
 // What the build needs, checked up front: a missing feature otherwise
 // surfaces as an abort deep in startup.
@@ -157,10 +200,19 @@ const hud = () => {
     const discMs = Module._harness_disc_wait_ms?.() ?? 0;
     if (lastWall && pct >= 0 && pct < 1000) {
       $('speed').textContent = `${pct.toFixed(0)}%`;
-      readouts.push(`${new Date().toISOString()} emulated ${emulated.toFixed(1)} s ` +
-                    `readout ${pct.toFixed(0)}% compiled ${compiles - lastCompiles} ` +
-                    `in ${(compileMs - lastCompileMs).toFixed(0)} ms ` +
-                    `disc ${stalls - lastStalls} in ${(discMs - lastDiscMs).toFixed(0)} ms`);
+      const line = `emulated ${emulated.toFixed(1)} s ` +
+                   `readout ${pct.toFixed(0)}% compiled ${compiles - lastCompiles} ` +
+                   `in ${(compileMs - lastCompileMs).toFixed(0)} ms ` +
+                   `disc ${stalls - lastStalls} in ${(discMs - lastDiscMs).toFixed(0)} ms`;
+      readouts.push(`${new Date().toISOString()} ${line}`);
+      // A slow second in the page's own log too: a hosted page has nowhere to
+      // send the readout (no /readout there), and the player pastes the log.
+      // The disc and compile figures say what that second waited for.
+      if (pct < 90 && !logEl.hidden) {
+        slow.push(`  ${new Date().toLocaleTimeString()} ${line}`);
+        if (slow.length > 200) slow.shift();
+        show();
+      }
     }
     lastEmulated = emulated;
     lastWall = wall;
