@@ -150,6 +150,9 @@ static PowerPC::PowerPCState* g_hatch_state = nullptr;
 // What goes through the hatch, keyed as the interpreter statistics key it
 // (primary opcode, and the extended opcode for 4, 19, 31, 59 and 63), so
 // the two rankings read side by side. Only kept with --jit-stats.
+// --disc-chunk=KB: the unit the HTTP disc source fetches and caches
+// (Harness::HttpByteSource); 0 fetches each read as asked.
+static u64 g_disc_chunk_kb = 1024;
 static bool g_hatch_stats = false;
 static u64 g_hatch_calls = 0;
 static std::map<u32, u64> g_hatch_hist;
@@ -2011,6 +2014,8 @@ int main(int argc, char** argv)
       jit_reg_cache = std::strcmp(argv[i] + 11, "off") != 0;
     else if (std::strncmp(argv[i], "--jit-extra=", 12) == 0)
       jit_extra_forms = std::strcmp(argv[i] + 12, "off") != 0;
+    else if (std::strncmp(argv[i], "--disc-chunk=", 13) == 0)
+      g_disc_chunk_kb = std::strtoull(argv[i] + 13, nullptr, 0);
     else if (std::strncmp(argv[i], "--watch=", 8) == 0)
       watch_addr = static_cast<u32>(std::strtoul(argv[i] + 8, nullptr, 0));
     // --capture-fifo=N: capture N bytes of GX command stream and dump them as
@@ -2479,7 +2484,7 @@ int main(int argc, char** argv)
   u64 disc_size = 0;
 #if defined(__EMSCRIPTEN__)
   disc_size = 4699979776ull;
-  source = Harness::HttpByteSource(location, stats);
+  source = Harness::HttpByteSource(location, stats, g_disc_chunk_kb * 1024);
 #else
   {
     std::FILE* f = std::fopen(location.c_str(), "rb");
