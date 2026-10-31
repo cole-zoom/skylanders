@@ -16,12 +16,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -85,9 +89,22 @@ inline ByteSource FileByteSource(const std::string& path, std::shared_ptr<Source
 // that ignores Range returns the whole file for each request, which still
 // "works" and silently defeats the entire point; the caller checks the
 // returned length against what it asked for.
-inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceStats> stats)
+//
+// `chunk`, when non-zero, is the unit the source fetches and keeps: a read is
+// served from whole chunks aligned to that size, held in a cache of about
+// 32 MB, most recently used first. The game reads the disc in pieces of
+// ~31 KB on average (a 400-second walk: 3,914 requests for 121 MB), each a
+// round trip the emulator waits out; from a server across the internet that
+// is 40-80 ms a piece and thousands of them at every load, where the local
+// server answered in a fraction of a millisecond. One request a megabyte
+// turns that into dozens. Zero keeps one request per read.
+inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceStats> stats,
+                                 u64 chunk = 0)
 {
-  return [url, stats](u64 offset, u64 size) -> std::vector<u8> {
+  // One fetch of [offset, offset + size). `exact` demands the whole range
+  // back (a read the game asked for); a chunk may end short at the disc's
+  // end, which is the last chunk's size, not a failure.
+  auto fetch_range = [url, stats](u64 offset, u64 size, bool exact) -> std::vector<u8> {
     emscripten_fetch_attr_t attr;
     emscripten_fetch_attr_init(&attr);
     std::strcpy(attr.requestMethod, "GET");
@@ -107,12 +124,15 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
     // 206 Partial Content is the expected answer. 200 means the server ignored
     // the Range header and sent everything, which is a server bug rather than
     // a transport failure -- treated as failure so it cannot pass unnoticed.
-    if (fetch && fetch->status == 206 && fetch->numBytes == size)
+    const bool whole = fetch && fetch->status == 206 &&
+                       (exact ? fetch->numBytes == size
+                              : (fetch->numBytes > 0 && fetch->numBytes <= size));
+    if (whole)
     {
       out.assign(fetch->data, fetch->data + fetch->numBytes);
       stats->requests++;
       stats->bytes += out.size();
-      if (stats->on_read)
+      if (exact && stats->on_read)
         stats->on_read(offset, out.size());
     }
     else if (fetch)
@@ -123,6 +143,65 @@ inline ByteSource HttpByteSource(const std::string& url, std::shared_ptr<SourceS
     }
     if (fetch)
       emscripten_fetch_close(fetch);
+    return out;
+  };
+  if (!chunk)
+    return [fetch_range](u64 offset, u64 size) { return fetch_range(offset, size, true); };
+
+  // The chunk cache, shared by every copy of the source (DiscIO clones its
+  // readers; several threads may read), so one lock around it. The lock is
+  // held across a fetch: a second reader wanting another chunk waits, and
+  // would have waited on the network anyway.
+  struct Cache
+  {
+    std::mutex lock;
+    std::list<u64> order;  // most recently used first
+    std::unordered_map<u64, std::pair<std::vector<u8>, std::list<u64>::iterator>> chunks;
+  };
+  auto cache = std::make_shared<Cache>();
+  const size_t max_chunks = static_cast<size_t>(std::max<u64>(1, (u64{32} << 20) / chunk));
+  return [fetch_range, stats, cache, chunk, max_chunks](u64 offset, u64 size) -> std::vector<u8> {
+    std::vector<u8> out;
+    out.reserve(static_cast<size_t>(size));
+    std::lock_guard<std::mutex> guard(cache->lock);
+    u64 pos = offset;
+    while (pos < offset + size)
+    {
+      const u64 index = pos / chunk;
+      auto it = cache->chunks.find(index);
+      if (it == cache->chunks.end())
+      {
+        std::vector<u8> data = fetch_range(index * chunk, chunk, false);
+        if (data.empty())
+          break;
+        cache->order.push_front(index);
+        it = cache->chunks.emplace(index, std::make_pair(std::move(data), cache->order.begin()))
+                 .first;
+        while (cache->chunks.size() > max_chunks)
+        {
+          cache->chunks.erase(cache->order.back());
+          cache->order.pop_back();
+        }
+      }
+      else if (it->second.second != cache->order.begin())
+      {
+        cache->order.erase(it->second.second);
+        cache->order.push_front(index);
+        it->second.second = cache->order.begin();
+      }
+      const std::vector<u8>& data = it->second.first;
+      const u64 in = pos - index * chunk;
+      if (in >= data.size())
+        break;  // past the disc's end
+      const u64 n = std::min<u64>(offset + size - pos, data.size() - in);
+      out.insert(out.end(), data.begin() + static_cast<size_t>(in),
+                 data.begin() + static_cast<size_t>(in + n));
+      pos += n;
+      if (data.size() < chunk && in + n == data.size())
+        break;  // a short last chunk: the disc ended inside it
+    }
+    if (stats->on_read)
+      stats->on_read(offset, out.size());
     return out;
   };
 }

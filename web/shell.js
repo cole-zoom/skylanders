@@ -48,6 +48,9 @@ if (missing.length) {
 }
 
 const speed = params.get('speed') ?? '1';
+// ?chunk=KB: the disc is fetched and cached in pieces of this size (0: each
+// read as asked); the default suits a disc across the internet.
+const chunk = params.get('chunk');
 const audio = params.get('audio') !== '0';
 const figure = params.get('figure');
 // The run never ends on its own; the step count is only a cap.
@@ -61,6 +64,7 @@ const args = [disc, '1000000000000000000',
               // The NAND where web/saves.js restores the game's saves.
               '--keep-nand',
               `--speed=${speed}`, figure ? `--skylander=${figure}` : '--skylander',
+              ...(chunk ? [`--disc-chunk=${chunk}`] : []),
               // The game's pipelines, compiled at boot rather than the first
               // time each is drawn (web/make-uidcache.sh). Absent, the game
               // still runs, with a stall at each new pipeline.
