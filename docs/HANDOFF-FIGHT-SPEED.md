@@ -1,9 +1,58 @@
 # Handoff: fights at 100%
 
-Written 2026-10-30, after #105 merged (main 49bd02a). For the next agent
-picking up Skylanders speed. Read `docs/PHASE3-WEBGPU.md` (the backend,
-every milestone's evidence) and `docs/PHASE3-HANDOFF.md` §5–§6 (landmines,
-how to measure) as well; this file is only what is new.
+Written 2026-10-30, after #105 merged (main 49bd02a); the state below
+added 2026-10-31 after #111 (main d00eea6). For the next agent picking up
+Skylanders speed. Read `docs/PHASE3-WEBGPU.md` (the backend, every
+milestone's evidence) and `docs/PHASE3-HANDOFF.md` §5–§6 (landmines, how
+to measure) as well; this file is only what is new.
+
+## 0. State on 2026-10-31: the goal is met
+
+The player's own session log (§2), the evening of 2026-10-30, with
+nothing else running on the machine: 203 seconds of a fight, readout
+median 100%, p25 99%, p10 98%, worst second 87%, one second below 90%.
+The fight state's harness window went 78% → ~107% over the day, each
+step its own PR, frames identical, M3 and the differentials passing:
+
+| PR | what | fight window |
+|---|---|---|
+| #107 | a draw waits 4 ms for its pipeline, then goes without | hitches gone |
+| #108 | the warm entry: every block optimised at install | 78 → 88% |
+| #109 | branch hints: the cold paths out of line; access groups | 88 → 105% |
+| #110 | exits to earlier blocks bound as imports | 105 → 106% |
+| #111 | guest registers in wasm locals, write-through | 106 → ~107% |
+
+Each has a section in `docs/PHASE3-WEBGPU.md` with every number. Items 3,
+4 and 5 of the plan below did not do what the plan expected: the memory
+path's instruction count was not the cost (the code layout was), the
+register loads were worth a point or two, the dispatcher's 6.5% was the
+block-to-block transition charged to the blocks. Read those sections
+before planning more.
+
+*What is left*, from a profile after #111 (CPU thread 97% busy): compiled
+blocks 82%, flat over 11,600 blocks (the top 500 are 39%); the C++
+dispatcher 6% (timing bookkeeping per slice and idle exit, the link
+table is already the fast path); instructions handed to the interpreter
+2.5% (`cror` and the other CR ops are a third of them, `psq_st` to the
+pipe, `dcbz_l`, `ps_sum0`, `mtspr`); the gather-pipe flush 1.3%; stores
+to hardware registers 0.9%; DSP HLE 0.9%; translate and install 0.9%.
+Each is about a point. Bigger compile regions (64 blocks a module) were
+measured: no effect, a third more blocks compiled.
+
+*Measurement landmines learned the hard way*, on top of §5:
+
+- The machine on a 15 W phone charger with the battery under 10% runs at
+  two thirds speed for hours; `pmset -g adapter` says the wattage. A pair
+  that disagrees with its history by more than the noise is the machine,
+  not the code.
+- The second of two long runs comes out 6–9 points slower than the first
+  while the battery charges; the fight's one-minute runs do not show it.
+  For a small effect on walking, run off-on-on-off and compare the means.
+- `--jit-stats` compiles counters into every exit and costs ~9 points;
+  compare only within a series that has it on or off throughout.
+- V8 15.6 speculatively inlines `return_call_indirect` from Liftoff
+  feedback (`--wasm-inlining-call-indirect`); whether the warm entry's
+  instant tier-up leaves it any feedback was not settled.
 
 ## 1. The goal
 
