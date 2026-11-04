@@ -15,7 +15,12 @@ D=dolphin
 B=dolphin-web/build-wasm
 
 # INITIAL_MEMORY must cover guest RAM before anything else: MEM1 (24 MB) plus
-# MEM2 (64 MB) plus the emulator's own allocations. 512 MB leaves headroom.
+# MEM2 (64 MB) plus the emulator's own allocations -- and a save state, which
+# is ~300 MB raw (web/states.js), while everything else is still allocated.
+# 512 MB ran out mid-session saving one (the player, 2026-11-04: "Cannot
+# enlarge memory arrays to size 553218048"), so 1 GB. Fixed, not growable:
+# the page holds views of the heap (input, audio, the readout) that growing
+# shared memory would leave behind.
 # PROXY_TO_PTHREAD keeps main off the main thread, matching Spike C's topology.
 # These must match what CMake compiled the libraries with. Without
 # -D_M_GENERIC the headers present a different view to this translation unit
@@ -60,7 +65,7 @@ em++ -std=c++23 -O2 ${PROFILING:+--profiling-funcs} -pthread -sPROXY_TO_PTHREAD 
   -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=2MB \
   $WEBGPU_FLAGS \
   -D_M_GENERIC=1 -D_ARCH_32=1 \
-  -sASSERTIONS=1 -sINITIAL_MEMORY=536870912 -sALLOW_MEMORY_GROWTH=0 \
+  -sASSERTIONS=1 -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=0 \
   -sFETCH=1 -sUSE_BZIP2=1 \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,FS \
   -sALLOW_TABLE_GROWTH=1 \
